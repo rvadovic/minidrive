@@ -1,5 +1,7 @@
 add_executable(minidrive_client
     src/main.cpp
+    src/client.cpp
+    src/terminalNoEcho.cpp
 )
 
 target_include_directories(minidrive_client
@@ -9,6 +11,7 @@ target_include_directories(minidrive_client
 
 target_link_libraries(minidrive_client
     PRIVATE
+        asio
         minidrive_shared
         minidrive_warnings
 )
