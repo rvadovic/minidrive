@@ -1,0 +1,8 @@
+{
+    "users": [
+        {
+            "password_hash": "$argon2id$v=19$m=65536,t=2,p=1$dQQr3ymnihUYyFVh03m+gw$OrEwzIwfK/rQ2ah92W2mTQoA15TbdtPEnSSvhHy8qBo",
+            "username": "rudko"
+        }
+    ]
+}

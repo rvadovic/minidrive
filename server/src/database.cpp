@@ -4,17 +4,20 @@
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include "password.hpp"
+#include "filesystem/utils.hpp"
 #include <iostream>
+#include <mutex>
 
 using nlohmann::json;
 
 namespace fs = std::filesystem;
 
 Database::Database(const std::filesystem::path& path) : path_(path) {
-    save();
+    if(fsutils::get_file_size(path) == 0) save();
 }
 
 bool Database::user_exists(const std::string& username) {
+    std::lock_guard<std::mutex> lock(db_mutex_);
     load();
     for(const auto& entry : entries_) {
         if(entry.username == username) {
@@ -25,6 +28,7 @@ bool Database::user_exists(const std::string& username) {
 }
 
 bool Database::validate_user(const std::string& username, const std::string& password) {
+    std::lock_guard<std::mutex> lock(db_mutex_);
     load();
     for(const auto& entry : entries_) {
         if(entry.username == username && password::verify_password(password, entry.password_hash)) {
@@ -35,6 +39,7 @@ bool Database::validate_user(const std::string& username, const std::string& pas
 }
 
 void Database::add_user(const std::string& username, const std::string& password) {
+    std::lock_guard<std::mutex> lock(db_mutex_);
     load();
     std::string password_hash = password::hash_password(password);
     entries_.push_back(DatabaseEntry{username, password_hash});
@@ -69,7 +74,7 @@ void Database::load() {
 }
 
 void Database::save() {
-     fs::path tmp = path_;
+    fs::path tmp = path_;
     tmp += ".tmp";
 
     std::ofstream f(tmp);

@@ -5,14 +5,34 @@ using nlohmann::json;
 
 namespace protocol {
 
+void to_json(json& j, const ChunkInfo& ci) {
+    j = {
+        {"index", ci.index},
+        {"size", ci.size},
+        {"chunk_hash", ci.chunk_hash}
+    };
+}
+
+void from_json(const json& j, ChunkInfo& ci) {
+    ci = {
+        j.at("index").get<uint32_t>(),
+        j.at("size").get<uint32_t>(),
+        j.at("chunk_hash").get<std::string>()
+    };
+}
+
 void to_json(json& j, const Request& req) {
     j = {
         {"cmd", req.cmd},
         {"first_argument", req.first_argument},
         {"second_argument", req.second_argument},
         {"size", req.size},
-        {"hash", req.hash}
+        {"file_hash", req.file_hash},
     };
+
+    if(!req.chunks.empty()) {
+        j["chunks"] = req.chunks;
+    }
 }
 
 void to_json(json& j, const Response& res) {
@@ -20,28 +40,36 @@ void to_json(json& j, const Response& res) {
         {"status", res.status},
         {"code", res.code},
         {"message", res.message},
-        {"hash", res.hash}
+        {"file_hash", res.file_hash}
     };
+
+    if(!res.chunks.empty()) {
+        j["chunks"] = res.chunks;
+    }
 }
 
 void from_json(const json& j, Request& req) {
-    req = {
-        j.at("cmd").get<std::string>(),
-        j.at("first_argument").get<std::string>(),
-        j.at("second_argument").get<std::string>(),
-        j.at("size").get<uint32_t>(),
-        j.at("hash").get<std::string>(),
-    };
+    req.cmd = j.at("cmd").get<std::string>();
+    req.first_argument = j.at("first_argument").get<std::string>();
+    req.second_argument = j.at("second_argument").get<std::string>();
+    req.size = j.at("size").get<uint32_t>();
+    req.file_hash = j.at("file_hash").get<std::string>();
+
+    if(j.contains("chunks")) {
+        req.chunks = j.at("chunks").get<std::vector<ChunkInfo>>();
+    }
 
 }
 
 void from_json(const json& j, Response& res) {
-    res = {
-        j.at("status").get<std::string>(),
-        j.at("code").get<uint16_t>(),
-        j.at("message").get<std::string>(),
-        j.at("hash").get<std::string>(),
-    };
+    res.status = j.at("status").get<std::string>();
+    res.code = j.at("code").get<uint16_t>();
+    res.message = j.at("message").get<std::string>();
+    res.file_hash = j.at("file_hash").get<std::string>();
+
+    if(j.contains("chunks")) {
+        res.chunks = j.at("chunks").get<std::vector<ChunkInfo>>();
+    }
 }
 
 }

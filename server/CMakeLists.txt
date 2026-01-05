@@ -4,6 +4,7 @@ add_executable(minidrive_server
     src/session.cpp
     src/password.cpp
     src/database.cpp
+    src/storage.cpp
 )
 
 target_include_directories(minidrive_server

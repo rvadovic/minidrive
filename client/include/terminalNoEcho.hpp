@@ -5,8 +5,8 @@
 
 class TerminalNoEcho {
 public:
-    TerminalNoEcho();
-    ~TerminalNoEcho();
+    TerminalNoEcho(); // Sets echo in cmd
+    ~TerminalNoEcho(); // Resets echo in cmd
 
 private:
     termios old_, new_;

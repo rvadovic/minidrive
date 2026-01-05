@@ -8,15 +8,18 @@
 #include "protocol/commands.hpp"
 #include "protocol/statuses.hpp"
 #include "protocol/codes.hpp"
+#include "protocol/flags.hpp"
 #include "filesystem/utils.hpp"
 
 using asio::ip::tcp;
 using nlohmann::json;
 
-Session::Session(tcp::socket socket, const std::filesystem::path& root, std::shared_ptr<Database> db) 
+Session::Session(tcp::socket socket, std::shared_ptr<Storage> storage, std::function<void(std::shared_ptr<Session>)> on_exit) 
     : socket_(std::move(socket)),
-      root_(root),
-      db_(std::move(db)),
+      storage_(storage),
+      on_exit_(on_exit),
+      root_(storage->get_root()),
+      db_(storage_->get_database()),
       requests_{
           {protocol::commands::LIST,     [this](auto& req){ list(req); }},
           {protocol::commands::UPLOAD,   [this](auto& req){ upload(req); }},
@@ -28,22 +31,24 @@ Session::Session(tcp::socket socket, const std::filesystem::path& root, std::sha
           {protocol::commands::MOVE,     [this](auto& req){ move(req); }},
           {protocol::commands::COPY,     [this](auto& req){ copy(req); }},
           {protocol::commands::SYNC,     [this](auto& req){ sync(req); }},
-          {protocol::commands::EXIT,     [this](auto& req){ exit(req); }},
-          {protocol::commands::LOGIN,     [this](auto& req){ login(req); }}
+          {protocol::commands::LOGIN,     [this](auto& req){ login(req); }},
+          {protocol::commands::NEED_INPUT, [this](auto& req){ need_input(req); }},
+          {protocol::commands::AUTH, [this](auto& req){ auth(req); }}
       } {
+        transfer_.transfer_id = UINT32_MAX;
 }
 
 void Session::start() {
-    read_header();
+    read_header_json();
 }
 
-void Session::read_header() {
+void Session::read_header_json() {
     auto self = shared_from_this();
     asio::async_read(socket_, asio::buffer(&msg_len_, sizeof(msg_len_)),[this, self](std::error_code ec, std::size_t) {
         if(!ec) {
             msg_len_ = ntohl(msg_len_);
             buffer_.resize(msg_len_);
-            read_body();
+            read_body_json();
         } else {
             handle_error(ec);
             return;
@@ -51,12 +56,11 @@ void Session::read_header() {
     });
 }
 
-void Session::read_body() {
+void Session::read_body_json() {
     auto self = shared_from_this();
-    std::cout << "before reading" << std::endl;
     if(msg_len_ == 0) {
         handle_error(asio::error::invalid_argument);
-        read_header();
+        read_next();
     }
     asio::async_read(socket_, asio::buffer(buffer_),[this, self](std::error_code ec, std::size_t) {
         if(!ec) {
@@ -65,7 +69,7 @@ void Session::read_body() {
 
             std::cout << "after reading" << std::endl;
             handle_request(j);
-            read_header();
+            read_next();
         } else {
             handle_error(ec);
             return;
@@ -73,14 +77,107 @@ void Session::read_body() {
     });
 }
 
+void Session::write_response_json(const json& j) {
+    auto self = shared_from_this();
+
+    auto write_buffer = std::make_shared<std::string>(j.dump());
+
+    if(write_buffer->size() > std::numeric_limits<uint32_t>::max()) {
+        std::cout << std::endl << "File data was too large." << std::endl;
+        return;
+    }
+
+    auto response_len = std::make_shared<uint32_t>(htonl(write_buffer->size()));
+
+    std::vector<asio::const_buffer> buffers;
+    buffers.push_back(asio::buffer(response_len.get(), sizeof(uint32_t)));
+    buffers.push_back(asio::buffer(*write_buffer));
+    
+    asio::async_write(socket_, buffers, [this, self, write_buffer, response_len](std::error_code ec, std::size_t) {
+        if(ec) {
+            handle_error(ec);
+            return;
+        }
+    });
+}
+
+void Session::read_header_chunk() {
+    auto self = shared_from_this();
+
+    auto header = std::make_shared<protocol::ChunkHeader>();
+
+    asio::async_read(socket_, asio::buffer(header.get(), sizeof(protocol::ChunkHeader)), [this, self, header](std::error_code ec, std::size_t) {
+        if(ec) {
+            handle_error(ec);
+            return;
+        }
+        ch_.transfer_id = ntohl(header->transfer_id);
+        ch_.index = ntohl(header->index);
+        ch_.size = ntohl(header->size);
+        ch_.flags = header->flags;
+        read_body_chunk();
+    });
+}
+
+void Session::read_body_chunk() {
+    auto self = shared_from_this();
+
+    auto data = std::make_shared<std::vector<uint8_t>>(ch_.size);
+
+    asio::async_read(socket_, asio::buffer(*data), [this, self, data](std::error_code ec, std::size_t) {
+        if(ec) {
+            handle_error(ec);
+            return;
+        }
+        handle_chunk(ch_, *data);
+        read_next();
+    });
+}
+
+void Session::send_chunk(const protocol::ChunkHeader& ch, const std::vector<uint8_t>& data) {
+    auto self = shared_from_this();
+
+    auto header = std::make_shared<protocol::ChunkHeader>();
+    header->transfer_id = htonl(ch.transfer_id);
+    header->index = htonl(ch.index);
+    header->size = htonl(ch.size);
+    header->flags = ch.flags;
+
+    auto data_to_write = std::make_shared<std::vector<uint8_t>>(data);
+
+    std::vector<asio::const_buffer> buffers;
+    buffers.push_back(asio::buffer(header.get(), sizeof(protocol::ChunkHeader)));
+    buffers.push_back(asio::buffer(*data_to_write));
+
+    asio::async_write(socket_, buffers, [this, self, header, data_to_write](std::error_code ec, std::size_t) {
+        if(ec) {
+            handle_error(ec);
+            return;
+        }
+    });
+}
+
+void Session::read_next() {
+    if(state_ == SessionState::UPLOADING || state_ == SessionState::DOWNLOADING) {
+        read_header_chunk();
+    } else {
+        read_header_json();
+    }
+}
+
 void Session::handle_error(const std::error_code& ec) {
     std::cerr << "Network error: " << ec.message() << " (" << ec.value() << ")" << std::endl;
+    exit();
 }
 
 void Session::handle_request(const json& j) {
     protocol::Request req;
     protocol::from_json(j, req);
     std::cout << req.cmd << std::endl;
+    if(req.cmd == protocol::commands::EXIT) {
+        exit();
+        return;
+    }
     auto it = requests_.find(req.cmd);
     if (it != requests_.end()) {
         it->second(req);
@@ -89,62 +186,118 @@ void Session::handle_request(const json& j) {
             protocol::statuses::ERROR,
             protocol::codes::BAD_REQUEST,
             "Unknown request",
-            ""
+            "",
         };
+        res.chunks.clear();
         json j;
         protocol::to_json(j, res);
-        write_response(j);
+        write_response_json(j);
     }
 }
 
-void Session::write_response(const json& j) {
-    auto self = shared_from_this();
-
-    auto write_buffer = std::make_shared<std::string>(j.dump());
-    auto response_len = std::make_shared<uint32_t>(htonl(write_buffer->size()));
-
-    std::vector<asio::const_buffer> buffers;
-    buffers.push_back(asio::buffer(response_len.get(), sizeof(uint32_t)));
-    buffers.push_back(asio::buffer(*write_buffer));
-    
-    asio::async_write(socket_, buffers, [this, self](std::error_code ec, std::size_t) {
-        if(ec) {
-            handle_error(ec);
+void Session::handle_chunk(const protocol::ChunkHeader& ch, const std::vector<uint8_t>& data) {
+    if(state_ == SessionState::UPLOADING) {
+        if(ch.flags == protocol::flags::SEND) {
+            if(valid_chunk(ch.index, ch.size, data)) {
+                if(transfer_.transfer_id == UINT32_MAX) { // transfer_id not initilized - upload not initialized
+                    std::cout << std::to_string(ch.transfer_id) << std::endl;
+                    transfer_.transfer_id = ch.transfer_id;
+                    std::cout << std::to_string(transfer_.transfer_id) << std::endl;
+                    upload_init();
+                }
+                uploading(ch.index, ch.size, data, protocol::flags::OK);
+                return;
+            }
+            upload_abort(false, true, protocol::flags::CHUNK_MISMATCH);
+            return;
+        } else if(ch.flags == protocol::flags::LAST) {
+            std::cout << "LAST" << std::endl;
+            if(valid_chunk(ch.index, ch.size, data)) {
+                uploading(ch.index, ch.size, data, protocol::flags::DONE);
+                return;
+            }
+            upload_abort(false, true, protocol::flags::CHUNK_MISMATCH);
+            return;
+        } else if(ch.flags == protocol::flags::ERROR) {
+            upload_abort(false, false, protocol::flags::ERROR);
+            return;
+        } else if(ch.flags == protocol::flags::EXIT) {
+            upload_abort(true, false, protocol::flags::EXIT);
+            exit();
             return;
         }
-    });
+    } else if (state_ == SessionState::DOWNLOADING) {
+        if(ch.flags == protocol::flags::OK) {
+            if(ch.transfer_id != transfer_.transfer_id) {
+                std::cout << std::to_string(ch.transfer_id) << " " << std::to_string(transfer_.transfer_id) << std::endl;
+                download_abort(false, true, protocol::flags::ERROR);
+                return;
+            }
+            transfer_.chunk_state[ch.index] = true;
+            partmeta_->mark_chunk_received(transfer_.transfer_id, ch.index);
+            downloading();
+        } else if (ch.flags == protocol::flags::DONE) {
+            transfer_.chunk_state[ch.index] = true;
+            download_done();
+            return;
+        } else if(ch.flags == protocol::flags::ERROR) {
+            download_abort(false, false, protocol::flags::ERROR);
+            return;
+        } else if(ch.flags == protocol::flags::EXIT) {
+            upload_abort(true, false, protocol::flags::EXIT);
+            exit();
+        }
+    }
 }
 
 void Session::login(protocol::Request& req) {
-    if(state_ != SessionSate::LOGIN) {
+    if(state_ != SessionState::LOGIN) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::SERVICE_UNAVAILABLE,
             "Already logged in",
             ""
         };
+        res.chunks.clear();
         json j;
         protocol::to_json(j, res);
-        write_response(j);
+        write_response_json(j);
         return;
     }
 
     if(req.first_argument.empty()) {
-        user_dir_ = relative(std::filesystem::path("/public/files"), root_);
-        current_dir_ = user_dir_;
-        username_ = "";
+        username_ = "public";
+        setup_dir();
         protocol::Response res {
             protocol::statuses::OK,
             protocol::codes::OK,
             "No username provided. Operating in public mode.",
             ""
         };
+        res.chunks.clear();
         json j;
         protocol::to_json(j, res);
-        write_response(j);
-        state_ = SessionSate::READY;
+        write_response_json(j);
+        state_ = SessionState::READY;
         return;
     }
+
+    if(req.first_argument == "public") {
+            username_ = "public";
+            setup_dir();
+            protocol::Response res {
+                protocol::statuses::OK,
+                protocol::codes::OK,
+                "Username \"public\" is reserved for public mode. Operating in public mode.",
+                ""
+            };
+            res.chunks.clear();
+            json j;
+            protocol::to_json(j, res);
+            write_response_json(j);
+            state_ = SessionState::READY;
+            return;
+        }
 
     username_ = req.first_argument;
     if(!db_->user_exists(req.first_argument)) {
@@ -154,10 +307,11 @@ void Session::login(protocol::Request& req) {
             "User does not exist. Do you want to register? (Y/n)",
             ""
         };
+        res.chunks.clear();
         json j;
         protocol::to_json(j, res);
-        write_response(j);
-        state_ = SessionSate::NEED_INPUT_REGISTER;
+        write_response_json(j);
+        state_ = SessionState::NEED_INPUT_REGISTER;
         return;
     } else {
         protocol::Response res {
@@ -166,41 +320,72 @@ void Session::login(protocol::Request& req) {
             "Please provide your password.",
             ""
         };
+        res.chunks.clear();
         json j;
         protocol::to_json(j, res);
-        write_response(j);
-        state_ = SessionSate::AUTH;
+        write_response_json(j);
+        state_ = SessionState::AUTH;
         return;
     }
 }
 
 void Session::setup_dir() {
-    if(fsutils::is_directory(std::filesystem::path(root_ / "private" / username_))) {
-        if(!fsutils::is_directory(std::filesystem::path(root_ / "private" / username_ / "files"))) {
+    if(username_ != "public") {
+        if(fsutils::is_directory(std::filesystem::path(root_ / "private" / username_))) {
+            if(!fsutils::is_directory(std::filesystem::path(root_ / "private" / username_ / "files"))) {
+                fsutils::mkdir(std::filesystem::path(root_ / "private" / username_ / "files"));
+            }
+            if(!fsutils::is_directory(std::filesystem::path(root_ / "private" / username_ / ".partial"))) {
+                fsutils::mkdir(std::filesystem::path(root_ / "private" / username_ / ".partial"));
+                fsutils::create_empty_file(std::filesystem::path(root_ / "private" / username_ / ".partial/partmeta.json"));
+            }
+            if(!fsutils::is_file(std::filesystem::path(root_ / "private" / username_ / ".partial/partmeta.json"))) {
+                fsutils::create_empty_file(std::filesystem::path(root_ / "private" / username_ / ".partial/partmeta.json"));
+            }
+
+        } else {
+            fsutils::mkdir(std::filesystem::path(root_ / "private" / username_));
             fsutils::mkdir(std::filesystem::path(root_ / "private" / username_ / "files"));
-        }
-        if(!fsutils::is_directory(std::filesystem::path(root_ / "private" / username_ / ".partial"))) {
             fsutils::mkdir(std::filesystem::path(root_ / "private" / username_ / ".partial"));
+            fsutils::create_empty_file(std::filesystem::path(root_ / "private" / username_ / ".partial/partmeta.json"));
         }
+        user_dir_ = fsutils::absolute(std::filesystem::path(root_ / "private" / username_ / "files"));
     } else {
-        fsutils::mkdir(std::filesystem::path(root_ / "private" / username_));
-        fsutils::mkdir(std::filesystem::path(root_ / "private" / username_ / "files"));
-        fsutils::mkdir(std::filesystem::path(root_ / "private" / username_ / ".partial"));
+        if(fsutils::is_directory(std::filesystem::path(root_ / "public"))) {
+            if(!fsutils::is_directory(std::filesystem::path(root_ / "public" / "files"))) {
+                fsutils::mkdir(std::filesystem::path(root_ / "public" / "files"));
+            }
+            if(!fsutils::is_directory(std::filesystem::path(root_ / "public" / ".partial"))) {
+                fsutils::mkdir(std::filesystem::path(root_ / "public" / ".partial"));
+                fsutils::create_empty_file(std::filesystem::path(root_ / "public/.partial/partmeta.json"));
+            }
+            if(!fsutils::is_file(std::filesystem::path(root_ / "public/.partial/partmeta.json"))) {
+                fsutils::create_empty_file(std::filesystem::path(root_ / "public/.partial/partmeta.json"));
+            }
+        } else {
+            fsutils::mkdir(std::filesystem::path(root_ / "public"));
+            fsutils::mkdir(std::filesystem::path(root_ / "public" / "files"));
+            fsutils::mkdir(std::filesystem::path(root_ / "public"/ ".partial"));
+            fsutils::create_empty_file(std::filesystem::path(root_ / "public/.partial/partmeta.json"));
+        }
+        user_dir_ = fsutils::absolute(std::filesystem::path(root_ / "public" / "files"));
     }
-    user_dir_ = fsutils::relative(std::filesystem::path("/private/" + username_ + "/files"), root_);
     current_dir_ = user_dir_;
+    partmeta_ = storage_->get_partmeta(username_);
 }
+
 void Session::auth(protocol::Request& req) {
-    if(state_ != SessionSate::AUTH) {
+    if(state_ != SessionState::AUTH) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::SERVICE_UNAVAILABLE,
             "Not in authentication state",
             ""
         };
+        res.chunks.clear();
         json j;
         protocol::to_json(j, res);
-        write_response(j);
+        write_response_json(j);
         return;
     }
 
@@ -211,9 +396,10 @@ void Session::auth(protocol::Request& req) {
             "Password cannot be empty. Try again.",
             ""
         };
+        res.chunks.clear();
         json j;
         protocol::to_json(j, res);
-        write_response(j);
+        write_response_json(j);
         return;
     } else if(db_->user_exists(username_)) {
         if(db_->validate_user(username_, req.first_argument)) {
@@ -224,10 +410,11 @@ void Session::auth(protocol::Request& req) {
                 "Authentication successful.",
                 ""
             };
+            res.chunks.clear();
             json j;
             protocol::to_json(j, res);
-            write_response(j);
-            state_ = SessionSate::READY;
+            write_response_json(j);
+            state_ = SessionState::READY;
             return;
         } else {
             protocol::Response res {
@@ -236,9 +423,10 @@ void Session::auth(protocol::Request& req) {
                 "Invalid password. Try again.",
                 ""
             };
+            res.chunks.clear();
             json j;
             protocol::to_json(j, res);
-            write_response(j);
+            write_response_json(j);
             return;
         }
     } else if(!db_->user_exists(username_)) {
@@ -250,16 +438,17 @@ void Session::auth(protocol::Request& req) {
             "Registration successful.",
             ""
         };
+        res.chunks.clear();
         json j;
         protocol::to_json(j, res);
-        write_response(j);
-        state_ = SessionSate::READY;
+        write_response_json(j);
+        state_ = SessionState::READY;
         return;
     }
 }
 void Session::need_input(protocol::Request& req) {
     switch (state_) {
-        case SessionSate::NEED_INPUT_REGISTER:
+        case SessionState::NEED_INPUT_REGISTER:
             if(req.first_argument == "Y") {
                 protocol::Response res {
                     protocol::statuses::AUTH,
@@ -267,14 +456,15 @@ void Session::need_input(protocol::Request& req) {
                     "For registration, please provide a password.",
                     ""
                 };
+                res.chunks.clear();
                 json j;
                 protocol::to_json(j, res);
-                write_response(j);
-                state_ = SessionSate::AUTH;
+                write_response_json(j);
+                state_ = SessionState::AUTH;
                 return; 
             } else if(req.first_argument == "n") {
-                user_dir_ = relative(std::filesystem::path("/public/files"), root_);
-                current_dir_ = user_dir_;
+                username_ = "public";
+                setup_dir();
 
                 protocol::Response res {
                     protocol::statuses::OK,
@@ -282,10 +472,11 @@ void Session::need_input(protocol::Request& req) {
                     "No registrartion. Operating in public mode.",
                     ""
                 };
+                res.chunks.clear();
                 json j;
                 protocol::to_json(j, res);
-                write_response(j);
-                state_ = SessionSate::READY;
+                write_response_json(j);
+                state_ = SessionState::READY;
                 return; 
             } else {
                 protocol::Response res {
@@ -294,13 +485,14 @@ void Session::need_input(protocol::Request& req) {
                     "Invalid input for registration. Y/n expected.",
                     ""
                 };
+                res.chunks.clear();
                 json j;
                 protocol::to_json(j, res);
-                write_response(j);
+                write_response_json(j);
                 return; 
             }
             break;
-        case SessionSate::NEED_INPUT_RESUME_UPDATE:
+        case SessionState::NEED_INPUT_RESUME_TREANSFER:
             // Handle resume update input
             break;
         default:
@@ -310,34 +502,96 @@ void Session::need_input(protocol::Request& req) {
                 "No input required at this time.",
                 ""
             };
+            res.chunks.clear();
             json j;
             protocol::to_json(j, res);
-            write_response(j);
+            write_response_json(j);
             return; 
     }
     // Implementation of need_input
 }
-void Session::exit(protocol::Request& req) {
-    // Implementation of exit
+void Session::exit() {
+    auto self = shared_from_this();
+    bool expected = false;
+    if(!exiting_.compare_exchange_strong(expected, true)) return;
+
+    bool socket_opened = socket_.is_open();
+
+    if(state_ == SessionState::UPLOADING ) {
+        upload_abort(true, socket_opened, protocol::flags::EXIT);
+    } else if (state_ == SessionState::DOWNLOADING) {
+        download_abort(true, socket_opened, protocol::flags::EXIT);
+    } else if (socket_opened) {
+        protocol::Response res{
+            protocol::statuses::EXIT,
+
+            
+        };
+        res.chunks.clear();
+        json j;
+        protocol::to_json(j, res);
+        write_response_json(j);
+    }
+
+    storage_->release_user_lock(username_);
+
+    std::error_code ec;
+    socket_.shutdown(tcp::socket::shutdown_both, ec);
+    socket_.close(ec);
+
+    state_ = SessionState::EXIT;
+    on_exit_(self);
 }
+
 void Session::list(protocol::Request& req) {
-    if(state_ != SessionSate::READY) {
+    if(state_ != SessionState::READY) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::SERVICE_UNAVAILABLE,
             "Session not ready.",
             ""
         };
+        res.chunks.clear();
         json j;
         protocol::to_json(j, res);
-        write_response(j);
+        write_response_json(j);
         return;
     }
+    if(!storage_->try_acquire_user_lock(username_)) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::SERVICE_UNAVAILABLE,
+            "Server is busy",
+            ""
+        };
+        res.chunks.clear();
+        json j;
+        protocol::to_json(j, res);
+        write_response_json(j);
+        return;
+    }
+
     if(req.first_argument.empty()) {
         std::vector<fsutils::FileMetadata> files = fsutils::scan_directory(current_dir_, false);
-        std::string file_list("Current directory: " + current_dir_.string() + "\n");
+        if(fsutils::is_scan_dir_error(files)) {
+            protocol::Response res {
+                protocol::statuses::ERROR,
+                protocol::codes::INTERNAL_SERVER_ERROR,
+                "Failed to list directory",
+                ""
+            };
+            res.chunks.clear();
+            json j;
+            protocol::to_json(j, res);
+            write_response_json(j);
+            storage_->release_user_lock(username_);
+            return;
+        }
+        auto curr_rel = fsutils::relative(user_dir_, current_dir_);
+        std::string file_list("Current directory: " + curr_rel.string() + "\n");
         for (const auto& file : files) {
-            file_list += file.relative_path.string() + "\n";
+            std::filesystem::path relative = fsutils::relative(current_dir_, file.absolute_path);
+            file_list += relative.string() + "\n";
         }
         protocol::Response res {
             protocol::statuses::OK,
@@ -345,39 +599,61 @@ void Session::list(protocol::Request& req) {
             file_list,
             ""
         };
+        res.chunks.clear();
         json j;
         protocol::to_json(j, res);
-        write_response(j);
+        write_response_json(j);
+        storage_->release_user_lock(username_);
         return;
     }else {
-        if(!fsutils::is_directory(std::filesystem::path(req.first_argument))) {
+        std::filesystem::path requested_dir = fsutils::absolute(std::filesystem::path(user_dir_ / req.first_argument));
+        if(!fsutils::is_directory(requested_dir)) {
             protocol::Response res {
                 protocol::statuses::ERROR,
                 protocol::codes::BAD_REQUEST,
                 "Directory does not exist.",
                 ""
             };
+            res.chunks.clear();
             json j;
             protocol::to_json(j, res);
-            write_response(j);
+            write_response_json(j);
+            storage_->release_user_lock(username_);
             return;
         }
-        if(!fsutils::is_subpath(user_dir_, std::filesystem::path(req.first_argument))) {
+        if(!fsutils::is_subpath(user_dir_, requested_dir)) {
             protocol::Response res {
                 protocol::statuses::ERROR,
                 protocol::codes::FORBIDDEN,
                 "Access denied.",
                 ""
             };
+            res.chunks.clear();
             json j;
             protocol::to_json(j, res);
-            write_response(j);
+            write_response_json(j);
+            storage_->release_user_lock(username_);
             return;
         }
-        std::vector<fsutils::FileMetadata> files = fsutils::scan_directory(std::filesystem::path(req.first_argument), false);
+        std::vector<fsutils::FileMetadata> files = fsutils::scan_directory(requested_dir, false);
+        if(fsutils::is_scan_dir_error(files)) {
+            protocol::Response res {
+                protocol::statuses::ERROR,
+                protocol::codes::INTERNAL_SERVER_ERROR,
+                "Failed to list directory",
+                ""
+            };
+            res.chunks.clear();
+            json j;
+            protocol::to_json(j, res);
+            write_response_json(j);
+            storage_->release_user_lock(username_);
+            return;
+        }
         std::string file_list;
         for (const auto& file : files) {
-            file_list += file.relative_path.string() + "\n";
+            std::filesystem::path relative = fsutils::relative(requested_dir, file.absolute_path);
+            file_list += relative.string() + "\n";
         }
         protocol::Response res {
             protocol::statuses::OK,
@@ -385,59 +661,82 @@ void Session::list(protocol::Request& req) {
             file_list,
             ""
         };
+        res.chunks.clear();
         json j;
         protocol::to_json(j, res);
-        write_response(j);
+        write_response_json(j);
+        storage_->release_user_lock(username_);
         return;
     }
 }
 void Session::delete_file(protocol::Request& req) {
-    if(state_ != SessionSate::READY) {
+    if(state_ != SessionState::READY) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::SERVICE_UNAVAILABLE,
             "Session not ready.",
             ""
         };
+        res.chunks.clear();
         json j;
         protocol::to_json(j, res);
-        write_response(j);
+        write_response_json(j);
         return;
     }
-    if(!fsutils::is_file(std::filesystem::path(req.first_argument))) {
+    if(!storage_->try_acquire_user_lock(username_)) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::SERVICE_UNAVAILABLE,
+            "Server is busy",
+            ""
+        };
+        res.chunks.clear();
+        json j;
+        protocol::to_json(j, res);
+        write_response_json(j);
+        return;
+    }
+    std::filesystem::path requested_file = fsutils::absolute(std::filesystem::path(user_dir_ / req.first_argument));
+    if(!fsutils::is_file(requested_file)) {
             protocol::Response res {
                 protocol::statuses::ERROR,
                 protocol::codes::BAD_REQUEST,
                 "File does not exist.",
                 ""
             };
+            res.chunks.clear();
             json j;
             protocol::to_json(j, res);
-            write_response(j);
+            write_response_json(j);
+            storage_->release_user_lock(username_);
             return;
         }
-        if(!fsutils::is_subpath(user_dir_, std::filesystem::path(req.first_argument))) {
+        if(!fsutils::is_subpath(user_dir_, requested_file)) {
             protocol::Response res {
                 protocol::statuses::ERROR,
                 protocol::codes::FORBIDDEN,
                 "Access denied.",
                 ""
             };
+            res.chunks.clear();
             json j;
             protocol::to_json(j, res);
-            write_response(j);
+            write_response_json(j);
+            storage_->release_user_lock(username_);
             return;
         }
-        if(!fsutils::remove_file(std::filesystem::path(req.first_argument))) {
+        if(!fsutils::remove_file(requested_file)) {
             protocol::Response res {
                 protocol::statuses::ERROR,
                 protocol::codes::INTERNAL_SERVER_ERROR,
                 "Cannot remove file",
                 ""
             };
+            res.chunks.clear();
             json j;
             protocol::to_json(j, res);
-            write_response(j);
+            write_response_json(j);
+            storage_->release_user_lock(username_);
             return;
         }
         protocol::Response res {
@@ -446,76 +745,339 @@ void Session::delete_file(protocol::Request& req) {
             "File deleted",
             ""
         };
+        res.chunks.clear();
         json j;
         protocol::to_json(j, res);
-        write_response(j);
+        write_response_json(j);
+        storage_->release_user_lock(username_);
 }
 
 void Session::upload(protocol::Request& req) {
-    // Implementation of upload
-}
-void Session::download(protocol::Request& req) {
-    // Implementation of download
-}
-void Session::cd(protocol::Request& req) {
-    if(state_ != SessionSate::READY) {
+    if(state_ != SessionState::READY) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::SERVICE_UNAVAILABLE,
             "Session not ready.",
             ""
         };
+        res.chunks.clear();
         json j;
         protocol::to_json(j, res);
-        write_response(j);
+        write_response_json(j);
         return;
     }
-    if(!fsutils::is_directory(std::filesystem::path(req.first_argument))) {
+    if(!storage_->try_acquire_user_lock(username_)) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::SERVICE_UNAVAILABLE,
+            "Server is busy",
+            ""
+        };
+        res.chunks.clear();
+        json j;
+        protocol::to_json(j, res);
+        write_response_json(j);
+        return;
+    }
+    std::filesystem::path requested_file = fsutils::absolute(std::filesystem::path(user_dir_ / req.first_argument));
+    if(fsutils::is_file(requested_file)) {
+            protocol::Response res {
+                protocol::statuses::ERROR,
+                protocol::codes::PRECONDITION_FAILED,
+                "File already exists.",
+                ""
+            };
+            res.chunks.clear();
+            json j;
+            protocol::to_json(j, res);
+            write_response_json(j);
+            storage_->release_user_lock(username_);
+            return;
+    }
+    if(fsutils::is_directory(requested_file)) {
+            protocol::Response res {
+                protocol::statuses::ERROR,
+                protocol::codes::PRECONDITION_FAILED,
+                "Requested file is an existing directory.",
+                ""
+            };
+            res.chunks.clear();
+            json j;
+            protocol::to_json(j, res);
+            write_response_json(j);
+            storage_->release_user_lock(username_);
+            return;
+    }
+    if(!fsutils::is_subpath(user_dir_, requested_file)) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::FORBIDDEN,
+            "Access denied.",
+            ""
+        };
+        res.chunks.clear();
+        json j;
+        protocol::to_json(j, res);
+        write_response_json(j);
+        storage_->release_user_lock(username_);
+        return;
+    }
+    if(req.size > UINT32_MAX) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::PRECONDITION_FAILED,
+            "File too large. Max 4GB.",
+            ""
+        };
+        res.chunks.clear();
+        json j;
+        protocol::to_json(j, res);
+        write_response_json(j);
+        storage_->release_user_lock(username_);
+        return;
+    }
+    fsutils::FileMetadata fmeta{
+        requested_file,
+        req.size,
+        0,
+        fsutils::hex_to_hash(req.file_hash)
+    };
+
+    transfer_.fmeta = fmeta;
+    transfer_.chunks = req.chunks;
+    transfer_.chunk_state = transfer_.chunk_state = std::vector<bool>(req.chunks.size(), false);
+
+    protocol::Response res {
+        protocol::statuses::OK,
+        protocol::codes::OK,
+        "Starting upload to file: " + requested_file.string(),
+        ""
+    };
+    res.chunks.clear();
+    json j;
+    protocol::to_json(j, res);
+    write_response_json(j);
+    state_ = SessionState::UPLOADING;
+    return;
+}
+void Session::download(protocol::Request& req) {
+    if(state_ != SessionState::READY) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::SERVICE_UNAVAILABLE,
+            "Session not ready.",
+            ""
+        };
+        res.chunks.clear();
+        json j;
+        protocol::to_json(j, res);
+        write_response_json(j);
+        return;
+    }
+    if(!storage_->try_acquire_user_lock(username_)) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::SERVICE_UNAVAILABLE,
+            "Server is busy",
+            ""
+        };
+        res.chunks.clear();
+        json j;
+        protocol::to_json(j, res);
+        write_response_json(j);
+        return;
+    }
+    std::filesystem::path requested_file = fsutils::absolute(std::filesystem::path(user_dir_ / req.first_argument));
+    if(!fsutils::is_file(requested_file)) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::PRECONDITION_FAILED,
+            "File does not exist.",
+            ""
+        };
+        res.chunks.clear();
+        json j;
+        protocol::to_json(j, res);
+        write_response_json(j);
+        storage_->release_user_lock(username_);
+        return;
+    }
+    if(fsutils::is_directory(requested_file)) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::PRECONDITION_FAILED,
+            "Requested file is an existing directory.",
+            ""
+        };
+        res.chunks.clear();
+        json j;
+        protocol::to_json(j, res);
+        write_response_json(j);
+        storage_->release_user_lock(username_);
+        return;
+    }
+    if(!fsutils::is_subpath(user_dir_, requested_file)) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::FORBIDDEN,
+            "Access denied.",
+            ""
+        };
+        res.chunks.clear();
+        json j;
+        protocol::to_json(j, res);
+        write_response_json(j);
+        storage_->release_user_lock(username_);
+        return;
+    }
+    fsutils::FileMetadata fmeta = fsutils::scan_file(requested_file);
+
+    if(fsutils::is_scan_file_error(fmeta)) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::INTERNAL_SERVER_ERROR,
+            "Failed to scan file.",
+            ""
+        };
+        res.chunks.clear();
+        json j;
+        protocol::to_json(j, res);
+        write_response_json(j);
+        storage_->release_user_lock(username_);
+        return;
+    }
+
+    if(fmeta.size == 0) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::PRECONDITION_FAILED,
+            "File is empty.",
+            ""
+        };
+        res.chunks.clear();
+        json j;
+        protocol::to_json(j, res);
+        write_response_json(j);
+        storage_->release_user_lock(username_);
+        return;
+    }
+
+    std::vector<protocol::ChunkInfo> chunks = fsutils::compute_chunks(fmeta);
+
+    if(fsutils::is_compute_chunks_error(chunks)) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::INTERNAL_SERVER_ERROR,
+            "Gathering chunk data failed.",
+            ""
+        };
+        res.chunks.clear();
+        json j;
+        protocol::to_json(j, res);
+        write_response_json(j);
+        storage_->release_user_lock(username_);
+        return;
+    }
+
+    transfer_.fmeta = fmeta;
+    transfer_.chunks = chunks;
+    transfer_.chunk_state = std::vector<bool>(chunks.size(), false);
+
+    if(fmeta.size > UINT32_MAX) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::PRECONDITION_FAILED,
+            "File too large. Max 4GB.",
+            ""
+        };
+        res.chunks.clear();
+        json j;
+        protocol::to_json(j, res);
+        write_response_json(j);
+        storage_->release_user_lock(username_);
+        return;
+    }
+
+    protocol::Response res {
+        protocol::statuses::OK,
+        protocol::codes::OK,
+        "Starting download.",
+        fsutils::hash_to_hex(transfer_.fmeta.hash)
+    };
+    res.chunks = transfer_.chunks;
+    json j;
+    protocol::to_json(j, res);
+    write_response_json(j);
+    state_ = SessionState::DOWNLOADING;
+    download_init();
+    return;
+}
+
+void Session::cd(protocol::Request& req) {
+    if(state_ != SessionState::READY) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::SERVICE_UNAVAILABLE,
+            "Session not ready.",
+            ""
+        };
+        res.chunks.clear();
+        json j;
+        protocol::to_json(j, res);
+        write_response_json(j);
+        return;
+    }
+    std::filesystem::path requested_dir = fsutils::absolute(std::filesystem::path(user_dir_ / req.first_argument));
+    if(!fsutils::is_directory(requested_dir)) {
             protocol::Response res {
                 protocol::statuses::ERROR,
                 protocol::codes::BAD_REQUEST,
                 "Directory does not exist.",
                 ""
             };
+            res.chunks.clear();
             json j;
             protocol::to_json(j, res);
-            write_response(j);
+            write_response_json(j);
             return;
         }
-        if(!fsutils::is_subpath(user_dir_, std::filesystem::path(req.first_argument))) {
+        if(!fsutils::is_subpath(user_dir_, requested_dir)) {
             protocol::Response res {
                 protocol::statuses::ERROR,
                 protocol::codes::FORBIDDEN,
                 "Access denied.",
                 ""
             };
+            res.chunks.clear();
             json j;
             protocol::to_json(j, res);
-            write_response(j);
+            write_response_json(j);
             return;
         }
-        current_dir_ = std::filesystem::path(req.first_argument);
+        current_dir_ = requested_dir;
         protocol::Response res {
             protocol::statuses::OK,
             protocol::codes::OK,
             "Directory changed.",
             ""
         };
+        res.chunks.clear();
         json j;
         protocol::to_json(j, res);
-        write_response(j);
+        write_response_json(j);
 }
 void Session::mkdir(protocol::Request& req) {
-    if(state_ != SessionSate::READY) {
+    if(state_ != SessionState::READY) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::SERVICE_UNAVAILABLE,
             "Session not ready.",
             ""
         };
+        res.chunks.clear();
         json j;
         protocol::to_json(j, res);
-        write_response(j);
+        write_response_json(j);
         return;
     }
     if(req.first_argument.empty()) {
@@ -525,45 +1087,66 @@ void Session::mkdir(protocol::Request& req) {
                 "Directory path cannot be empty.",
                 ""
             };
+            res.chunks.clear();
             json j;
             protocol::to_json(j, res);
-            write_response(j);
+            write_response_json(j);
             return;
     }
-    if(fsutils::is_directory(std::filesystem::path(req.first_argument))) {
+    if(!storage_->try_acquire_user_lock(username_)) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::SERVICE_UNAVAILABLE,
+            "Server is busy",
+            ""
+        };
+        res.chunks.clear();
+        json j;
+        protocol::to_json(j, res);
+        write_response_json(j);
+        return;
+    }
+    std::filesystem::path requested_dir = fsutils::absolute(std::filesystem::path(user_dir_ / req.first_argument));
+    if(fsutils::is_directory(requested_dir)) {
             protocol::Response res {
                 protocol::statuses::ERROR,
                 protocol::codes::PRECONDITION_FAILED,
                 "Directory already exists.",
                 ""
             };
+            res.chunks.clear();
             json j;
             protocol::to_json(j, res);
-            write_response(j);
+            write_response_json(j);
+            storage_->release_user_lock(username_);
             return;
         }
-    if(!fsutils::is_subpath(user_dir_, std::filesystem::path(req.first_argument))) {
+    if(!fsutils::is_subpath(user_dir_, requested_dir)) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::FORBIDDEN,
             "Access denied.",
             ""
         };
+        res.chunks.clear();
         json j;
         protocol::to_json(j, res);
-        write_response(j);
+        write_response_json(j);
+        storage_->release_user_lock(username_);
         return;
     }
-    if(!fsutils::mkdir(std::filesystem::path(req.first_argument))) {
+    if(!fsutils::mkdir(requested_dir)) {
         protocol::Response res {
                 protocol::statuses::ERROR,
                 protocol::codes::INTERNAL_SERVER_ERROR,
                 "Cannot create directory.",
                 ""
             };
+            res.chunks.clear();
             json j;
             protocol::to_json(j, res);
-            write_response(j);
+            write_response_json(j);
+            storage_->release_user_lock(username_);
             return;
     }
     protocol::Response res {
@@ -572,21 +1155,24 @@ void Session::mkdir(protocol::Request& req) {
             "Directory created.",
             ""
         };
+        res.chunks.clear();
         json j;
         protocol::to_json(j, res);
-        write_response(j);
+        write_response_json(j);
+        storage_->release_user_lock(username_);
 }
 void Session::rmdir(protocol::Request& req) {
-    if(state_ != SessionSate::READY) {
+    if(state_ != SessionState::READY) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::SERVICE_UNAVAILABLE,
             "Session not ready.",
             ""
         };
+        res.chunks.clear();
         json j;
         protocol::to_json(j, res);
-        write_response(j);
+        write_response_json(j);
         return;
     }
     if(req.first_argument.empty()) {
@@ -596,45 +1182,66 @@ void Session::rmdir(protocol::Request& req) {
                 "Directory path cannot be empty.",
                 ""
             };
+            res.chunks.clear();
             json j;
             protocol::to_json(j, res);
-            write_response(j);
+            write_response_json(j);
             return;
     }
-    if(!fsutils::is_directory(std::filesystem::path(req.first_argument))) {
+    if(!storage_->try_acquire_user_lock(username_)) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::SERVICE_UNAVAILABLE,
+            "Server is busy",
+            ""
+        };
+        res.chunks.clear();
+        json j;
+        protocol::to_json(j, res);
+        write_response_json(j);
+        return;
+    }
+    std::filesystem::path requested_dir = fsutils::absolute(std::filesystem::path(user_dir_ / req.first_argument));
+    if(!fsutils::is_directory(requested_dir)) {
             protocol::Response res {
                 protocol::statuses::ERROR,
                 protocol::codes::BAD_REQUEST,
                 "Directory does no  exist.",
                 ""
             };
+            res.chunks.clear();
             json j;
             protocol::to_json(j, res);
-            write_response(j);
+            write_response_json(j);
+            storage_->release_user_lock(username_);
             return;
         }
-    if(!fsutils::is_subpath(user_dir_, std::filesystem::path(req.first_argument))) {
+    if(!fsutils::is_subpath(user_dir_, requested_dir) || user_dir_ == requested_dir) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::FORBIDDEN,
             "Access denied.",
             ""
         };
+        res.chunks.clear();
         json j;
         protocol::to_json(j, res);
-        write_response(j);
+        write_response_json(j);
+        storage_->release_user_lock(username_);
         return;
     }
-    if(!fsutils::rmdir(std::filesystem::path(req.first_argument))) {
+    if(!fsutils::rmdir(requested_dir)) {
         protocol::Response res {
                 protocol::statuses::ERROR,
                 protocol::codes::INTERNAL_SERVER_ERROR,
                 "Cannot delete directory.",
                 ""
             };
+            res.chunks.clear();
             json j;
             protocol::to_json(j, res);
-            write_response(j);
+            write_response_json(j);
+            storage_->release_user_lock(username_);
             return;
     }
     protocol::Response res {
@@ -643,21 +1250,24 @@ void Session::rmdir(protocol::Request& req) {
             "Directory deleted.",
             ""
         };
+        res.chunks.clear();
         json j;
         protocol::to_json(j, res);
-        write_response(j);
+        write_response_json(j);
+        storage_->release_user_lock(username_);
 }
 void Session::move(protocol::Request& req) {
-    if(state_ != SessionSate::READY) {
+    if(state_ != SessionState::READY) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::SERVICE_UNAVAILABLE,
             "Session not ready.",
             ""
         };
+        res.chunks.clear();
         json j;
         protocol::to_json(j, res);
-        write_response(j);
+        write_response_json(j);
         return;
     }
     if(req.first_argument.empty() || req.second_argument.empty()) {
@@ -667,72 +1277,107 @@ void Session::move(protocol::Request& req) {
                 "File path cannot be empty.",
                 ""
             };
+            res.chunks.clear();
             json j;
             protocol::to_json(j, res);
-            write_response(j);
+            write_response_json(j);
             return;
     }
-    if((fsutils::is_directory(std::filesystem::path(req.second_argument)) &&
-        fsutils::is_directory(std::filesystem::path(req.second_argument))) ||
-        (fsutils::is_file(std::filesystem::path(req.second_argument)) &&
-        fsutils::is_file(std::filesystem::path(req.second_argument)))) {
+    if(!storage_->try_acquire_user_lock(username_)) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::SERVICE_UNAVAILABLE,
+            "Server is busy",
+            ""
+        };
+        res.chunks.clear();
+        json j;
+        protocol::to_json(j, res);
+        write_response_json(j);
+        return;
+    }
+    std::filesystem::path requested_src = fsutils::absolute(std::filesystem::path(user_dir_ / req.first_argument));
+    std::filesystem::path requested_dst = fsutils::absolute(std::filesystem::path(user_dir_ / req.second_argument));
+    if(!(fsutils::is_directory(requested_src) || fsutils::is_file(requested_src))) {
             protocol::Response res {
                 protocol::statuses::ERROR,
                 protocol::codes::PRECONDITION_FAILED,
                 "Incorrect paths.",
                 ""
             };
+            res.chunks.clear();
             json j;
             protocol::to_json(j, res);
-            write_response(j);
+            write_response_json(j);
+            storage_->release_user_lock(username_);
             return;
-        }
-    if(!fsutils::is_subpath(user_dir_, std::filesystem::path(req.first_argument)) 
-        || !fsutils::is_subpath(user_dir_, std::filesystem::path(req.second_argument))) {
+    }
+    if(fsutils::is_directory(requested_dst) || fsutils::is_file(requested_dst)) {
+            protocol::Response res {
+                protocol::statuses::ERROR,
+                protocol::codes::PRECONDITION_FAILED,
+                "Destination path already exists.",
+                ""
+            };
+            res.chunks.clear();
+            json j;
+            protocol::to_json(j, res);
+            write_response_json(j);
+            storage_->release_user_lock(username_);
+            return;
+    }
+    if(!fsutils::is_subpath(user_dir_, requested_src) || !fsutils::is_subpath(user_dir_, requested_dst)) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::FORBIDDEN,
             "Access denied.",
             ""
         };
+        res.chunks.clear();
         json j;
         protocol::to_json(j, res);
-        write_response(j);
+        write_response_json(j);
+        storage_->release_user_lock(username_);
         return;
     }
-    if(!(fsutils::move_file(std::filesystem::path(req.first_argument), std::filesystem::path(req.second_argument), false))) {
+    if(!(fsutils::move_path(requested_src ,requested_dst, false))) {
         protocol::Response res {
                 protocol::statuses::ERROR,
                 protocol::codes::INTERNAL_SERVER_ERROR,
-                "Cannot move files.",
+                "Cannot move paths.",
                 ""
             };
+            res.chunks.clear();
             json j;
             protocol::to_json(j, res);
-            write_response(j);
+            write_response_json(j);
+            storage_->release_user_lock(username_);
             return;
     }
     protocol::Response res {
             protocol::statuses::OK,
             protocol::codes::OK,
-            "File moved.",
+            "Path moved.",
             ""
         };
+        res.chunks.clear();
         json j;
         protocol::to_json(j, res);
-        write_response(j);
+        write_response_json(j);
+        storage_->release_user_lock(username_);
 }
 void Session::copy(protocol::Request& req) {
-    if(state_ != SessionSate::READY) {
+    if(state_ != SessionState::READY) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::SERVICE_UNAVAILABLE,
             "Session not ready.",
             ""
         };
+        res.chunks.clear();
         json j;
         protocol::to_json(j, res);
-        write_response(j);
+        write_response_json(j);
         return;
     }
     if(req.first_argument.empty() || req.second_argument.empty()) {
@@ -742,62 +1387,280 @@ void Session::copy(protocol::Request& req) {
                 "File path cannot be empty.",
                 ""
             };
+            res.chunks.clear();
             json j;
             protocol::to_json(j, res);
-            write_response(j);
+            write_response_json(j);
             return;
     }
-    if((fsutils::is_directory(std::filesystem::path(req.second_argument)) &&
-        fsutils::is_directory(std::filesystem::path(req.second_argument))) ||
-        (fsutils::is_file(std::filesystem::path(req.second_argument)) &&
-        fsutils::is_file(std::filesystem::path(req.second_argument)))) {
+    if(!storage_->try_acquire_user_lock(username_)) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::SERVICE_UNAVAILABLE,
+            "Server is busy",
+            ""
+        };
+        res.chunks.clear();
+        json j;
+        protocol::to_json(j, res);
+        write_response_json(j);
+        return;
+    }
+    std::filesystem::path requested_src = fsutils::absolute(std::filesystem::path(user_dir_ / req.first_argument));
+    std::filesystem::path requested_dst = fsutils::absolute(std::filesystem::path(user_dir_ / req.second_argument));
+    if(!(fsutils::is_directory(requested_src) || fsutils::is_file(requested_src))) {
             protocol::Response res {
                 protocol::statuses::ERROR,
                 protocol::codes::PRECONDITION_FAILED,
                 "Incorrect paths.",
                 ""
             };
+            res.chunks.clear();
             json j;
             protocol::to_json(j, res);
-            write_response(j);
+            write_response_json(j);
+            storage_->release_user_lock(username_);
             return;
-        }
-    if(!fsutils::is_subpath(user_dir_, std::filesystem::path(req.first_argument)) 
-        || !fsutils::is_subpath(user_dir_, std::filesystem::path(req.second_argument))) {
+    }
+    if(fsutils::is_directory(requested_dst) || fsutils::is_file(requested_dst)) {
+            protocol::Response res {
+                protocol::statuses::ERROR,
+                protocol::codes::PRECONDITION_FAILED,
+                "Destination path already exists.",
+                ""
+            };
+            res.chunks.clear();
+            json j;
+            protocol::to_json(j, res);
+            write_response_json(j);
+            storage_->release_user_lock(username_);
+            return;
+    }
+    if(!fsutils::is_subpath(user_dir_, requested_src) || !fsutils::is_subpath(user_dir_, requested_dst)) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::FORBIDDEN,
             "Access denied.",
             ""
         };
+        res.chunks.clear();
         json j;
         protocol::to_json(j, res);
-        write_response(j);
+        write_response_json(j);
+        storage_->release_user_lock(username_);
         return;
     }
-    if(!(fsutils::copy_file(std::filesystem::path(req.first_argument), std::filesystem::path(req.second_argument), false))) {
+    if(!(fsutils::copy_path(requested_src, requested_dst, false))) {
         protocol::Response res {
                 protocol::statuses::ERROR,
                 protocol::codes::INTERNAL_SERVER_ERROR,
-                "Cannot copy files.",
+                "Cannot copy paths.",
                 ""
             };
+            res.chunks.clear();
             json j;
             protocol::to_json(j, res);
-            write_response(j);
+            write_response_json(j);
+            storage_->release_user_lock(username_);
             return;
     }
     protocol::Response res {
             protocol::statuses::OK,
             protocol::codes::OK,
-            "File copied.",
+            "Path copied.",
             ""
         };
+        res.chunks.clear();
         json j;
         protocol::to_json(j, res);
-        write_response(j);
+        write_response_json(j);
+        storage_->release_user_lock(username_);
 }
 
 void Session::sync(protocol::Request& req) {
     // Implementation of sync
+}
+bool Session::valid_file(const std::filesystem::path& partial_file, const std::array<uint8_t, crypto_generichash_BYTES>& expected) {
+    std::array<uint8_t, crypto_generichash_BYTES> hash = fsutils::hash_file(partial_file);
+    std::cout << fsutils::hash_to_hex(hash) << " =? " << fsutils::hash_to_hex(expected) << std::endl;
+
+    return hash == expected && !fsutils::is_hash_error(hash);
+}
+
+bool Session::valid_chunk(const uint32_t& index, const uint32_t& size, const std::vector<uint8_t>& data) {
+    protocol::ChunkInfo chunk = transfer_.chunks[index];
+    if(chunk.size != size) return false;
+    if(chunk.index != index) return false;
+    std::array<uint8_t, crypto_generichash_BYTES> hash = fsutils::hash_chunk(data);
+    return hash == fsutils::hex_to_hash(chunk.chunk_hash) && !fsutils::is_hash_error(hash);
+}
+
+void Session::upload_init() {
+    partmeta_->add_partial_metadata(TransferType::UPLOAD, transfer_.fmeta, transfer_.chunks, transfer_.transfer_id);
+    transfer_.partial_path = partmeta_->get_partial_path(transfer_.transfer_id);
+    if(transfer_.partial_path.empty()) {
+        upload_abort(false, true, protocol::flags::ERROR);
+        return;
+    } 
+    if(!fsutils::is_file(transfer_.partial_path)) {
+        fsutils::create_empty_file(transfer_.partial_path);
+    }
+}
+
+void Session::uploading(const uint32_t& index, const uint32_t& size, const std::vector<uint8_t>& data, uint8_t flag) {
+    transfer_.chunk_state[index] = true;
+    partmeta_->mark_chunk_received(transfer_.transfer_id, index);
+
+    uint32_t offset = fsutils::CHUNK_SIZE * index;
+    if(!fsutils::write_chunk(transfer_.partial_path, offset, data)) {
+        flag = protocol::flags::ERROR;
+        upload_abort(false, true, flag);
+        return;
+    }
+
+    if(flag == protocol::flags::DONE) {
+        if(!valid_file(transfer_.partial_path, transfer_.fmeta.hash)) {
+            flag = protocol::flags::ERROR;
+            upload_abort(false, true, flag);
+            return;
+        }
+    }
+    protocol::ChunkHeader ch{
+        transfer_.transfer_id,
+        index,
+        0,
+        flag
+    };
+
+    std::vector<uint8_t> response_data;
+
+    send_chunk(ch, response_data);
+
+    if(flag == protocol::flags::DONE) {
+        upload_done();
+    }
+}
+
+void Session::upload_done() {
+    fsutils::move_path(transfer_.partial_path, transfer_.fmeta.absolute_path, true);
+    partmeta_->delete_partial_metadata(transfer_.transfer_id);
+
+    transfer_.transfer_id = UINT32_MAX;
+    transfer_.fmeta = fsutils::FileMetadata{};
+    transfer_.chunk_state.clear();
+    transfer_.chunks.clear();
+
+    storage_->release_user_lock(username_);
+    state_ = SessionState::READY;
+}
+
+void Session::upload_abort(bool save, bool notify, uint8_t flag) {
+    if(save) {
+        partmeta_->save();
+    } else {
+        fsutils::remove_file(transfer_.partial_path);
+        partmeta_->delete_partial_metadata(transfer_.transfer_id);
+
+        transfer_.transfer_id = UINT32_MAX;
+        transfer_.fmeta = fsutils::FileMetadata{};
+        transfer_.chunk_state.clear();
+        transfer_.chunks.clear();
+    }
+
+    if(notify) {
+        protocol::ChunkHeader ch{
+            transfer_.transfer_id,
+            UINT32_MAX,
+            0,
+            flag
+        };
+
+        std::vector<uint8_t> data;
+
+        send_chunk(ch, data);
+    }
+
+    storage_->release_user_lock(username_);
+    state_ = SessionState::READY;
+}
+
+void Session::download_init() {
+    transfer_.transfer_id = partmeta_->add_partial_metadata(TransferType::DOWNLOAD, transfer_.fmeta, transfer_.chunks, UINT32_MAX);
+    std::cout << std::to_string(transfer_.transfer_id) << std::endl;
+    downloading();
+}
+
+void Session::downloading() {
+    uint32_t index;
+
+    for(uint32_t i = 0; i < transfer_.chunk_state.size(); ++i) {
+        if(!transfer_.chunk_state[i]) {
+            index = i;
+            break;
+        }
+    }
+    protocol::ChunkInfo chunk = transfer_.chunks[index];
+    uint8_t flag = protocol::flags::SEND;
+
+    if(chunk.index == (transfer_.chunks.size() - 1)) {
+        flag = protocol::flags::LAST;
+    }
+
+    protocol::ChunkHeader chunk_header{
+        transfer_.transfer_id,
+        chunk.index,
+        chunk.size,
+        flag
+    };
+
+    std::cout << std::to_string(transfer_.transfer_id) << std::endl;
+
+    uint32_t offset = fsutils::CHUNK_SIZE * chunk.index;
+
+    std::vector<uint8_t> data = fsutils::read_chunk(transfer_.fmeta.absolute_path, offset, chunk.size);
+    if(data.empty()) {
+
+        return;
+    }
+    send_chunk(chunk_header, data);
+}
+
+void Session::download_done() {
+    partmeta_->delete_partial_metadata(transfer_.transfer_id);
+
+    transfer_.transfer_id = UINT32_MAX;
+    transfer_.fmeta = fsutils::FileMetadata{};
+    transfer_.chunk_state.clear();
+    transfer_.chunks.clear();
+
+    storage_->release_user_lock(username_);
+    state_ = SessionState::READY;
+}
+
+void Session::download_abort(bool save, bool notify, uint8_t flag) {
+    if(save) {
+        partmeta_->save();
+    } else {
+        partmeta_->delete_partial_metadata(transfer_.transfer_id);
+
+        transfer_.transfer_id = UINT32_MAX;
+        transfer_.fmeta = fsutils::FileMetadata{};
+        transfer_.chunk_state.clear();
+        transfer_.chunks.clear();
+    }
+
+    if(notify) {
+        protocol::ChunkHeader chunk_header{
+            transfer_.transfer_id,
+            UINT32_MAX,
+            0,
+            flag
+        };
+
+        std::vector<uint8_t> data;
+
+        send_chunk(chunk_header, data);
+    }
+    storage_->release_user_lock(username_);
+    state_ = SessionState::READY;
 }

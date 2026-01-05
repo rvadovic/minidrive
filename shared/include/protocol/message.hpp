@@ -3,26 +3,51 @@
 #include <nlohmann/json.hpp>
 #include <string>
 #include <cstdint>
+#include <sodium.h>
 
 namespace protocol {
 
 using json = nlohmann::json;
 
+// Info about chunk for a file
+struct ChunkInfo {
+    uint32_t index; // chunk index
+    u_int32_t size; // size of chunk
+    std::string chunk_hash; //hash_to_hex value
+};
+
+// Client request JSON protocol
 struct Request {
-    std::string cmd;
+    std::string cmd; // command
     std::string first_argument;
     std::string second_argument;
     uint32_t size;
-    std::string hash;
+    std::string file_hash;
+    std::vector<ChunkInfo> chunks;
 };
 
+// Server rsponse JSON protocol
 struct Response {
-    std::string status;
-    uint16_t code;
+    std::string status; // server status
+    uint16_t code; // code from protocol/codes.hpp
     std::string message;
-    std::string hash;
+    std::string file_hash;
+    std::vector<ChunkInfo> chunks;
 };
 
+// Binary protocol for file transfers
+#pragma pack(push, 1)
+struct ChunkHeader {
+    uint32_t transfer_id;
+    uint32_t index; // chunk index
+    uint32_t size; // chunk size
+    uint8_t flags; // defined in protocol/flags.hpp
+};
+#pragma pack(pop)
+
+// Parsing
+void to_json(json& json, const ChunkInfo& ci);
+void from_json(const json& json, ChunkInfo& ci);
 void to_json(json& json, const Request& req);
 void to_json(json& json, const Response& res);
 void from_json(const json& json, Request& req);

@@ -78,15 +78,11 @@ int main(int argc, char* argv[]) {
     Client client(hp.username, io_context);
     client.connect(hp.host, hp.port);
 
-    // keep io_context alive
-    asio::executor_work_guard<asio::io_context::executor_type> guard(io_context.get_executor());
-
-    // handle SIGINT
+    // handle SIGINT, SIGTERM
     asio::signal_set signals(io_context, SIGINT, SIGTERM);
     signals.async_wait([&](const std::error_code& ec, int) {
-        std::cout << std::endl << "SIGINT received, shutting down..." << std::endl;
+        std::cout << std::endl << "Signal received, shutting down..." << std::endl;
         client.exit();
-        guard.reset(); // allow io-context.run() to return
     });
 
     // network thread

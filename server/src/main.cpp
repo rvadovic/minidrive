@@ -67,9 +67,33 @@ int main(int argc, char* argv[]) {
 
     asio::io_context io_context;
     Server server(io_context, port, root);
+
+    asio::signal_set signals(io_context, SIGINT, SIGTERM);
+    signals.async_wait([&](const std::error_code& ec, int) {
+        std::cout << std::endl << "Signal received, shutting down..." << std::endl;
+        server.exit_all_sessions();
+    });
+
     std::cout << "Starting async server (version " << minidrive::version() << ") on port " << port << std::endl;
     server.start();
-    io_context.run();
+
+    const unsigned int thread_count =  std::max(1u, std::thread::hardware_concurrency());
+
+    std::vector<std::thread> pool;
+    pool.reserve(thread_count);
+
+    for(unsigned int i = 0; i < thread_count; i++) {
+        pool.emplace_back([&io_context] {
+            io_context.run();
+        });
+    }
+
+    //io_context.stop();
+    
+    for (auto& t : pool) {
+        t.join();
+    }
+    
     std::cout << "Server exited." << std::endl;
     return 0;
 }

@@ -4,9 +4,9 @@
 
 TerminalNoEcho::TerminalNoEcho() {
     tcgetattr(STDIN_FILENO, &old_);
-        new_ = old_;
-        new_.c_cflag &= ~ECHO;
-        tcsetattr(STDIN_FILENO, TCSANOW, &new_);
+    new_ = old_;
+    new_.c_lflag &= ~static_cast<tcflag_t>(ECHO);
+    tcsetattr(STDIN_FILENO, TCSANOW, &new_);
 }
 
 TerminalNoEcho::~TerminalNoEcho() {

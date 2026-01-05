@@ -1,7 +1,5 @@
 # MiniDrive Protocol
 
-**Draft you should delete this or edit it** 
-
 This document will capture the JSON command/response schema and binary transfer framing once the implementation stabilises.
 
 ## Control Channel
@@ -10,13 +8,27 @@ This document will capture the JSON command/response schema and binary transfer 
 - Each message is framed using a 32-bit unsigned length prefix (network byte order).
 - Example request:
   ```json
-  { "cmd": "LIST", "args": { "path": "." } }
+  { 
+    "cmd": "UPLOAD", 
+    "first_argument": "./data/client_root/files/file.txt", 
+    "second_argument": "./test/file.txt", "size": "262144", 
+    "file_hash": "f23cb2...", 
+    "chunks": [ 
+      { "index": "0", "size": "262144", "chunk_hash": "a7d9bd..." } 
+    ] 
+  }
   ```
 - Example response:
   ```json
-  { "status": "OK", "code": 0, "message": "", "data": { "entries": [] } }
+  { "status": "OK", 
+    "code": 200, 
+    "message": "Starting upload", 
+    "file_hash": "", 
+    "chunks": [
+    ] 
+  }
   ```
 
 ## Data Channel
 
-File uploads/downloads reuse the TCP connection and stream binary chunks with per-chunk metadata (size, hash). Details TBD.
+File uploads/downloads reuse the TCP connection and stream binary chunks with per-chunk metadata (transfer_id, index, size, flags).

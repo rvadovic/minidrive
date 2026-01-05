@@ -2,6 +2,7 @@ add_library(minidrive_shared STATIC
     src/version.cpp
     src/protocol/message.cpp
     src/filesystem/utils.cpp
+    src/filesystem/partmeta.cpp
 )
 
 target_include_directories(minidrive_shared
