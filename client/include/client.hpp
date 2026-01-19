@@ -68,10 +68,17 @@ private:
     void read_body_json(); // read message of json message using async_read, call handle_response(), then read_next()
     void send_json(const nlohmann::json& j); // send json message using async_write
 
+    // Special write which calls finish_exit()
+    void send_json_exit(const nlohmann::json& j);
+
     // Read loop and write using binary protocol for chunk transfer
     void read_header_chunk(); // Read header of binary data using async_read, call read_body_chunk()
     void read_body_chunk(); // Read data of binary data using async_read, call handle_
     void send_chunk(const protocol::ChunkHeader& ch, const std::vector<uint8_t>& data); // Send data of binary data using async_write
+
+    // Special write which calls finish_exit();
+    void send_chunk_exit(const protocol::ChunkHeader& ch, const std::vector<uint8_t>& data);
+
 
     // Protocol switch between binary data and json message based on state_
     void read_next();
@@ -81,6 +88,9 @@ private:
     void handle_response(const nlohmann::json& j); // Handles json response message from server
     void handle_request(const std::string& line); // Handles string request command from user
     void handle_chunk(const protocol::ChunkHeader& ch, const std::vector<uint8_t>& data); // Handles recieved binary data from server, calls transfer functions
+
+    // Closes socket and on exit removes itself from sessions_ list in server
+    void finish_exit();
 
     // Automatic operations
     void login(); // Send login request to server with username triggered by connect()
@@ -105,6 +115,7 @@ private:
     void uploading(); // Pick chunk to send, read chunk of file and send it, call send_chunk()
     void upload_done(); // Delete partial file metadata, nullify transfer_, state_ = READY
     void upload_abort(bool save, bool notify, uint8_t flag); // Delete or save partial file metadta, notify server with protocol::flag
+    void upload_abort_exit(bool save, bool notify, uint8_t flag); // calls finish_exit()
 
     // Download
     bool valid_file(const std::filesystem::path& partial_file, const std::array<uint8_t, crypto_generichash_BYTES>& expected); // Compute hash of full file after download and compare with expected
@@ -114,6 +125,7 @@ private:
     void downloading(const uint32_t& index, const uint32_t& size, const std::vector<uint8_t>& data, uint8_t flag); // Systemtically sends one chunk, is called by handle_chunk()
     void download_done(); // Delete partial metadata from database partmeta_ (client_root/.partial/partmeta.json)
     void download_abort(bool save, bool notify, uint8_t flag); // Delete or save partial file metadata, delete .part file, notify server with protocol::flag
+    void download_abort_exit(bool save, bool notify, uint8_t flag); // calls finish_exit()
 
     // Set cmd for password entry
     void on_password_required();

@@ -60,14 +60,11 @@ void Session::read_body_json() {
     auto self = shared_from_this();
     if(msg_len_ == 0) {
         handle_error(asio::error::invalid_argument);
-        read_next();
     }
     asio::async_read(socket_, asio::buffer(buffer_),[this, self](std::error_code ec, std::size_t) {
         if(!ec) {
             std::string msg(buffer_.begin(), buffer_.end());
             json j = json::parse(msg);
-
-            std::cout << "after reading" << std::endl;
             handle_request(j);
             read_next();
         } else {
@@ -98,6 +95,27 @@ void Session::write_response_json(const json& j) {
             handle_error(ec);
             return;
         }
+    });
+}
+
+void Session::write_response_json_exit(const json& j) {
+    auto self = shared_from_this();
+
+    auto write_buffer = std::make_shared<std::string>(j.dump());
+
+    if(write_buffer->size() > std::numeric_limits<uint32_t>::max()) {
+        std::cout << std::endl << "File data was too large." << std::endl;
+        return;
+    }
+
+    auto response_len = std::make_shared<uint32_t>(htonl(write_buffer->size()));
+
+    std::vector<asio::const_buffer> buffers;
+    buffers.push_back(asio::buffer(response_len.get(), sizeof(uint32_t)));
+    buffers.push_back(asio::buffer(*write_buffer));
+    
+    asio::async_write(socket_, buffers, [this, self, write_buffer, response_len](std::error_code ec, std::size_t) {
+        finish_exit();
     });
 }
 
@@ -157,7 +175,28 @@ void Session::send_chunk(const protocol::ChunkHeader& ch, const std::vector<uint
     });
 }
 
+void Session::send_chunk_exit(const protocol::ChunkHeader& ch, const std::vector<uint8_t>& data) {
+    auto self = shared_from_this();
+
+    auto header = std::make_shared<protocol::ChunkHeader>();
+    header->transfer_id = htonl(ch.transfer_id);
+    header->index = htonl(ch.index);
+    header->size = htonl(ch.size);
+    header->flags = ch.flags;
+
+    auto data_to_write = std::make_shared<std::vector<uint8_t>>(data);
+
+    std::vector<asio::const_buffer> buffers;
+    buffers.push_back(asio::buffer(header.get(), sizeof(protocol::ChunkHeader)));
+    buffers.push_back(asio::buffer(*data_to_write));
+
+    asio::async_write(socket_, buffers, [this, self, header, data_to_write](std::error_code ec, std::size_t) {
+        finish_exit();
+    });
+}
+
 void Session::read_next() {
+    if(exiting_) return;
     if(state_ == SessionState::UPLOADING || state_ == SessionState::DOWNLOADING) {
         read_header_chunk();
     } else {
@@ -200,9 +239,7 @@ void Session::handle_chunk(const protocol::ChunkHeader& ch, const std::vector<ui
         if(ch.flags == protocol::flags::SEND) {
             if(valid_chunk(ch.index, ch.size, data)) {
                 if(transfer_.transfer_id == UINT32_MAX) { // transfer_id not initilized - upload not initialized
-                    std::cout << std::to_string(ch.transfer_id) << std::endl;
                     transfer_.transfer_id = ch.transfer_id;
-                    std::cout << std::to_string(transfer_.transfer_id) << std::endl;
                     upload_init();
                 }
                 uploading(ch.index, ch.size, data, protocol::flags::OK);
@@ -211,7 +248,6 @@ void Session::handle_chunk(const protocol::ChunkHeader& ch, const std::vector<ui
             upload_abort(false, true, protocol::flags::CHUNK_MISMATCH);
             return;
         } else if(ch.flags == protocol::flags::LAST) {
-            std::cout << "LAST" << std::endl;
             if(valid_chunk(ch.index, ch.size, data)) {
                 uploading(ch.index, ch.size, data, protocol::flags::DONE);
                 return;
@@ -229,7 +265,6 @@ void Session::handle_chunk(const protocol::ChunkHeader& ch, const std::vector<ui
     } else if (state_ == SessionState::DOWNLOADING) {
         if(ch.flags == protocol::flags::OK) {
             if(ch.transfer_id != transfer_.transfer_id) {
-                std::cout << std::to_string(ch.transfer_id) << " " << std::to_string(transfer_.transfer_id) << std::endl;
                 download_abort(false, true, protocol::flags::ERROR);
                 return;
             }
@@ -511,16 +546,15 @@ void Session::need_input(protocol::Request& req) {
     // Implementation of need_input
 }
 void Session::exit() {
-    auto self = shared_from_this();
     bool expected = false;
     if(!exiting_.compare_exchange_strong(expected, true)) return;
 
     bool socket_opened = socket_.is_open();
 
     if(state_ == SessionState::UPLOADING ) {
-        upload_abort(true, socket_opened, protocol::flags::EXIT);
+        upload_abort_exit(true, socket_opened, protocol::flags::EXIT);
     } else if (state_ == SessionState::DOWNLOADING) {
-        download_abort(true, socket_opened, protocol::flags::EXIT);
+        download_abort_exit(true, socket_opened, protocol::flags::EXIT);
     } else if (socket_opened) {
         protocol::Response res{
             protocol::statuses::EXIT,
@@ -530,8 +564,13 @@ void Session::exit() {
         res.chunks.clear();
         json j;
         protocol::to_json(j, res);
-        write_response_json(j);
+        write_response_json_exit(j);
     }
+    finish_exit();
+}
+
+void Session::finish_exit() {
+    auto self = shared_from_this();
 
     storage_->release_user_lock(username_);
 
@@ -1482,8 +1521,6 @@ void Session::sync(protocol::Request& req) {
 }
 bool Session::valid_file(const std::filesystem::path& partial_file, const std::array<uint8_t, crypto_generichash_BYTES>& expected) {
     std::array<uint8_t, crypto_generichash_BYTES> hash = fsutils::hash_file(partial_file);
-    std::cout << fsutils::hash_to_hex(hash) << " =? " << fsutils::hash_to_hex(expected) << std::endl;
-
     return hash == expected && !fsutils::is_hash_error(hash);
 }
 
@@ -1584,9 +1621,35 @@ void Session::upload_abort(bool save, bool notify, uint8_t flag) {
     state_ = SessionState::READY;
 }
 
+void Session::upload_abort_exit(bool save, bool notify, uint8_t flag) {
+    if(save) {
+        partmeta_->save();
+    } else {
+        fsutils::remove_file(transfer_.partial_path);
+        partmeta_->delete_partial_metadata(transfer_.transfer_id);
+
+        transfer_.transfer_id = UINT32_MAX;
+        transfer_.fmeta = fsutils::FileMetadata{};
+        transfer_.chunk_state.clear();
+        transfer_.chunks.clear();
+    }
+
+    if(notify) {
+        protocol::ChunkHeader ch{
+            transfer_.transfer_id,
+            UINT32_MAX,
+            0,
+            flag
+        };
+
+        std::vector<uint8_t> data;
+
+        send_chunk_exit(ch, data);
+    }
+}
+
 void Session::download_init() {
     transfer_.transfer_id = partmeta_->add_partial_metadata(TransferType::DOWNLOAD, transfer_.fmeta, transfer_.chunks, UINT32_MAX);
-    std::cout << std::to_string(transfer_.transfer_id) << std::endl;
     downloading();
 }
 
@@ -1613,7 +1676,6 @@ void Session::downloading() {
         flag
     };
 
-    std::cout << std::to_string(transfer_.transfer_id) << std::endl;
 
     uint32_t offset = fsutils::CHUNK_SIZE * chunk.index;
 
@@ -1663,4 +1725,30 @@ void Session::download_abort(bool save, bool notify, uint8_t flag) {
     }
     storage_->release_user_lock(username_);
     state_ = SessionState::READY;
+}
+
+void Session::download_abort_exit(bool save, bool notify, uint8_t flag) {
+    if(save) {
+        partmeta_->save();
+    } else {
+        partmeta_->delete_partial_metadata(transfer_.transfer_id);
+
+        transfer_.transfer_id = UINT32_MAX;
+        transfer_.fmeta = fsutils::FileMetadata{};
+        transfer_.chunk_state.clear();
+        transfer_.chunks.clear();
+    }
+
+    if(notify) {
+        protocol::ChunkHeader chunk_header{
+            transfer_.transfer_id,
+            UINT32_MAX,
+            0,
+            flag
+        };
+
+        std::vector<uint8_t> data;
+
+        send_chunk_exit(chunk_header, data);
+    }
 }

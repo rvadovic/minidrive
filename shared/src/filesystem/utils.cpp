@@ -55,8 +55,6 @@ bool is_subpath(const fs::path& base, const fs::path& sub) {
     auto norm_base = base.lexically_normal(); // does not need to exist for mkdir and create file operations
     auto norm_sub = sub.lexically_normal();
 
-    std::cout << norm_base.string() << " " << norm_sub.string() << std::endl;
-
     auto base_it = norm_base.begin();
     auto sub_it = norm_sub.begin();
 
@@ -231,7 +229,6 @@ bool is_hash_error(const std::array<uint8_t, crypto_generichash_BYTES>& h) {
 }
 
 std::array<uint8_t, crypto_generichash_BYTES> hash_file(const fs::path& path) {
-    std::cout << "hashing file" << std::endl;
     std::array<uint8_t, crypto_generichash_BYTES> hash;
     std::ifstream file(path, std::ios::binary);
 
@@ -250,7 +247,6 @@ std::array<uint8_t, crypto_generichash_BYTES> hash_file(const fs::path& path) {
     }
 
     crypto_generichash_final(&state, hash.data(), crypto_generichash_BYTES);
-    std::cout << "file hashed" << std::endl;
     return hash;
 }
 

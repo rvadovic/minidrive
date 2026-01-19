@@ -111,6 +111,25 @@ void Client::send_json(const json& j) {
     });
 }
 
+void Client::send_json_exit(const json& j) {
+    auto write_buffer = std::make_shared<std::string>(j.dump());
+
+    if(write_buffer->size() > std::numeric_limits<uint32_t>::max()) {
+        std::cout << std::endl << "File data was too large." << std::endl;
+        return;
+    }
+
+    auto len = std::make_shared<uint32_t>(htonl(write_buffer->size())); // Host to network layer
+
+    std::vector<asio::const_buffer> buffers;
+    buffers.push_back(asio::buffer(len.get(), sizeof(uint32_t)));
+    buffers.push_back(asio::buffer(*write_buffer));
+
+    asio::async_write(socket_, buffers, [this](std::error_code ec, std::size_t) {
+        finish_exit();
+    });
+}
+
 void Client::read_header_json() {
     asio::async_read(socket_, asio::buffer(&msg_len_, sizeof(msg_len_)),[this](std::error_code ec, std::size_t) {
         if(!ec) {
@@ -189,7 +208,26 @@ void Client::send_chunk(const protocol::ChunkHeader& ch, const std::vector<uint8
     });
 }
 
+void Client::send_chunk_exit(const protocol::ChunkHeader& ch, const std::vector<uint8_t>& data) {
+     auto header = std::make_shared<protocol::ChunkHeader>();
+    header->transfer_id = htonl(ch.transfer_id); // Host to network layer
+    header->index = htonl(ch.index);
+    header->size = htonl(ch.size);
+    header->flags = ch.flags;
+
+    auto data_to_write = std::make_shared<std::vector<uint8_t>>(data);
+
+    std::vector<asio::const_buffer> buffers;
+    buffers.push_back(asio::buffer(header.get(), sizeof(protocol::ChunkHeader)));
+    buffers.push_back(asio::buffer(*data_to_write));
+
+    asio::async_write(socket_, buffers, [this, header, data_to_write](std::error_code ec, std::size_t) {
+        finish_exit();
+    });
+}
+
 void Client::read_next() {
+    if(exiting_) return;
     if(state_ == ClientState::DOWNLOADING || state_ == ClientState::UPLOADING) {
         read_header_chunk();
     } else {
@@ -428,9 +466,9 @@ void Client::exit() {
     bool socket_opened = socket_.is_open();
 
     if(state_ == ClientState::UPLOADING ) {                         // Notify server
-        upload_abort(true, socket_opened, protocol::flags::EXIT);
+        upload_abort_exit(true, socket_opened, protocol::flags::EXIT);
     } else if (state_ == ClientState::DOWNLOADING) {
-        download_abort(true, socket_opened, protocol::flags::EXIT);
+        download_abort_exit(true, socket_opened, protocol::flags::EXIT);
     } else if (socket_opened) {
         protocol::Request req{
             protocol::commands::EXIT,
@@ -442,9 +480,12 @@ void Client::exit() {
         req.chunks.clear();
         json j;
         protocol::to_json(j, req);
-        send_json(j);
+        send_json_exit(j);
     }
-    
+    finish_exit();
+}
+
+void Client::finish_exit() {
     asio::post(io_context_, [this]() {  // Post to io_context thread
         std::error_code ec;
         if(socket_.is_open()) {
@@ -455,11 +496,6 @@ void Client::exit() {
         state_ = ClientState::EXIT;
     });
     io_context_.stop();
-
-    /*if(on_exit) {
-        std::cout << "on_exit" << std::endl;
-        on_exit_();
-    }*/
 }
 
 void Client::cmd_help(std::istringstream& iss) {
@@ -825,6 +861,32 @@ void Client::upload_abort(bool save, bool notify, uint8_t flag) {
     state_ = ClientState::READY;
 }
 
+void Client::upload_abort_exit(bool save, bool notify, uint8_t flag) {
+    if(save) {
+        partmeta_->save();
+    } else {
+        partmeta_->delete_partial_metadata(transfer_.transfer_id);
+
+        transfer_.transfer_id = UINT32_MAX;
+        transfer_.fmeta = fsutils::FileMetadata{};
+        transfer_.chunk_state.clear();
+        transfer_.chunks.clear();
+    }
+
+    if(notify) {
+        protocol::ChunkHeader chunk_header{
+            transfer_.transfer_id,
+            UINT32_MAX,
+            0,
+            flag
+        };
+
+        std::vector<uint8_t> data;
+
+        send_chunk_exit(chunk_header, data);
+    }
+}
+
 bool Client::valid_file(const std::filesystem::path& partial_file, const std::array<uint8_t, crypto_generichash_BYTES>& expected) {
     std::array<uint8_t, crypto_generichash_BYTES> hash = fsutils::hash_file(partial_file);
     std::cout << fsutils::hash_to_hex(hash) << " =? " << fsutils::hash_to_hex(expected) << std::endl;
@@ -955,4 +1017,31 @@ void Client::download_abort(bool save, bool notify, uint8_t flag) {
         send_chunk(ch, data);
     }
     state_ = ClientState::READY;
+}
+
+void Client::download_abort_exit(bool save, bool notify, uint8_t flag)  {
+    if(save) {
+        partmeta_->save();
+    } else {
+        fsutils::remove_file(transfer_.partial_path); // Delete partial file
+        partmeta_->delete_partial_metadata(transfer_.transfer_id);
+
+        transfer_.transfer_id = UINT32_MAX;
+        transfer_.fmeta = fsutils::FileMetadata{};
+        transfer_.chunk_state.clear();
+        transfer_.chunks.clear();
+    }
+
+    if(notify) {
+        protocol::ChunkHeader ch{
+            transfer_.transfer_id,
+            UINT32_MAX,
+            0,
+            flag
+        };
+
+        std::vector<uint8_t> data;
+
+        send_chunk_exit(ch, data);
+    }
 }

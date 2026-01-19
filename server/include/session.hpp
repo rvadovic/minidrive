@@ -30,7 +30,7 @@ class Session : public std::enable_shared_from_this<Session> {
 public:
     Session(asio::ip::tcp::socket socket, std::shared_ptr<Storage> storage, std::function<void(std::shared_ptr<Session>)> on_exit);
     void start(); // Start listening loop
-    void exit(); // Triggered by signals, server, client, closes socket and on exit removes itself from sessions_ list in server
+    void exit(); // Triggered by signals, server, client, sends notification to client or calls finish_exit()
 private:
     asio::ip::tcp::socket socket_;
     std::filesystem::path root_; // Root of filesystem
@@ -54,13 +54,22 @@ private:
     void read_body_json(); // read message of json message using async_read, call handle_response(), then read_next()
     void write_response_json(const nlohmann::json& j); // send json message using async_write
 
+    // Special write which calls finish_exit()
+    void write_response_json_exit(const nlohmann::json& j);
+
     // Read loop and write using binary protocol for chunk transfer
     void read_header_chunk(); // Read header of binary data using async_read, call read_body_chunk()
     void read_body_chunk(); // Read data of binary data using async_read, call handle_
     void send_chunk(const protocol::ChunkHeader& ch, const std::vector<uint8_t>& data); // Send data of binary data using async_write
 
+    // Special write which calls finish_exit();
+    void send_chunk_exit(const protocol::ChunkHeader& ch, const std::vector<uint8_t>& data);
+
     // Protocol switch between binary data and json message based on state_
     void read_next();
+
+    // Closes socket and on exit removes itself from sessions_ list in server
+    void finish_exit();
 
     // Handlers
     void handle_error(const std::error_code& ec); // Handles error codes of async operations
@@ -92,11 +101,12 @@ private:
     void uploading(const uint32_t& index, const uint32_t& size, const std::vector<uint8_t>& data, uint8_t flag);
     void upload_done(); // release per user lock
     void upload_abort(bool save, bool notify, uint8_t flag); // release per user lock
+    void upload_abort_exit(bool save, bool notify, uint8_t flag); // calls finish_exit()
 
     // Download - simular to clients upload
     void download_init();
     void downloading();
     void download_done(); // release per user lock
     void download_abort(bool save, bool notify, uint8_t flag); // release per user lock
-
+    void download_abort_exit(bool save, bool notify, uint8_t flag); // calls finish_exit()
 };
