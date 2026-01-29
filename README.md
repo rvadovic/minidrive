@@ -67,6 +67,14 @@ Current implementation in server and client has nothing to do with the specifica
 
 ## Testing
 
+There are python scripts in the `tests/` folder that perform basic integration tests. You can run them 
+
+```sh
+python3 tests/integration/run_all_tests.py
+```
+
+Or you can directly run just one suite. 
+
 ```
 cmake --build build --target integration_smoke
 ctest --test-dir build
