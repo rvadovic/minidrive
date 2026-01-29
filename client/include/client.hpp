@@ -33,7 +33,7 @@ enum class ClientState {
 
 class Client {
 public:
-    Client(const std::string& username, asio::io_context& io_context);
+    Client(const std::string& username, asio::io_context& io_context, std::shared_ptr<asio::executor_work_guard<asio::io_context::executor_type>> guard);
     ~Client();
 
     // Connect and start listening loop
@@ -45,6 +45,7 @@ private:
     std::string username_;
     asio::io_context& io_context_;
     asio::ip::tcp::socket socket_;
+    std::shared_ptr<asio::executor_work_guard<asio::io_context::executor_type>> guard_;
     std::unordered_map<std::string, std::function<void(std::istringstream&)>> commands_; // Map of commands and their functions
     std::thread input_thread_; // Input loop runs in this thread
     uint32_t msg_len_; // Message lenght for json read loop
@@ -56,6 +57,9 @@ private:
     ActiveTransfer transfer_{UINT32_MAX, fsutils::FileMetadata{}, std::filesystem::path(""), {}, {}}; // Current active transfer info
     std::filesystem::path root_; // Client root
     std::optional<PartialMetadata> partmeta_; // Database for partial file metadata
+
+    // Print to stdout
+    void print(int code, const std::string& message, bool prompt = true);
 
     // Prepare the client root directory (./data/client_root)
     void setup();

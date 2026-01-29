@@ -8,6 +8,9 @@ Storage::Storage(std::filesystem::path root)
     }
 
 void Storage::setup() {
+    if(!fsutils::exists(root_)) {
+        fsutils::mkdir(std::filesystem::path(root_));
+    }
     if(!fsutils::is_file(std::filesystem::path(root_ / "users.json"))) {
         fsutils::create_empty_file(std::filesystem::path(root_ / "users.json"));
         std::cout << "Created users.json file in root directory." << std::endl;

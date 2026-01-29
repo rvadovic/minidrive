@@ -15,10 +15,11 @@
 using asio::ip::tcp;
 using nlohmann::json;
 
-Client::Client(const std::string& username, asio::io_context& io_context)
+Client::Client(const std::string& username, asio::io_context& io_context, std::shared_ptr<asio::executor_work_guard<asio::io_context::executor_type>> guard)
     : username_(username), 
       io_context_(io_context),
       socket_(io_context_),
+      guard_(std::move(guard)),
       commands_{
           {"LIST",     [this](auto& iss){ cmd_list(iss); }},
           {"HELP",     [this](auto& iss){ cmd_help(iss); }},
@@ -58,8 +59,18 @@ void Client::connect(const std::string& host, uint16_t port) {
         });
 }
 
+void Client::print(int code, const std::string& message, bool prompt) {
+    if(code == protocol::codes::OK) {
+        std::cout << "OK" << ": " << message << std::endl;
+    } else {
+        std::cout << "ERROR" << ": " << "<" << code << ">" << " " << message << std::endl;
+    }
+    if(prompt) {
+        std::cout << "> " << std::flush;
+    }
+}
 void Client::setup() {
-    root_ = std::filesystem::path("./data/client_root");
+    root_ = std::filesystem::path("./data/client_cwd");
     if(!fsutils::is_directory(root_)) {
         fsutils::mkdir(root_);
     }
@@ -93,7 +104,7 @@ void Client::send_json(const json& j) {
     auto write_buffer = std::make_shared<std::string>(j.dump());
 
     if(write_buffer->size() > std::numeric_limits<uint32_t>::max()) {
-        std::cout << std::endl << "File data was too large." << std::endl;
+        print(protocol::codes::INTERNAL_SERVER_ERROR, "File data was too large.");
         return;
     }
 
@@ -104,8 +115,10 @@ void Client::send_json(const json& j) {
     buffers.push_back(asio::buffer(*write_buffer));
 
     asio::async_write(socket_, buffers, [this](std::error_code ec, std::size_t) {
-        if(ec) {
-            handle_error(ec);
+        if(exiting_ || ec) {
+            if(ec && ec != asio::error::operation_aborted) {
+                handle_error(ec);
+            }
             return;
         }
     });
@@ -115,7 +128,7 @@ void Client::send_json_exit(const json& j) {
     auto write_buffer = std::make_shared<std::string>(j.dump());
 
     if(write_buffer->size() > std::numeric_limits<uint32_t>::max()) {
-        std::cout << std::endl << "File data was too large." << std::endl;
+        print(protocol::codes::INTERNAL_SERVER_ERROR, "File data was too large.");
         return;
     }
 
@@ -131,30 +144,40 @@ void Client::send_json_exit(const json& j) {
 }
 
 void Client::read_header_json() {
-    asio::async_read(socket_, asio::buffer(&msg_len_, sizeof(msg_len_)),[this](std::error_code ec, std::size_t) {
-        if(!ec) {
-            msg_len_ = ntohl(msg_len_); // Network to host layer
-            buffer_.resize(msg_len_);
-            read_body_json(); // Read body right after header
-        } else {
-            handle_error(ec);
+    auto msg_len_local = std::make_shared<uint32_t>();
+    
+    asio::async_read(socket_, asio::buffer(msg_len_local.get(), sizeof(uint32_t)),[this, msg_len_local](std::error_code ec, std::size_t) {
+        if(exiting_ || ec) {
+            if(ec && ec != asio::error::operation_aborted) {
+                handle_error(ec);
+            }
             return;
         }
+        msg_len_ = ntohl(*msg_len_local); // Network to host layer
+        buffer_.resize(msg_len_);
+        read_body_json(); // Read body right after header
     });
 }
 
 void Client::read_body_json() {
     asio::async_read(socket_, asio::buffer(buffer_),[this](std::error_code ec, std::size_t) {
-        if(!ec) {
-            std::string msg(buffer_.begin(), buffer_.end());
-            json j = json::parse(msg);
-
-            handle_response(j); // Handle message
-            read_next(); // Decide which protocol to read next
-        } else {
-            handle_error(ec);
+        if(exiting_ || ec) {
+            if(ec && ec != asio::error::operation_aborted) {
+                handle_error(ec);
+            }
             return;
         }
+        std::string msg(buffer_.begin(), buffer_.end());
+        json j;
+        try {
+            j = json::parse(msg);
+        } catch (json::parse_error& e) {
+            handle_error(asio::error::invalid_argument);
+            return;
+        }
+
+        handle_response(j); // Handle message
+        read_next(); // Decide which protocol to read next
     });
 }
 
@@ -162,8 +185,10 @@ void Client::read_header_chunk() {
     auto header = std::make_shared<protocol::ChunkHeader>();
 
     asio::async_read(socket_, asio::buffer(header.get(), sizeof(protocol::ChunkHeader)), [this, header](std::error_code ec, std::size_t) {
-        if(ec) {
-            handle_error(ec);
+        if(exiting_ || ec) {
+            if(ec && ec != asio::error::operation_aborted) {
+                handle_error(ec);
+            }
             return;
         }
         ch_.transfer_id = ntohl(header->transfer_id); // Network to host layer
@@ -178,8 +203,10 @@ void Client::read_body_chunk() {
     auto data = std::make_shared<std::vector<uint8_t>>(ch_.size);
 
     asio::async_read(socket_, asio::buffer(*data), [this, data](std::error_code ec, std::size_t) {
-        if(ec) {
-            handle_error(ec);
+        if(exiting_ || ec) {
+            if(ec && ec != asio::error::operation_aborted) {
+                handle_error(ec);
+            }
             return;
         }
         handle_chunk(ch_, *data);
@@ -201,8 +228,10 @@ void Client::send_chunk(const protocol::ChunkHeader& ch, const std::vector<uint8
     buffers.push_back(asio::buffer(*data_to_write));
 
     asio::async_write(socket_, buffers, [this, header, data_to_write](std::error_code ec, std::size_t) {
-        if(ec) {
-            handle_error(ec);
+        if(exiting_ || ec) {
+            if(ec && ec != asio::error::operation_aborted) {
+                handle_error(ec);
+            }
             return;
         }
     });
@@ -237,14 +266,14 @@ void Client::read_next() {
 
 void Client::on_password_required() {
     password_guard_ = std::make_unique<TerminalNoEcho>();
-    std::cout << "Password: " << std::flush;
+    std::cout << "Password for " << username_ << ": " << std::flush;
 }
 
 void Client::handle_error(const std::error_code& ec) {
     if(ec.value() != 125) {
         std::cerr << "Network error: " << ec.message() << " (" << ec.value() << ")" << std::endl;
     }
-    std::cout << "Closing client" << std::endl;
+    print(protocol::codes::INTERNAL_SERVER_ERROR, ec.message());
     socket_.close();
     exit();
 }
@@ -256,56 +285,48 @@ void Client::handle_response(const json& j) {
     
     if(res.status == protocol::statuses::AUTH) {
         state_ = ClientState::AUTH;
-        std::cout << std::endl << res.code << ": " << res.message << std::endl;
+        print(res.code, res.message, false);
         on_password_required();
-    } 
-    else if(res.status == protocol::statuses::NEED_INPUT) {
+        return;
+    } else if (res.status == protocol::statuses::EXIT) {
+        exit();
+        return;
+    }
+    print(res.code, res.message);
+
+    if(res.status == protocol::statuses::NEED_INPUT) {
         state_ = ClientState::NEED_INPUT;
-        std::cout << std::endl << res.code << ": " << res.message << std::endl;
-        std::cout << "> " << std::flush;
     } 
     else if(res.status == protocol::statuses::ERROR) {
         state_ = ClientState::READY;
-        std::cout << std::endl << res.code << ": " << res.message << std::endl;
-        std::cout << "> " << std::flush;
     } 
     else if(res.status == protocol::statuses::OK) {
         if(state_ == ClientState::UPLOAD_INIT) {
             state_ = ClientState::UPLOADING;
-            std::cout << std::endl << res.code << ": " << res.message << std::endl;
-            std::cout << "> " << std::flush;
             upload_init();
             return;
         } 
         else if(state_ == ClientState::DOWNLOAD_INIT) {
-            std::cout << std::endl << res.code << ": " << res.message << std::endl;
-            std::cout << "> " << std::flush;
             download_init(res.chunks, res.file_hash);
             return;
         } 
         else {
             state_ = ClientState::READY;
         }
-        std::cout << std::endl << res.code << ": " << res.message << std::endl;
-        std::cout << "> " << std::flush;
-    } 
-    else if(res.status == protocol::statuses::CONFLICT) {
-        std::cout << std::endl << res.code << ": " << res.message << std::endl;
-    } 
-    else if(res.status == protocol::statuses::BUSY) {
+    } else if(res.status == protocol::statuses::BUSY) {
+        print(res.code, res.message, false);
         state_ = ClientState::PROCESSING;
-        std::cout << std::endl << "Server is busy." << std::endl;
-    } else if (res.status == protocol::statuses::EXIT) {
-        std::cout << std::endl << "Server unavailable" << std::endl;
-        exit();
     }
 }
 
 void Client::handle_request(const std::string& line) {
+    std::cout << std::endl;
     if(line == protocol::commands::EXIT) { // Priority over other commands
         exit();
+        return;
+    }
 
-    } else if(state_ == ClientState::AUTH) {
+    if(state_ == ClientState::AUTH) {
         password_guard_.reset();
         auth(line);
 
@@ -317,8 +338,7 @@ void Client::handle_request(const std::string& line) {
         auto it = commands_.find(cmd); // Check map
 
         if(it == commands_.end()) {
-            std::cout << protocol::codes::BAD_REQUEST << ": Invalid command \""<< cmd << "\"." << std::endl;
-            std::cout << "> " << std::flush;
+            print(protocol::codes::BAD_REQUEST, "Invalid command \"" + cmd + "\".");
             return;
         }
 
@@ -331,15 +351,12 @@ void Client::handle_request(const std::string& line) {
         login();
 
     } else if(state_ == ClientState::PROCESSING || state_ == ClientState::UPLOAD_INIT || state_ == ClientState::DOWNLOAD_INIT) {
-        std::cout << std::endl << "Waiting for server..." << std::endl;
-        std::cout << "> " << std::flush;
-
+        print(protocol::codes::SERVICE_UNAVAILABLE, "Server is busy...");
     } else if (state_ == ClientState::EXIT) {
         return;
 
     } else if(state_ == ClientState::UPLOADING || state_ == ClientState::DOWNLOADING) { // Waiting for finished transfer and prompting for potentional exit
-        std::cout << std::endl << "Transeferring files..." << std::endl;
-        std::cout << "> " << std::flush;
+        print(protocol::codes::SERVICE_UNAVAILABLE, "Transfer in progress...");
     }
 }
 
@@ -348,9 +365,8 @@ void Client::handle_chunk(const protocol::ChunkHeader& ch, const std::vector<uin
         if(ch.flags == protocol::flags::OK) {
             if(ch.transfer_id != transfer_.transfer_id) {
                 upload_abort(false, true, protocol::flags::ERROR);
-                std::cout << std::endl << protocol::codes::INTERNAL_SERVER_ERROR << ": Transfer ID mismatch." << std::endl;
+                print(protocol::codes::INTERNAL_SERVER_ERROR, "Transfer ID mismatch.");
                 state_ = ClientState::READY;
-                std::cout << "> " << std::flush;
                 return;
             }
             transfer_.chunk_state[ch.index] = true; // Set chunk at index to sent
@@ -358,19 +374,17 @@ void Client::handle_chunk(const protocol::ChunkHeader& ch, const std::vector<uin
             uploading();
         } else if (ch.flags == protocol::flags::DONE) {
             transfer_.chunk_state[ch.index] = true;
-            std::cout << std::endl << protocol::codes::OK << ": Upload succesful" << std::endl;
-            std::cout << "> " << std::flush;
+            print(protocol::codes::OK, "Upload successful");
             upload_done();
             return;
         } else if(ch.flags == protocol::flags::ERROR) {
             upload_abort(false, false, protocol::flags::ERROR);
-            std::cout << std::endl << protocol::codes::INTERNAL_SERVER_ERROR << ": Upload failed." << std::endl;
+            print(protocol::codes::INTERNAL_SERVER_ERROR, "Upload failed.");
             state_ = ClientState::READY;
-            std::cout << "> " << std::flush;
             return;
         } else if(ch.flags == protocol::flags::EXIT) {
             upload_abort(true, false, protocol::flags::EXIT);
-            std::cout << std::endl << protocol::codes::INTERNAL_SERVER_ERROR << ": Server unavailable" << std::endl;
+            print(protocol::codes::INTERNAL_SERVER_ERROR, "Server unavailable.", false);
             exit();
         }
     } else if (state_ == ClientState::DOWNLOADING) {
@@ -383,22 +397,23 @@ void Client::handle_chunk(const protocol::ChunkHeader& ch, const std::vector<uin
                 downloading(ch.index, ch.size, data, protocol::flags::OK);
                 return;
             }
-            std::cout << std::endl << protocol::codes::INTERNAL_SERVER_ERROR << ": Chunk mismatch" << std::endl;
-            std::cout << "> " << std::flush;
+            print(protocol::codes::INTERNAL_SERVER_ERROR, "Chunk mismatch");
             download_abort(false, true, protocol::flags::CHUNK_MISMATCH);
             return;
         } else if(ch.flags == protocol::flags::LAST) {
             if(valid_chunk(ch.index, ch.size, data)) {
+                if(transfer_.transfer_id == UINT32_MAX) { // transfer_id not initilized - upload not initialized
+                    transfer_.transfer_id = ch.transfer_id;
+                    download_prepare_partmeta();
+                }
                 downloading(ch.index, ch.size, data, protocol::flags::DONE);
                 return;
             }
-            std::cout << std::endl << protocol::codes::INTERNAL_SERVER_ERROR << ": Chunk mismatch" << std::endl;
-            std::cout << "> " << std::flush;
+            print(protocol::codes::INTERNAL_SERVER_ERROR, "Chunk mismatch");
             download_abort(false, true, protocol::flags::CHUNK_MISMATCH);
             return;
         } else if(ch.flags == protocol::flags::ERROR) {
-            std::cout << std::endl << protocol::codes::INTERNAL_SERVER_ERROR << ": Download failed" << std::endl;
-            std::cout << "> " << std::flush;
+            print(protocol::codes::INTERNAL_SERVER_ERROR, "Download failed");
             download_abort(false, false, protocol::flags::ERROR);
             return;
         } else if(ch.flags == protocol::flags::EXIT) {
@@ -439,14 +454,15 @@ void Client::auth(const std::string password) {
 }
 
 void Client::need_input(const std::string input) {
-    if(!(input == "Y" || input == "n")) {
-        std::cout << protocol::codes::BAD_REQUEST << ": Invalid input." << std::endl;
-        std::cout << "> " << std::flush;
+    std::string lower_input = input;
+    std::transform(lower_input.begin(), lower_input.end(), lower_input.begin(), ::tolower);
+    if(!(lower_input == "y" || lower_input == "n")) {
+        print(protocol::codes::BAD_REQUEST, "Invalid input.");
         return;
     }
     protocol::Request req{
             protocol::commands::NEED_INPUT,
-            input,
+            lower_input,
             "",
             0,
             ""
@@ -486,15 +502,15 @@ void Client::exit() {
 }
 
 void Client::finish_exit() {
-    asio::post(io_context_, [this]() {  // Post to io_context thread
-        std::error_code ec;
-        if(socket_.is_open()) {
-            socket_.shutdown(tcp::socket::shutdown_both, ec);
-            socket_.close(ec);
-        }
+    state_ = ClientState::EXIT;
+    std::error_code ec;
+    socket_.cancel(ec);
 
-        state_ = ClientState::EXIT;
-    });
+    if(socket_.is_open()) {
+        socket_.shutdown(tcp::socket::shutdown_both, ec);
+        socket_.close(ec);
+    }
+    guard_->reset();
     io_context_.stop();
 }
 
@@ -502,8 +518,7 @@ void Client::cmd_help(std::istringstream& iss) {
     for (const auto& [key, value] : commands_) {
         std:: cout << key << std::endl;
     }
-    std::cout << "The syntax of filesystem commands is: \"Command\" \"what\" \"where\"." << std::endl;
-    std::cout << "> " << std::flush;
+    print(protocol::codes::OK, "The syntax of filesystem commands is: \"Command\" \"what\" \"where\"");
 }
 
 void Client::cmd_list(std::istringstream& iss) {
@@ -531,38 +546,33 @@ void Client::cmd_upload(std::istringstream& iss) {
     std::string local_path;
     std::string remote_path;
     if(!(iss >> local_path)) {
-        std::cout << std::endl << protocol::codes::BAD_REQUEST << ": Missing local path argument." << std::endl;
-        std::cout << "> " << std::flush;
+        print(protocol::codes::BAD_REQUEST, "Missing local path argument.");
         return;
     }
     std::cout << local_path << std::endl;
     auto local = std::filesystem::path(local_path);
 
     if(!fsutils::exists(local)) {
-        std::cout << std::endl << protocol::codes::BAD_REQUEST << ": Local file does not exist." << std::endl;
-        std::cout << "> " << std::flush;
+        print(protocol::codes::BAD_REQUEST, "Local file does not exist.");
         return;
     }
 
     fsutils::FileMetadata fmeta = fsutils::scan_file(local);
 
     if(fsutils::is_scan_file_error(fmeta)) {
-        std::cout << std::endl << protocol::codes::INTERNAL_SERVER_ERROR << ": Gathering file metadata failed." << std::endl;
-        std::cout << "> " << std::flush;
+        print(protocol::codes::INTERNAL_SERVER_ERROR, "Gathering file metadata failed.");
         return;
     }
 
     if(fmeta.size == 0) {
-        std::cout << std::endl << protocol::codes::BAD_REQUEST << ": Local file is empty." << std::endl;
-        std::cout << "> " << std::flush;
+        print(protocol::codes::BAD_REQUEST, "Local file is empty.");
         return;
     }
 
     std::vector<protocol::ChunkInfo> chunks = fsutils::compute_chunks(fmeta);
 
     if(fsutils::is_compute_chunks_error(chunks)) {
-        std::cout << std::endl << protocol::codes::INTERNAL_SERVER_ERROR << ": Generating file chunks failed." << std::endl;
-        std::cout << "> " << std::flush;
+        print(protocol::codes::INTERNAL_SERVER_ERROR, "Generating file chunks failed.");
         return;
     }
 
@@ -595,8 +605,7 @@ void Client::cmd_download(std::istringstream& iss) {
     std::string local_path;
     std::string remote_path;
     if(!(iss >> remote_path)) {
-        std::cout << std::endl << protocol::codes::BAD_REQUEST << ": Missing remote path argument." << std::endl;
-        std::cout << "> " << std::flush;
+        print(protocol::codes::BAD_REQUEST, "Missing remote path argument.");
         return;
     }
 
@@ -611,12 +620,14 @@ void Client::cmd_download(std::istringstream& iss) {
     std::filesystem::path local;
     if(iss >> local_path) {
         local = std::filesystem::path(local_path);
-        if(!fsutils::exists(local)) {
-            std::cout << protocol::codes::BAD_REQUEST << ": Local file does not exist." << std::endl;
-            std::cout << "> " << std::flush;
-        }
     } else {
-        local = std::filesystem::current_path();
+        std::filesystem::path remote(remote_path);
+        local = std::filesystem::current_path() / remote.filename();
+    }
+
+    if(fsutils::exists(local)) {
+        print(protocol::codes::BAD_REQUEST, "Requested file already exists in current working directory.");
+        return;
     }
 
     fsutils::FileMetadata fmeta{
@@ -638,12 +649,11 @@ void Client::cmd_download(std::istringstream& iss) {
 void Client::cmd_delete(std::istringstream& iss) {
     std::string path;
     if(!(iss >> path)) {
-        std::cout << protocol::codes::BAD_REQUEST << ": Missing path argument." << std::endl;
-        std::cout << "> " << std::flush;
+        print(protocol::codes::BAD_REQUEST, "Missing path argument.");
         return;
     }
     protocol::Request req{
-        protocol::commands::LIST,
+        protocol::commands::DELETE,
         path,
         "",
         0,
@@ -659,8 +669,7 @@ void Client::cmd_delete(std::istringstream& iss) {
 void Client::cmd_cd(std::istringstream& iss) {
     std::string path;
     if(!(iss >> path)) {
-        std::cout << protocol::codes::BAD_REQUEST << ": Missing path argument." << std::endl;
-        std::cout << "> " << std::flush;
+        print(protocol::codes::BAD_REQUEST, "Missing path argument.");
         return;
     }
     protocol::Request req{
@@ -680,8 +689,7 @@ void Client::cmd_cd(std::istringstream& iss) {
 void Client::cmd_mkdir(std::istringstream& iss) {
     std::string path;
     if(!(iss >> path)) {
-        std::cout << protocol::codes::BAD_REQUEST << ": Missing path argument." << std::endl;
-        std::cout << "> " << std::flush;
+        print(protocol::codes::BAD_REQUEST, "Missing path argument.");
         return;
     }
     protocol::Request req{
@@ -701,8 +709,7 @@ void Client::cmd_mkdir(std::istringstream& iss) {
 void Client::cmd_rmdir(std::istringstream& iss) {
     std::string path;
     if(!(iss >> path)) {
-        std::cout << protocol::codes::BAD_REQUEST << ": Missing path argument." << std::endl;
-        std::cout << "> " << std::flush;
+        print(protocol::codes::BAD_REQUEST, "Missing path argument.");
         return;
     }
     protocol::Request req{
@@ -723,8 +730,7 @@ void Client::cmd_move(std::istringstream& iss) {
     std::string source_path;
     std::string dest_path;
     if(!(iss >> source_path >> dest_path)) {
-        std::cout << protocol::codes::BAD_REQUEST << ": Missing source or destination path argument." << std::endl;
-        std::cout << "> " << std::flush;
+        print(protocol::codes::BAD_REQUEST, "Missing source or destination path argument.");
         return;
     }
     protocol::Request req{
@@ -745,8 +751,7 @@ void Client::cmd_copy(std::istringstream& iss) {
     std::string source_path;
     std::string dest_path;
     if(!(iss >> source_path >> dest_path)) {
-        std::cout << protocol::codes::BAD_REQUEST << ": Missing source or destination path argument." << std::endl;
-        std::cout << "> " << std::flush;
+        print(protocol::codes::BAD_REQUEST, "Missing source or destination path argument.");
         return;
     }
     protocol::Request req{
@@ -767,7 +772,7 @@ void Client::cmd_sync(std::istringstream& iss) {
     std::string source_path;
     std::string dest_path;
     if(!(iss >> source_path >> dest_path)) {
-        std::cout << protocol::codes::BAD_REQUEST << ": Missing source or destination path argument." << std::endl;
+        print(protocol::codes::BAD_REQUEST, "Missing source or destination path argument.");
         return;
     }
     //TODO check if paths exist
@@ -889,7 +894,6 @@ void Client::upload_abort_exit(bool save, bool notify, uint8_t flag) {
 
 bool Client::valid_file(const std::filesystem::path& partial_file, const std::array<uint8_t, crypto_generichash_BYTES>& expected) {
     std::array<uint8_t, crypto_generichash_BYTES> hash = fsutils::hash_file(partial_file);
-    std::cout << fsutils::hash_to_hex(hash) << " =? " << fsutils::hash_to_hex(expected) << std::endl;
 
     return hash == expected && !fsutils::is_hash_error(hash);
 }
@@ -909,8 +913,7 @@ void Client::download_init(const std::vector<protocol::ChunkInfo>& chunks, const
     }
 
     if(file_size > UINT32_MAX) {
-        std::cout << std::endl << protocol::codes::PRECONDITION_FAILED << ": Requested file is too large" << std::endl;
-        std::cout << "> " << std::flush;
+        print(protocol::codes::INTERNAL_SERVER_ERROR, "Requested file is too large.");
         download_abort(false, true, protocol::flags::ERROR);
         return;
     }
@@ -929,8 +932,7 @@ void Client::download_prepare_partmeta() {
     transfer_.partial_path = partmeta_->get_partial_path(transfer_.transfer_id);
 
     if(transfer_.partial_path.empty()) {
-        std::cout << std::endl << protocol::codes::INTERNAL_SERVER_ERROR << ": Cannot get partial file" << std::endl;
-        std::cout << "> " << std::flush;
+        print(protocol::codes::INTERNAL_SERVER_ERROR, "Cannot get partial file");
         upload_abort(false, true, protocol::flags::ERROR);
         return;
     } 
@@ -946,16 +948,14 @@ void Client::downloading(const uint32_t& index, const uint32_t& size, const std:
 
     uint32_t offset = fsutils::CHUNK_SIZE * index;
     if(!fsutils::write_chunk(transfer_.partial_path, offset, data)) {
-        std::cout << std::endl << protocol::codes::INTERNAL_SERVER_ERROR << ": Cannot write to file" << std::endl;
-        std::cout << "> " << std::flush;
+        print(protocol::codes::INTERNAL_SERVER_ERROR, "Cannot write to file");
         flag = protocol::flags::ERROR;
         download_abort(false, true, flag);
         return;
     }
     if(flag == protocol::flags::DONE) {
         if(!valid_file(transfer_.partial_path, transfer_.fmeta.hash)) {
-            std::cout << std::endl << protocol::codes::INTERNAL_SERVER_ERROR << ": Invalid chunk" << std::endl;
-            std::cout << "> " << std::flush;
+            print(protocol::codes::INTERNAL_SERVER_ERROR, "Downloaded file is corrupted");
             flag = protocol::flags::ERROR;
             download_abort(false, true, flag);
             return;
@@ -986,8 +986,7 @@ void Client::download_done() {
     transfer_.chunk_state.clear();
     transfer_.chunks.clear();
     
-    std::cout << std::endl << protocol::codes::OK << ": Download succesful" << std::endl;
-    std::cout << "> " << std::flush;
+    print(protocol::codes::OK, "Download successful");
     state_ = ClientState::READY;
 }
 

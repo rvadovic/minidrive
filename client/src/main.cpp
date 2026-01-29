@@ -47,11 +47,11 @@ static bool parse_host_port(const std::string& input, UserHostPort& out) {
 
 int main(int argc, char* argv[]) {
     // Echo full command line once for diagnostics
-    std::cout << "[cmd]";
+    /*std::cout << "[cmd]";
     for (int i = 0; i < argc; ++i) {
         std::cout << " \"" << argv[i] << '"';
     }
-    std::cout << std::endl;
+    std::cout << std::endl;*/
 
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " <host>:<port>" << std::endl;
@@ -64,8 +64,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::cout << "MiniDrive client (version " << minidrive::version() << ")" << std::endl;
-    std::cout << "Connecting to " << hp.host << ':' << hp.port << std::endl;
+    //std::cerr << "MiniDrive client (version " << minidrive::version() << ")" << std::endl;
+    //std::cerr << "Connecting to " << hp.host << ':' << hp.port << std::endl;
 
     // libsodium init
     if (sodium_init() < 0) {
@@ -74,8 +74,9 @@ int main(int argc, char* argv[]) {
     }
 
     asio::io_context io_context;
+    auto work_guard = std::make_shared<asio::executor_work_guard<asio::io_context::executor_type>>(asio::make_work_guard(io_context));
     
-    Client client(hp.username, io_context);
+    Client client(hp.username, io_context, work_guard);
     client.connect(hp.host, hp.port);
 
     // handle SIGINT, SIGTERM

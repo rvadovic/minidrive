@@ -44,15 +44,19 @@ void Session::start() {
 
 void Session::read_header_json() {
     auto self = shared_from_this();
-    asio::async_read(socket_, asio::buffer(&msg_len_, sizeof(msg_len_)),[this, self](std::error_code ec, std::size_t) {
-        if(!ec) {
-            msg_len_ = ntohl(msg_len_);
-            buffer_.resize(msg_len_);
-            read_body_json();
-        } else {
-            handle_error(ec);
+    auto msg_len_local = std::make_shared<uint32_t>();
+
+    asio::async_read(socket_, asio::buffer(msg_len_local.get(), sizeof(uint32_t)),[this, self, msg_len_local](std::error_code ec, std::size_t) {
+        if(exiting_ || ec) {
+            if(ec && ec != asio::error::operation_aborted) {
+                handle_error(ec);
+            }
             return;
         }
+        msg_len_ = ntohl(*msg_len_local);
+        buffer_.resize(msg_len_);
+        read_body_json();
+        
     });
 }
 
@@ -60,17 +64,25 @@ void Session::read_body_json() {
     auto self = shared_from_this();
     if(msg_len_ == 0) {
         handle_error(asio::error::invalid_argument);
+        return;
     }
     asio::async_read(socket_, asio::buffer(buffer_),[this, self](std::error_code ec, std::size_t) {
-        if(!ec) {
-            std::string msg(buffer_.begin(), buffer_.end());
-            json j = json::parse(msg);
-            handle_request(j);
-            read_next();
-        } else {
-            handle_error(ec);
+        if(exiting_ || ec) {
+            if(ec && ec != asio::error::operation_aborted) {
+                handle_error(ec);
+            }
             return;
         }
+        std::string msg(buffer_.begin(), buffer_.end());
+        json j;
+        try {
+            j = json::parse(msg);
+        } catch (json::parse_error& e) {
+            handle_error(asio::error::invalid_argument);
+            return;
+        }
+        handle_request(j);
+        read_next();
     });
 }
 
@@ -125,8 +137,10 @@ void Session::read_header_chunk() {
     auto header = std::make_shared<protocol::ChunkHeader>();
 
     asio::async_read(socket_, asio::buffer(header.get(), sizeof(protocol::ChunkHeader)), [this, self, header](std::error_code ec, std::size_t) {
-        if(ec) {
-            handle_error(ec);
+        if(exiting_ || ec) {
+            if(ec && ec != asio::error::operation_aborted) {
+                handle_error(ec);
+            }
             return;
         }
         ch_.transfer_id = ntohl(header->transfer_id);
@@ -143,8 +157,10 @@ void Session::read_body_chunk() {
     auto data = std::make_shared<std::vector<uint8_t>>(ch_.size);
 
     asio::async_read(socket_, asio::buffer(*data), [this, self, data](std::error_code ec, std::size_t) {
-        if(ec) {
-            handle_error(ec);
+        if(exiting_ || ec) {
+            if(ec && ec != asio::error::operation_aborted) {
+                handle_error(ec);
+            }
             return;
         }
         handle_chunk(ch_, *data);
@@ -238,20 +254,26 @@ void Session::handle_chunk(const protocol::ChunkHeader& ch, const std::vector<ui
     if(state_ == SessionState::UPLOADING) {
         if(ch.flags == protocol::flags::SEND) {
             if(valid_chunk(ch.index, ch.size, data)) {
-                if(transfer_.transfer_id == UINT32_MAX) { // transfer_id not initilized - upload not initialized
+                if(transfer_.transfer_id == UINT32_MAX) { // transfer_id not initilized -> upload not initialized
                     transfer_.transfer_id = ch.transfer_id;
                     upload_init();
                 }
                 uploading(ch.index, ch.size, data, protocol::flags::OK);
                 return;
             }
+            std::cout << "Invalid chunk received." << std::endl;
             upload_abort(false, true, protocol::flags::CHUNK_MISMATCH);
             return;
         } else if(ch.flags == protocol::flags::LAST) {
+            if(transfer_.transfer_id == UINT32_MAX) { // transfer_id not initilized -> upload not initialized
+                transfer_.transfer_id = ch.transfer_id;
+                upload_init();
+            }
             if(valid_chunk(ch.index, ch.size, data)) {
                 uploading(ch.index, ch.size, data, protocol::flags::DONE);
                 return;
             }
+            std::cout << "Invalid last chunk received." << std::endl;
             upload_abort(false, true, protocol::flags::CHUNK_MISMATCH);
             return;
         } else if(ch.flags == protocol::flags::ERROR) {
@@ -306,7 +328,7 @@ void Session::login(protocol::Request& req) {
         protocol::Response res {
             protocol::statuses::OK,
             protocol::codes::OK,
-            "No username provided. Operating in public mode.",
+            "[warning] no username provided. Operating in public mode.",
             ""
         };
         res.chunks.clear();
@@ -323,7 +345,7 @@ void Session::login(protocol::Request& req) {
             protocol::Response res {
                 protocol::statuses::OK,
                 protocol::codes::OK,
-                "Username \"public\" is reserved for public mode. Operating in public mode.",
+                "[warning] username \"public\" is reserved for public mode. Operating in public mode.",
                 ""
             };
             res.chunks.clear();
@@ -351,7 +373,7 @@ void Session::login(protocol::Request& req) {
     } else {
         protocol::Response res {
             protocol::statuses::AUTH,
-            protocol::codes::UNAUTHORIZED,
+            protocol::codes::OK,
             "Please provide your password.",
             ""
         };
@@ -484,7 +506,7 @@ void Session::auth(protocol::Request& req) {
 void Session::need_input(protocol::Request& req) {
     switch (state_) {
         case SessionState::NEED_INPUT_REGISTER:
-            if(req.first_argument == "Y") {
+            if(req.first_argument == "y") {
                 protocol::Response res {
                     protocol::statuses::AUTH,
                     protocol::codes::UNAUTHORIZED,
@@ -504,7 +526,7 @@ void Session::need_input(protocol::Request& req) {
                 protocol::Response res {
                     protocol::statuses::OK,
                     protocol::codes::OK,
-                    "No registrartion. Operating in public mode.",
+                    "[warning] no registrartion. Operating in public mode.",
                     ""
                 };
                 res.chunks.clear();
@@ -553,8 +575,10 @@ void Session::exit() {
 
     if(state_ == SessionState::UPLOADING ) {
         upload_abort_exit(true, socket_opened, protocol::flags::EXIT);
+        return;
     } else if (state_ == SessionState::DOWNLOADING) {
         download_abort_exit(true, socket_opened, protocol::flags::EXIT);
+        return;
     } else if (socket_opened) {
         protocol::Response res{
             protocol::statuses::EXIT,
@@ -565,6 +589,7 @@ void Session::exit() {
         json j;
         protocol::to_json(j, res);
         write_response_json_exit(j);
+        return;
     }
     finish_exit();
 }
@@ -1535,7 +1560,9 @@ bool Session::valid_chunk(const uint32_t& index, const uint32_t& size, const std
 void Session::upload_init() {
     partmeta_->add_partial_metadata(TransferType::UPLOAD, transfer_.fmeta, transfer_.chunks, transfer_.transfer_id);
     transfer_.partial_path = partmeta_->get_partial_path(transfer_.transfer_id);
+    std::cout << transfer_.partial_path.c_str() << std::endl;
     if(transfer_.partial_path.empty()) {
+        std::cout << "Failed to get partial path for upload." << std::endl;
         upload_abort(false, true, protocol::flags::ERROR);
         return;
     } 
@@ -1551,6 +1578,7 @@ void Session::uploading(const uint32_t& index, const uint32_t& size, const std::
     uint32_t offset = fsutils::CHUNK_SIZE * index;
     if(!fsutils::write_chunk(transfer_.partial_path, offset, data)) {
         flag = protocol::flags::ERROR;
+        std::cout << "Failed to write chunk to file." << std::endl;
         upload_abort(false, true, flag);
         return;
     }
@@ -1558,6 +1586,7 @@ void Session::uploading(const uint32_t& index, const uint32_t& size, const std::
     if(flag == protocol::flags::DONE) {
         if(!valid_file(transfer_.partial_path, transfer_.fmeta.hash)) {
             flag = protocol::flags::ERROR;
+            std::cout << "Uploaded file hash mismatch." << std::endl;
             upload_abort(false, true, flag);
             return;
         }
@@ -1582,6 +1611,7 @@ void Session::upload_done() {
     fsutils::move_path(transfer_.partial_path, transfer_.fmeta.absolute_path, true);
     partmeta_->delete_partial_metadata(transfer_.transfer_id);
 
+    transfer_.partial_path = std::filesystem::path("");
     transfer_.transfer_id = UINT32_MAX;
     transfer_.fmeta = fsutils::FileMetadata{};
     transfer_.chunk_state.clear();
@@ -1598,6 +1628,7 @@ void Session::upload_abort(bool save, bool notify, uint8_t flag) {
         fsutils::remove_file(transfer_.partial_path);
         partmeta_->delete_partial_metadata(transfer_.transfer_id);
 
+        transfer_.partial_path = std::filesystem::path("");
         transfer_.transfer_id = UINT32_MAX;
         transfer_.fmeta = fsutils::FileMetadata{};
         transfer_.chunk_state.clear();
@@ -1628,6 +1659,7 @@ void Session::upload_abort_exit(bool save, bool notify, uint8_t flag) {
         fsutils::remove_file(transfer_.partial_path);
         partmeta_->delete_partial_metadata(transfer_.transfer_id);
 
+        transfer_.partial_path = std::filesystem::path("");
         transfer_.transfer_id = UINT32_MAX;
         transfer_.fmeta = fsutils::FileMetadata{};
         transfer_.chunk_state.clear();
@@ -1690,6 +1722,7 @@ void Session::downloading() {
 void Session::download_done() {
     partmeta_->delete_partial_metadata(transfer_.transfer_id);
 
+    transfer_.partial_path = std::filesystem::path("");
     transfer_.transfer_id = UINT32_MAX;
     transfer_.fmeta = fsutils::FileMetadata{};
     transfer_.chunk_state.clear();
@@ -1705,6 +1738,7 @@ void Session::download_abort(bool save, bool notify, uint8_t flag) {
     } else {
         partmeta_->delete_partial_metadata(transfer_.transfer_id);
 
+        transfer_.partial_path = std::filesystem::path("");
         transfer_.transfer_id = UINT32_MAX;
         transfer_.fmeta = fsutils::FileMetadata{};
         transfer_.chunk_state.clear();
@@ -1733,6 +1767,7 @@ void Session::download_abort_exit(bool save, bool notify, uint8_t flag) {
     } else {
         partmeta_->delete_partial_metadata(transfer_.transfer_id);
 
+        transfer_.partial_path = std::filesystem::path("");
         transfer_.transfer_id = UINT32_MAX;
         transfer_.fmeta = fsutils::FileMetadata{};
         transfer_.chunk_state.clear();
