@@ -20,9 +20,20 @@ bool FileMetadata::operator!=(const FileMetadata& other) const {
     return !(*this == other);
 }
 
-fs::path absolute(const fs::path& path) {
-    return fs::absolute(path);
+fs::path resolve_path(const fs::path& user_dir, const fs::path& current_dir, const fs::path& path) {
+    fs::path real;
+    if(path.is_absolute()) {
+        real = fsutils::absolute(user_dir / path.relative_path());
+    } else if(path.is_relative()) {
+        real = fsutils::absolute(current_dir / path);
+    }
+    return real;
 }
+
+fs::path absolute(const fs::path& path) {
+    return normalize(fs::absolute(path));
+}
+
 fs::path relative(const fs::path& base, const fs::path& path) {
     return fs::relative(path, base);
 }
@@ -52,18 +63,16 @@ bool paths_equal(const fs::path& p1, const fs::path& p2) {
 }
 
 bool is_subpath(const fs::path& base, const fs::path& sub) {
-    auto norm_base = base.lexically_normal(); // does not need to exist for mkdir and create file operations
-    auto norm_sub = sub.lexically_normal();
+    fs::path canon_base = fs::weakly_canonical(base);
+    fs::path canon_sub  = fs::weakly_canonical(sub);
 
-    auto base_it = norm_base.begin();
-    auto sub_it = norm_sub.begin();
+    auto b = canon_base.begin();
+    auto s = canon_sub.begin();
 
-    for (; base_it != norm_base.end() && sub_it != norm_sub.end(); ++base_it, ++sub_it) {
-        if (*base_it != *sub_it) {
-            return false;
-        }
+    for (; b != canon_base.end() && s != canon_sub.end(); ++b, ++s) {
+        if (*b != *s) return false;
     }
-    return base_it == norm_base.end();
+    return b == canon_base.end();
 }
 
 uint64_t get_file_size(const fs::path& path) {
@@ -269,20 +278,17 @@ std::string hash_to_hex(const std::array<uint8_t, crypto_generichash_BYTES>& has
 std::array<uint8_t, crypto_generichash_BYTES> hex_to_hash(const std::string& hex) {
     std::array<uint8_t, crypto_generichash_BYTES> hash;
     if (hex.length() / 2 != crypto_generichash_BYTES) {
-        hash.empty();
-        return hash;
+        return HASH_ERROR;
     }
 
     size_t hash_len = 0;
 
     if (sodium_hex2bin(hash.data(), hash.size(), hex.data(), hex.length(), nullptr, &hash_len, nullptr) != 0) {
-        hash.empty();
-        return hash;
+        return HASH_ERROR;
     }
 
     if(hash_len != hash.size()) {
-        hash.empty();
-        return hash;
+        return HASH_ERROR;
     }
 
     return hash;

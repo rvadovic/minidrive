@@ -28,6 +28,7 @@ namespace fsutils {
     };
 
     // Convert path type
+    fs::path resolve_path(const fs::path& user_dir, const fs::path& current_dir, const fs::path& path);
     fs::path absolute(const fs:: path& path);
     fs::path relative(const fs::path& base, const fs::path& path);
     fs::path normalize(const fs::path& path);

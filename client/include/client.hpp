@@ -45,10 +45,12 @@ private:
     std::string username_;
     asio::io_context& io_context_;
     asio::ip::tcp::socket socket_;
+    asio::posix::stream_descriptor input_;
     std::shared_ptr<asio::executor_work_guard<asio::io_context::executor_type>> guard_;
     std::unordered_map<std::string, std::function<void(std::istringstream&)>> commands_; // Map of commands and their functions
     std::thread input_thread_; // Input loop runs in this thread
     uint32_t msg_len_; // Message lenght for json read loop
+    std::string input_buffer_;
     std::vector<char> buffer_; // Buffer for json read loop
     protocol::ChunkHeader ch_; // Chunk header for binary read loop
     std::atomic<ClientState> state_ = ClientState::LOGIN; // State of client
@@ -65,6 +67,7 @@ private:
     void setup();
 
     // Input loop runs in input_thread, calls handle_request()
+    void read_line();
     void input_loop();
 
     // Read loop and write using json protocol for communication

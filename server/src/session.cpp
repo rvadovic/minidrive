@@ -670,7 +670,7 @@ void Session::list(protocol::Request& req) {
         storage_->release_user_lock(username_);
         return;
     }else {
-        std::filesystem::path requested_dir = fsutils::absolute(std::filesystem::path(user_dir_ / req.first_argument));
+        std::filesystem::path requested_dir = fsutils::resolve_path(user_dir_, current_dir_, req.first_argument);
         if(!fsutils::is_directory(requested_dir)) {
             protocol::Response res {
                 protocol::statuses::ERROR,
@@ -760,7 +760,7 @@ void Session::delete_file(protocol::Request& req) {
         write_response_json(j);
         return;
     }
-    std::filesystem::path requested_file = fsutils::absolute(std::filesystem::path(user_dir_ / req.first_argument));
+    std::filesystem::path requested_file = fsutils::resolve_path(user_dir_, current_dir_, req.first_argument);
     if(!fsutils::is_file(requested_file)) {
             protocol::Response res {
                 protocol::statuses::ERROR,
@@ -843,7 +843,7 @@ void Session::upload(protocol::Request& req) {
         write_response_json(j);
         return;
     }
-    std::filesystem::path requested_file = fsutils::absolute(std::filesystem::path(user_dir_ / req.first_argument));
+    std::filesystem::path requested_file = fsutils::resolve_path(user_dir_, current_dir_, req.first_argument);
     if(fsutils::is_file(requested_file)) {
             protocol::Response res {
                 protocol::statuses::ERROR,
@@ -951,7 +951,7 @@ void Session::download(protocol::Request& req) {
         write_response_json(j);
         return;
     }
-    std::filesystem::path requested_file = fsutils::absolute(std::filesystem::path(user_dir_ / req.first_argument));
+    std::filesystem::path requested_file = fsutils::resolve_path(user_dir_, current_dir_, req.first_argument);
     if(!fsutils::is_file(requested_file)) {
         protocol::Response res {
             protocol::statuses::ERROR,
@@ -1091,7 +1091,7 @@ void Session::cd(protocol::Request& req) {
         write_response_json(j);
         return;
     }
-    std::filesystem::path requested_dir = fsutils::absolute(std::filesystem::path(user_dir_ / req.first_argument));
+    std::filesystem::path requested_dir = fsutils::resolve_path(user_dir_, current_dir_, req.first_argument);
     if(!fsutils::is_directory(requested_dir)) {
             protocol::Response res {
                 protocol::statuses::ERROR,
@@ -1170,7 +1170,7 @@ void Session::mkdir(protocol::Request& req) {
         write_response_json(j);
         return;
     }
-    std::filesystem::path requested_dir = fsutils::absolute(std::filesystem::path(user_dir_ / req.first_argument));
+    std::filesystem::path requested_dir = fsutils::resolve_path(user_dir_, current_dir_, req.first_argument);
     if(fsutils::is_directory(requested_dir)) {
             protocol::Response res {
                 protocol::statuses::ERROR,
@@ -1265,7 +1265,7 @@ void Session::rmdir(protocol::Request& req) {
         write_response_json(j);
         return;
     }
-    std::filesystem::path requested_dir = fsutils::absolute(std::filesystem::path(user_dir_ / req.first_argument));
+    std::filesystem::path requested_dir = fsutils::resolve_path(user_dir_, current_dir_, req.first_argument);
     if(!fsutils::is_directory(requested_dir)) {
             protocol::Response res {
                 protocol::statuses::ERROR,
@@ -1360,8 +1360,8 @@ void Session::move(protocol::Request& req) {
         write_response_json(j);
         return;
     }
-    std::filesystem::path requested_src = fsutils::absolute(std::filesystem::path(user_dir_ / req.first_argument));
-    std::filesystem::path requested_dst = fsutils::absolute(std::filesystem::path(user_dir_ / req.second_argument));
+    std::filesystem::path requested_src = fsutils::resolve_path(user_dir_, current_dir_, req.first_argument);
+    std::filesystem::path requested_dst = fsutils::resolve_path(user_dir_, current_dir_, req.second_argument);
     if(!(fsutils::is_directory(requested_src) || fsutils::is_file(requested_src))) {
             protocol::Response res {
                 protocol::statuses::ERROR,
@@ -1470,8 +1470,8 @@ void Session::copy(protocol::Request& req) {
         write_response_json(j);
         return;
     }
-    std::filesystem::path requested_src = fsutils::absolute(std::filesystem::path(user_dir_ / req.first_argument));
-    std::filesystem::path requested_dst = fsutils::absolute(std::filesystem::path(user_dir_ / req.second_argument));
+    std::filesystem::path requested_src = fsutils::resolve_path(user_dir_, current_dir_, req.first_argument);
+    std::filesystem::path requested_dst = fsutils::resolve_path(user_dir_, current_dir_, req.second_argument);
     if(!(fsutils::is_directory(requested_src) || fsutils::is_file(requested_src))) {
             protocol::Response res {
                 protocol::statuses::ERROR,

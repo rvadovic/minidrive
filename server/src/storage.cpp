@@ -4,7 +4,7 @@
 #include "storage.hpp"
 
 Storage::Storage(std::filesystem::path root)
-    : root_(std::move(root)) {
+    : root_(std::move(fsutils::absolute(root))) {
     }
 
 void Storage::setup() {

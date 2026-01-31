@@ -19,6 +19,7 @@ Client::Client(const std::string& username, asio::io_context& io_context, std::s
     : username_(username), 
       io_context_(io_context),
       socket_(io_context_),
+      input_(io_context_, ::dup(STDIN_FILENO)),
       guard_(std::move(guard)),
       commands_{
           {"LIST",     [this](auto& iss){ cmd_list(iss); }},
@@ -33,16 +34,11 @@ Client::Client(const std::string& username, asio::io_context& io_context, std::s
           {"COPY",     [this](auto& iss){ cmd_copy(iss); }},
           {"SYNC",     [this](auto& iss){ cmd_sync(iss); }},
       } {
-        input_thread_ = std::thread(&Client::input_loop, this);
         setup();
     }
 
 Client::~Client() {
     exiting_ = true;
-
-    if(input_thread_.joinable() && std::this_thread::get_id() != input_thread_.get_id()) {
-        input_thread_.join();
-    }
 }
 
 void Client::connect(const std::string& host, uint16_t port) {
@@ -51,6 +47,7 @@ void Client::connect(const std::string& host, uint16_t port) {
         [this](std::error_code ec, tcp::endpoint endpoint) {
             if(!ec) {
                 handle_request(username_);
+                read_line();
                 read_header_json();
             } else {
                 handle_error(ec);
@@ -86,18 +83,23 @@ void Client::setup() {
     partmeta_.emplace(std::filesystem::path(root_ / ".partial/partmeta.json")); // Database for partial metadata
 }
 
-void Client::input_loop() {
-    std::string line;
+void Client::read_line() {
+    if(exiting_) return;
 
-    while (!exiting_) {
-        if (!std::getline(std::cin, line)) {
-            exit();
-            break;
+    asio::async_read_until(input_, asio::dynamic_buffer(input_buffer_), '\n',[this](std::error_code ec, std::size_t length) {
+        if(!ec) {
+            std::string line = input_buffer_.substr(0, length - 1); // remove '\n'
+            input_buffer_.erase(0, length);
+
+            asio::post(io_context_, [this, line = std::move(line)] {
+                handle_request(line); 
+            });
+
+            read_line(); // read next line
+        } else if(ec != asio::error::operation_aborted) {
+            std::cerr << "Input error: " << ec.message() << "\n";
         }
-        asio::post(io_context_, [this, line] {
-            handle_request(line);
-        });
-    }
+    });
 }
 
 void Client::send_json(const json& j) {
@@ -320,7 +322,6 @@ void Client::handle_response(const json& j) {
 }
 
 void Client::handle_request(const std::string& line) {
-    std::cout << std::endl;
     if(line == protocol::commands::EXIT) { // Priority over other commands
         exit();
         return;
@@ -328,6 +329,7 @@ void Client::handle_request(const std::string& line) {
 
     if(state_ == ClientState::AUTH) {
         password_guard_.reset();
+        std::cout << std::endl;
         auth(line);
 
     } else if(state_ == ClientState::READY) {
@@ -479,6 +481,8 @@ void Client::exit() {
 
     if(!exiting_.compare_exchange_strong(expected, true)) return; // Prevent multiple running exit() 
 
+    input_.cancel();
+    
     bool socket_opened = socket_.is_open();
 
     if(state_ == ClientState::UPLOADING ) {                         // Notify server
@@ -549,7 +553,7 @@ void Client::cmd_upload(std::istringstream& iss) {
         print(protocol::codes::BAD_REQUEST, "Missing local path argument.");
         return;
     }
-    std::cout << local_path << std::endl;
+
     auto local = std::filesystem::path(local_path);
 
     if(!fsutils::exists(local)) {
