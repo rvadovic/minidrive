@@ -2,6 +2,9 @@ add_executable(minidrive_client
     src/main.cpp
     src/client.cpp
     src/terminalNoEcho.cpp
+    src/terminalRaw.cpp
+    src/sync_manifest.cpp
+    src/sync_diff.cpp
 )
 
 target_include_directories(minidrive_client

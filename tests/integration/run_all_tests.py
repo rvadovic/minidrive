@@ -24,6 +24,7 @@ TEST_SUITES = [
     ("folder", "Folder Commands", "test_folder_commands.py"),
     ("auth", "Authentication", "test_authentication.py"),
     ("sync", "Sync Command", "test_sync_command.py"),
+    ("batch", "Batch & Two-Way Sync", "test_batch_and_twoway_sync.py"),
     ("conc", "Concurrency", "test_concurrency.py"),
     ("sec", "Security", "test_security.py"),
     ("err", "Error Handling", "test_error_handling.py"),

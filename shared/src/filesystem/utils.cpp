@@ -31,7 +31,9 @@ fs::path resolve_path(const fs::path& user_dir, const fs::path& current_dir, con
 }
 
 fs::path absolute(const fs::path& path) {
-    return normalize(fs::absolute(path));
+    std::error_code ec;
+    fs::path result = normalize(fs::absolute(path, ec));
+    return result;
 }
 
 fs::path relative(const fs::path& base, const fs::path& path) {
@@ -47,15 +49,30 @@ fs::path normalize(const fs::path& path) {
 }
 
 bool exists(const fs::path& path) {
-    return fs::exists(path);
+    std::error_code ec;
+    bool result = fs::exists(path, ec);
+    if(ec) {
+        return false;
+    }
+    return result;
 }
 
 bool is_file(const fs::path& path) {
-    return fs::is_regular_file(path);
+    std::error_code ec;
+    bool result = fs::is_regular_file(path, ec);
+    if(ec) {
+        return false;
+    }
+    return result;
 }
 
 bool is_directory(const fs::path& path) {
-    return fs::is_directory(path);
+    std::error_code ec;
+    bool result = fs::is_directory(path, ec);
+    if(ec) {
+        return false;
+    }
+    return result;
 }
 
 bool paths_equal(const fs::path& p1, const fs::path& p2) {
@@ -63,8 +80,12 @@ bool paths_equal(const fs::path& p1, const fs::path& p2) {
 }
 
 bool is_subpath(const fs::path& base, const fs::path& sub) {
-    fs::path canon_base = fs::weakly_canonical(base);
-    fs::path canon_sub  = fs::weakly_canonical(sub);
+    std::error_code ec;
+    fs::path canon_base = fs::weakly_canonical(base, ec);
+    fs::path canon_sub  = fs::weakly_canonical(sub, ec);
+    if(ec) {
+        return false;
+    }
 
     auto b = canon_base.begin();
     auto s = canon_sub.begin();
@@ -76,13 +97,20 @@ bool is_subpath(const fs::path& base, const fs::path& sub) {
 }
 
 uint64_t get_file_size(const fs::path& path) {
-    uint64_t size = fs::file_size(path);
-    if(size > UINT32_MAX) return UINT64_MAX;
+    std::error_code ec;
+    uint64_t size = fs::file_size(path, ec);
+    if(ec ||size > UINT32_MAX) {
+        return SIZE_ERROR;
+    }
     return size;
 }
 
 uint64_t get_last_write_time(const fs::path& path) {
-    fs::file_time_type ftime = fs::last_write_time(path);
+    std::error_code ec;
+    fs::file_time_type ftime = fs::last_write_time(path, ec);
+    if(ec) {
+        return TIME_ERRROR;
+    }
     return std::chrono::duration_cast<std::chrono::seconds>(ftime.time_since_epoch()).count(); // Returns time in seconds
 }
 

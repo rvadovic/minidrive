@@ -37,7 +37,7 @@ private:
     std::shared_ptr<Storage> storage_; // Handles operations on filesystem using one mutex per user
     std::function<void(std::shared_ptr<Session>)> on_exit_; // Removes this session from server list of sessions on exit
     std::shared_ptr<Database> db_; // Handles file-based database of user data
-    std::shared_ptr<PartialMetadata> partmeta_; // Handles file-based database of user partial file data
+    std::shared_ptr<PartialMetadata> partmeta_; // Handles file-based database of user's partial file data
     std::unordered_map<std::string, std::function<void(protocol::Request&)>> requests_; // Map of commands and their executors
     std::vector<char> buffer_; // Buffer for json read loop
     uint32_t msg_len_; // Message length for json read loop
@@ -48,6 +48,8 @@ private:
     std::string username_; // Logged user
     ActiveTransfer transfer_{UINT32_MAX, fsutils::FileMetadata{}, std::filesystem::path(""), {}, {}}; // Transfer currently active
     std::atomic<bool> exiting_{false}; // Indicates exit has been called
+    std::queue<PartialMetadataEntry> files_to_be_resumed; // Files to be resumed
+    bool resuming_ = false; // True while working through files_to_be_resumed (gates handle_resumes() re-population)
 
     // Read loop and write using json protocol for communication
     void read_header_json(); // read header of json message using async_read, call read_body_json()
@@ -65,6 +67,9 @@ private:
     // Special write which calls finish_exit();
     void send_chunk_exit(const protocol::ChunkHeader& ch, const std::vector<uint8_t>& data);
 
+    // Sending helper
+    void send_res(protocol::Response& res);
+
     // Protocol switch between binary data and json message based on state_
     void read_next();
 
@@ -75,7 +80,7 @@ private:
     void handle_error(const std::error_code& ec); // Handles error codes of async operations
     void handle_request(const nlohmann::json& j);   // Handles json request message from client
     void handle_chunk(const protocol::ChunkHeader& ch, const std::vector<uint8_t>& data); // Handles received binary data from server
-
+    void handle_resumes(); // Handles resumable transfers
     // Automatic operations
     void login(protocol::Request& req); // Handle users existance in db_ (root/users.json), send NEED_INPUT or AUTH response to client, decide public/private mode
     void setup_dir(); // Set up user directory after succesful login

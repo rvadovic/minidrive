@@ -228,10 +228,11 @@ def test_sync_handles_deletions(env, results):
         deleted_correctly = True
         for fname in ["delete_me.txt", "also_delete.txt"]:
             stdout, code = env.run_client(f"DOWNLOAD {remote_dir}/{fname} check_del_{fname}", f"check_sync_del_{fname}")
-            if has_ok_response(stdout):
+            # has_ok_response() matches "ok" anywhere in stdout, including the public-mode banner,
+            # so the downloaded file has to be the real evidence - same pairing as the check above.
+            if has_ok_response(stdout) and os.path.exists(f"check_del_{fname}"):
                 deleted_correctly = False
-                if os.path.exists(f"check_del_{fname}"):
-                    os.remove(f"check_del_{fname}")
+                os.remove(f"check_del_{fname}")
         
         if deleted_correctly:
             results.ok("SYNC deletes locally-removed files from server")

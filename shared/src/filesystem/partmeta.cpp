@@ -13,7 +13,7 @@ using nlohmann::json;
 
 PartialMetadata::PartialMetadata(std::filesystem::path metadata_file)
     :metadata_file_(std::move(metadata_file)) {
-    if(fsutils::get_file_size(metadata_file_)) save();
+    if(fsutils::get_file_size(metadata_file_) == 0) save();
     load(); // load on initialization
     cleanup_expired(); // check expired on initialization
 }
@@ -59,9 +59,13 @@ uint32_t PartialMetadata::add_partial_metadata(TransferType type, fsutils::FileM
 }
 
 void PartialMetadata::delete_partial_metadata(uint32_t id) {
-    std::lock_guard lock(partmeta_mutex_);
-    entries_.erase(id);
-    free_ids_.push(id);
+    {
+        std::lock_guard lock(partmeta_mutex_);
+        entries_.erase(id);
+        free_ids_.push(id);
+    }
+    save(); // persist the removal immediately -- otherwise a completed/discarded transfer
+            // reappears as "resumable" from the stale on-disk file after the next restart
 }
 
 void PartialMetadata::mark_chunk_received(uint32_t id, uint32_t chunk_index) {
@@ -118,18 +122,25 @@ void PartialMetadata::save() {
 }
 
 void PartialMetadata::cleanup_expired() {
-    std::lock_guard lock(partmeta_mutex_);
-
-    auto now = std::chrono::system_clock::now();
-
-    for (auto it = entries_.begin(); it != entries_.end();) {
-        if(now - it->second.last_activity > TRANSFER_TIMEOUT) { // compare saved time with now
-            free_ids_.push(it->second.id);
-            it = entries_.erase(it);
-        } else {
-            ++it;
+    std::vector<uint32_t> expired_ids;
+    {
+        std::lock_guard lock(partmeta_mutex_);
+        auto now = std::chrono::system_clock::now();
+        for (const auto& [id, entry] : entries_) {
+            if (now - entry.last_activity > TRANSFER_TIMEOUT) { // compare saved time with now
+                expired_ids.push_back(id);
+            }
         }
     }
+
+    if (expired_ids.empty()) return;
+
+    for (uint32_t id : expired_ids) {
+        fsutils::remove_file(get_partial_path(id)); // get_partial_path()/delete_partial_metadata() lock internally,
+        delete_partial_metadata(id);                 // so this must run outside the lock above
+    }
+
+    save();
 }
 
 void PartialMetadata::load() {
@@ -150,7 +161,7 @@ void PartialMetadata::load() {
     json j;
     f >> j;
 
-    for(const auto& e : j) {
+    for(const auto& e : j.at("entries")) {
         PartialMetadataEntry entry;
         entry.id = e.at("id").get<uint32_t>();
         entry.absolute_path = std::filesystem::path(e.at("absolute_path").get<std::string>());
@@ -167,4 +178,22 @@ void PartialMetadata::load() {
     }
 
     f.close();
+}
+
+std::vector<PartialMetadataEntry> PartialMetadata::get_entries() {
+    std::lock_guard lock(partmeta_mutex_);
+    std::vector<PartialMetadataEntry> result;
+    std::cout << metadata_file_ << std::endl;
+    result.reserve(entries_.size());
+    for (const auto& [id, entry] : entries_) {
+        result.push_back(entry);
+    }
+    return result;
+}
+
+std::optional<PartialMetadataEntry> PartialMetadata::get_entry(uint32_t id) {
+    std::lock_guard lock(partmeta_mutex_);
+    auto it = entries_.find(id);
+    if(it == entries_.end()) return std::nullopt;
+    return it->second;
 }

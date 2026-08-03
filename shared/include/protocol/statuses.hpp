@@ -9,5 +9,6 @@ inline constexpr const char* AUTH = "AUTH";
 inline constexpr const char* CONFLICT = "CONFLICT";
 inline constexpr const char* BUSY = "BUSY";
 inline constexpr const char* EXIT = "EXIT";
+inline constexpr const char* RESUME = "RESUME";
 
 }

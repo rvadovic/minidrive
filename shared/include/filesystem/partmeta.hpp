@@ -7,6 +7,7 @@
 #include <sodium.h>
 #include <array>
 #include <queue>
+#include <optional>
 #include "protocol/message.hpp"
 #include "filesystem/utils.hpp"
 
@@ -14,6 +15,14 @@ enum class TransferType {
     UPLOAD,
     DOWNLOAD
 };
+
+inline std::string to_string(TransferType type) {
+    switch (type) {
+        case TransferType::UPLOAD:   return "UPLOAD";
+        case TransferType::DOWNLOAD: return "DOWNLOAD";
+    }
+    return "UNKNOWN";
+}
 
 constexpr auto TRANSFER_TIMEOUT = std::chrono::hours(1); // Transfer is deleted after 1 hour
 
@@ -24,7 +33,7 @@ struct PartialMetadataEntry {
     uint32_t size; // Final size
     std::array<uint8_t, crypto_generichash_BYTES> file_hash; //Final file hash
     TransferType type; // Download/ Upload
-    std::vector<protocol::ChunkInfo> chunks; // Chunks, their indexe, sizes, hashes
+    std::vector<protocol::ChunkInfo> chunks; // Chunks, their indexes, sizes, hashes
     std::vector<bool> chunk_state; // bitmap of transferred chunks
     std::chrono::system_clock::time_point last_activity; // last update of data
 };
@@ -42,6 +51,8 @@ public:
     void delete_partial_metadata(uint32_t id); // Delete entry
     void mark_chunk_received(uint32_t id, uint32_t chunk_index); // Mark chunk at index was sucesfully transfered
     void save(); // save entries_ to file, triggered manually, mostly during exit
+    std::vector<PartialMetadataEntry> get_entries(); // get all entries
+    std::optional<PartialMetadataEntry> get_entry(uint32_t id); // get single entry by id, for resume
 
 private:// Check if scan_file returned error value
     std::filesystem::path metadata_file_; // Path of database file

@@ -21,6 +21,26 @@ void from_json(const json& j, ChunkInfo& ci) {
     };
 }
 
+void to_json(json& j, const FileEntry& fe) {
+    j = {
+        {"relative_path", fe.relative_path},
+        {"size", fe.size},
+        {"file_hash", fe.file_hash},
+        {"last_modified", fe.last_modified},
+        {"is_directory", fe.is_directory}
+    };
+}
+
+void from_json(const json& j, FileEntry& fe) {
+    fe = {
+        j.at("relative_path").get<std::string>(),
+        j.at("size").get<uint32_t>(),
+        j.at("file_hash").get<std::string>(),
+        j.at("last_modified").get<uint64_t>(),
+        j.at("is_directory").get<bool>()
+    };
+}
+
 void to_json(json& j, const Request& req) {
     j = {
         {"cmd", req.cmd},
@@ -46,6 +66,10 @@ void to_json(json& j, const Response& res) {
     if(!res.chunks.empty()) {
         j["chunks"] = res.chunks;
     }
+
+    if(!res.files.empty()) {
+        j["files"] = res.files;
+    }
 }
 
 void from_json(const json& j, Request& req) {
@@ -69,6 +93,10 @@ void from_json(const json& j, Response& res) {
 
     if(j.contains("chunks")) {
         res.chunks = j.at("chunks").get<std::vector<ChunkInfo>>();
+    }
+
+    if(j.contains("files")) {
+        res.files = j.at("files").get<std::vector<FileEntry>>();
     }
 }
 

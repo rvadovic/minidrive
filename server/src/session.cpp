@@ -211,6 +211,13 @@ void Session::send_chunk_exit(const protocol::ChunkHeader& ch, const std::vector
     });
 }
 
+void Session::send_res(protocol::Response& res) {
+    res.chunks.clear();
+    json j;
+    protocol::to_json(j, res);
+    write_response_json(j);
+}
+
 void Session::read_next() {
     if(exiting_) return;
     if(state_ == SessionState::UPLOADING || state_ == SessionState::DOWNLOADING) {
@@ -243,10 +250,7 @@ void Session::handle_request(const json& j) {
             "Unknown request",
             "",
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
     }
 }
 
@@ -307,6 +311,40 @@ void Session::handle_chunk(const protocol::ChunkHeader& ch, const std::vector<ui
     }
 }
 
+void Session::handle_resumes() {
+    if (!resuming_) {
+        std::vector<PartialMetadataEntry> entries = partmeta_->get_entries();
+        if (entries.empty()) return;
+        resuming_ = true;
+        for (const auto& entry : entries) {
+            files_to_be_resumed.push(entry);
+        }
+    }
+
+    if(files_to_be_resumed.empty()) {
+        resuming_ = false;
+        state_ = SessionState::READY;
+        protocol::Response res {
+            protocol::statuses::OK,
+            protocol::codes::OK,
+            "Ready.",
+            ""
+        };
+        send_res(res); // a caller (e.g. need_input()'s "n" branch) may be waiting on a reply here
+        return;
+    }
+
+    state_ = SessionState::NEED_INPUT_RESUME_TREANSFER;
+    PartialMetadataEntry file_to_resume = files_to_be_resumed.front();
+    protocol::Response res {
+        protocol::statuses::RESUME,
+        protocol::codes::OK,
+        "Do you want to resume " + to_string(file_to_resume.type) + " of " + fsutils::relative(user_dir_ ,file_to_resume.absolute_path).string() + "? (y/n)",
+        ""
+    };
+    send_res(res);
+}
+
 void Session::login(protocol::Request& req) {
     if(state_ != SessionState::LOGIN) {
         protocol::Response res {
@@ -315,10 +353,7 @@ void Session::login(protocol::Request& req) {
             "Already logged in",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         return;
     }
 
@@ -331,11 +366,8 @@ void Session::login(protocol::Request& req) {
             "[warning] no username provided. Operating in public mode.",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
-        state_ = SessionState::READY;
+        send_res(res);
+        state_ = SessionState::READY; // resume is private-mode only, no handle_resumes() here
         return;
     }
 
@@ -348,11 +380,8 @@ void Session::login(protocol::Request& req) {
                 "[warning] username \"public\" is reserved for public mode. Operating in public mode.",
                 ""
             };
-            res.chunks.clear();
-            json j;
-            protocol::to_json(j, res);
-            write_response_json(j);
-            state_ = SessionState::READY;
+            send_res(res);
+            state_ = SessionState::READY; // resume is private-mode only, no handle_resumes() here
             return;
         }
 
@@ -364,10 +393,7 @@ void Session::login(protocol::Request& req) {
             "User does not exist. Do you want to register? (Y/n)",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         state_ = SessionState::NEED_INPUT_REGISTER;
         return;
     } else {
@@ -377,10 +403,7 @@ void Session::login(protocol::Request& req) {
             "Please provide your password.",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         state_ = SessionState::AUTH;
         return;
     }
@@ -439,10 +462,7 @@ void Session::auth(protocol::Request& req) {
             "Not in authentication state",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         return;
     }
 
@@ -453,25 +473,32 @@ void Session::auth(protocol::Request& req) {
             "Password cannot be empty. Try again.",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         return;
     } else if(db_->user_exists(username_)) {
         if(db_->validate_user(username_, req.first_argument)) {
             setup_dir();
-            protocol::Response res {
-                protocol::statuses::OK,
-                protocol::codes::OK,
-                "Authentication successful.",
-                ""
-            };
-            res.chunks.clear();
-            json j;
-            protocol::to_json(j, res);
-            write_response_json(j);
             state_ = SessionState::READY;
+
+            // Send exactly one response: either the normal OK, or the resume question in its
+            // place -- never both, since a second back-to-back response races against whatever
+            // the client already has buffered on stdin (same class of bug as the login race).
+            std::vector<PartialMetadataEntry> entries = partmeta_->get_entries();
+            if(entries.empty()) {
+                protocol::Response res {
+                    protocol::statuses::OK,
+                    protocol::codes::OK,
+                    "Authentication successful.",
+                    ""
+                };
+                send_res(res);
+            } else {
+                resuming_ = true;
+                for(const auto& entry : entries) {
+                    files_to_be_resumed.push(entry);
+                }
+                handle_resumes();
+            }
             return;
         } else {
             protocol::Response res {
@@ -480,10 +507,7 @@ void Session::auth(protocol::Request& req) {
                 "Invalid password. Try again.",
                 ""
             };
-            res.chunks.clear();
-            json j;
-            protocol::to_json(j, res);
-            write_response_json(j);
+            send_res(res);
             return;
         }
     } else if(!db_->user_exists(username_)) {
@@ -495,14 +519,13 @@ void Session::auth(protocol::Request& req) {
             "Registration successful.",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         state_ = SessionState::READY;
+        handle_resumes();
         return;
     }
 }
+
 void Session::need_input(protocol::Request& req) {
     switch (state_) {
         case SessionState::NEED_INPUT_REGISTER:
@@ -513,10 +536,7 @@ void Session::need_input(protocol::Request& req) {
                     "For registration, please provide a password.",
                     ""
                 };
-                res.chunks.clear();
-                json j;
-                protocol::to_json(j, res);
-                write_response_json(j);
+                send_res(res);
                 state_ = SessionState::AUTH;
                 return; 
             } else if(req.first_argument == "n") {
@@ -529,10 +549,7 @@ void Session::need_input(protocol::Request& req) {
                     "[warning] no registrartion. Operating in public mode.",
                     ""
                 };
-                res.chunks.clear();
-                json j;
-                protocol::to_json(j, res);
-                write_response_json(j);
+                send_res(res);
                 state_ = SessionState::READY;
                 return; 
             } else {
@@ -542,15 +559,66 @@ void Session::need_input(protocol::Request& req) {
                     "Invalid input for registration. Y/n expected.",
                     ""
                 };
-                res.chunks.clear();
-                json j;
-                protocol::to_json(j, res);
-                write_response_json(j);
+                send_res(res);
                 return; 
             }
             break;
         case SessionState::NEED_INPUT_RESUME_TREANSFER:
-            // Handle resume update input
+            if(req.first_argument == "y") {
+                PartialMetadataEntry entry = files_to_be_resumed.front();
+                files_to_be_resumed.pop();
+
+                if(!storage_->try_acquire_user_lock(username_)) {
+                    protocol::Response res {
+                        protocol::statuses::ERROR,
+                        protocol::codes::SERVICE_UNAVAILABLE,
+                        "Server is busy, skipping " + to_string(entry.type) + " of " + fsutils::relative(user_dir_, entry.absolute_path).string(),
+                        ""
+                    };
+                    send_res(res);
+                    handle_resumes();
+                    return;
+                }
+
+                transfer_.transfer_id = entry.id;
+                transfer_.fmeta.absolute_path = entry.absolute_path;
+                transfer_.fmeta.size = entry.size;
+                transfer_.fmeta.hash = entry.file_hash;
+                transfer_.chunks = entry.chunks;
+                transfer_.chunk_state = entry.chunk_state;
+                transfer_.partial_path = partmeta_->get_partial_path(entry.id);
+
+                protocol::Response res {
+                    protocol::statuses::RESUME,
+                    protocol::codes::OK,
+                    to_string(entry.type) + " " + fsutils::relative(user_dir_, entry.absolute_path).string(),
+                    std::to_string(entry.id) // reuse file_hash field to carry the transfer id being resumed
+                };
+                send_res(res);
+
+                if(entry.type == TransferType::UPLOAD) {
+                    state_ = SessionState::UPLOADING; // client drives sending; handle_chunk() already skips upload_init() since transfer_id != UINT32_MAX
+                } else {
+                    state_ = SessionState::DOWNLOADING;
+                    downloading(); // server drives sending, resumes at first chunk_state==false
+                }
+                return;
+            } else if(req.first_argument == "n") {
+                PartialMetadataEntry entry = files_to_be_resumed.front();
+                files_to_be_resumed.pop();
+                fsutils::remove_file(partmeta_->get_partial_path(entry.id));
+                partmeta_->delete_partial_metadata(entry.id);
+            } else {
+                protocol::Response res {
+                    protocol::statuses::ERROR,
+                    protocol::codes::BAD_REQUEST,
+                    "Invalid input for resume confirmation. Y/n expected.",
+                    ""
+                };
+                send_res(res);
+                return;
+            }
+            handle_resumes();
             break;
         default:
             protocol::Response res {
@@ -559,14 +627,12 @@ void Session::need_input(protocol::Request& req) {
                 "No input required at this time.",
                 ""
             };
-            res.chunks.clear();
-            json j;
-            protocol::to_json(j, res);
-            write_response_json(j);
+            send_res(res);
             return; 
     }
     // Implementation of need_input
 }
+
 void Session::exit() {
     bool expected = false;
     if(!exiting_.compare_exchange_strong(expected, true)) return;
@@ -615,10 +681,7 @@ void Session::list(protocol::Request& req) {
             "Session not ready.",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         return;
     }
     if(!storage_->try_acquire_user_lock(username_)) {
@@ -628,10 +691,7 @@ void Session::list(protocol::Request& req) {
             "Server is busy",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         return;
     }
 
@@ -644,10 +704,7 @@ void Session::list(protocol::Request& req) {
                 "Failed to list directory",
                 ""
             };
-            res.chunks.clear();
-            json j;
-            protocol::to_json(j, res);
-            write_response_json(j);
+            send_res(res);
             storage_->release_user_lock(username_);
             return;
         }
@@ -663,10 +720,7 @@ void Session::list(protocol::Request& req) {
             file_list,
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         storage_->release_user_lock(username_);
         return;
     }else {
@@ -678,10 +732,7 @@ void Session::list(protocol::Request& req) {
                 "Directory does not exist.",
                 ""
             };
-            res.chunks.clear();
-            json j;
-            protocol::to_json(j, res);
-            write_response_json(j);
+            send_res(res);
             storage_->release_user_lock(username_);
             return;
         }
@@ -692,10 +743,7 @@ void Session::list(protocol::Request& req) {
                 "Access denied.",
                 ""
             };
-            res.chunks.clear();
-            json j;
-            protocol::to_json(j, res);
-            write_response_json(j);
+            send_res(res);
             storage_->release_user_lock(username_);
             return;
         }
@@ -707,10 +755,7 @@ void Session::list(protocol::Request& req) {
                 "Failed to list directory",
                 ""
             };
-            res.chunks.clear();
-            json j;
-            protocol::to_json(j, res);
-            write_response_json(j);
+            send_res(res);
             storage_->release_user_lock(username_);
             return;
         }
@@ -725,14 +770,12 @@ void Session::list(protocol::Request& req) {
             file_list,
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         storage_->release_user_lock(username_);
         return;
     }
 }
+
 void Session::delete_file(protocol::Request& req) {
     if(state_ != SessionState::READY) {
         protocol::Response res {
@@ -741,10 +784,7 @@ void Session::delete_file(protocol::Request& req) {
             "Session not ready.",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         return;
     }
     if(!storage_->try_acquire_user_lock(username_)) {
@@ -754,10 +794,7 @@ void Session::delete_file(protocol::Request& req) {
             "Server is busy",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         return;
     }
     std::filesystem::path requested_file = fsutils::resolve_path(user_dir_, current_dir_, req.first_argument);
@@ -768,10 +805,7 @@ void Session::delete_file(protocol::Request& req) {
                 "File does not exist.",
                 ""
             };
-            res.chunks.clear();
-            json j;
-            protocol::to_json(j, res);
-            write_response_json(j);
+            send_res(res);
             storage_->release_user_lock(username_);
             return;
         }
@@ -782,10 +816,7 @@ void Session::delete_file(protocol::Request& req) {
                 "Access denied.",
                 ""
             };
-            res.chunks.clear();
-            json j;
-            protocol::to_json(j, res);
-            write_response_json(j);
+            send_res(res);
             storage_->release_user_lock(username_);
             return;
         }
@@ -796,10 +827,7 @@ void Session::delete_file(protocol::Request& req) {
                 "Cannot remove file",
                 ""
             };
-            res.chunks.clear();
-            json j;
-            protocol::to_json(j, res);
-            write_response_json(j);
+            send_res(res);
             storage_->release_user_lock(username_);
             return;
         }
@@ -809,10 +837,7 @@ void Session::delete_file(protocol::Request& req) {
             "File deleted",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         storage_->release_user_lock(username_);
 }
 
@@ -824,10 +849,7 @@ void Session::upload(protocol::Request& req) {
             "Session not ready.",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         return;
     }
     if(!storage_->try_acquire_user_lock(username_)) {
@@ -837,10 +859,7 @@ void Session::upload(protocol::Request& req) {
             "Server is busy",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         return;
     }
     std::filesystem::path requested_file = fsutils::resolve_path(user_dir_, current_dir_, req.first_argument);
@@ -851,10 +870,7 @@ void Session::upload(protocol::Request& req) {
                 "File already exists.",
                 ""
             };
-            res.chunks.clear();
-            json j;
-            protocol::to_json(j, res);
-            write_response_json(j);
+            send_res(res);
             storage_->release_user_lock(username_);
             return;
     }
@@ -865,10 +881,7 @@ void Session::upload(protocol::Request& req) {
                 "Requested file is an existing directory.",
                 ""
             };
-            res.chunks.clear();
-            json j;
-            protocol::to_json(j, res);
-            write_response_json(j);
+            send_res(res);
             storage_->release_user_lock(username_);
             return;
     }
@@ -879,10 +892,7 @@ void Session::upload(protocol::Request& req) {
             "Access denied.",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         storage_->release_user_lock(username_);
         return;
     }
@@ -893,10 +903,7 @@ void Session::upload(protocol::Request& req) {
             "File too large. Max 4GB.",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         storage_->release_user_lock(username_);
         return;
     }
@@ -914,16 +921,14 @@ void Session::upload(protocol::Request& req) {
     protocol::Response res {
         protocol::statuses::OK,
         protocol::codes::OK,
-        "Starting upload to file: " + requested_file.string(),
+        "Starting upload to file: " + fsutils::relative(user_dir_, requested_file).string(),
         ""
     };
-    res.chunks.clear();
-    json j;
-    protocol::to_json(j, res);
-    write_response_json(j);
+    send_res(res);
     state_ = SessionState::UPLOADING;
     return;
 }
+
 void Session::download(protocol::Request& req) {
     if(state_ != SessionState::READY) {
         protocol::Response res {
@@ -932,10 +937,7 @@ void Session::download(protocol::Request& req) {
             "Session not ready.",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         return;
     }
     if(!storage_->try_acquire_user_lock(username_)) {
@@ -945,10 +947,7 @@ void Session::download(protocol::Request& req) {
             "Server is busy",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         return;
     }
     std::filesystem::path requested_file = fsutils::resolve_path(user_dir_, current_dir_, req.first_argument);
@@ -959,10 +958,7 @@ void Session::download(protocol::Request& req) {
             "File does not exist.",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         storage_->release_user_lock(username_);
         return;
     }
@@ -973,10 +969,7 @@ void Session::download(protocol::Request& req) {
             "Requested file is an existing directory.",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         storage_->release_user_lock(username_);
         return;
     }
@@ -987,10 +980,7 @@ void Session::download(protocol::Request& req) {
             "Access denied.",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         storage_->release_user_lock(username_);
         return;
     }
@@ -1003,10 +993,7 @@ void Session::download(protocol::Request& req) {
             "Failed to scan file.",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         storage_->release_user_lock(username_);
         return;
     }
@@ -1018,10 +1005,7 @@ void Session::download(protocol::Request& req) {
             "File is empty.",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         storage_->release_user_lock(username_);
         return;
     }
@@ -1035,10 +1019,7 @@ void Session::download(protocol::Request& req) {
             "Gathering chunk data failed.",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         storage_->release_user_lock(username_);
         return;
     }
@@ -1054,10 +1035,7 @@ void Session::download(protocol::Request& req) {
             "File too large. Max 4GB.",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         storage_->release_user_lock(username_);
         return;
     }
@@ -1085,10 +1063,7 @@ void Session::cd(protocol::Request& req) {
             "Session not ready.",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         return;
     }
     std::filesystem::path requested_dir = fsutils::resolve_path(user_dir_, current_dir_, req.first_argument);
@@ -1099,10 +1074,7 @@ void Session::cd(protocol::Request& req) {
                 "Directory does not exist.",
                 ""
             };
-            res.chunks.clear();
-            json j;
-            protocol::to_json(j, res);
-            write_response_json(j);
+            send_res(res);
             return;
         }
         if(!fsutils::is_subpath(user_dir_, requested_dir)) {
@@ -1112,10 +1084,7 @@ void Session::cd(protocol::Request& req) {
                 "Access denied.",
                 ""
             };
-            res.chunks.clear();
-            json j;
-            protocol::to_json(j, res);
-            write_response_json(j);
+            send_res(res);
             return;
         }
         current_dir_ = requested_dir;
@@ -1125,10 +1094,7 @@ void Session::cd(protocol::Request& req) {
             "Directory changed.",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
 }
 void Session::mkdir(protocol::Request& req) {
     if(state_ != SessionState::READY) {
@@ -1138,10 +1104,7 @@ void Session::mkdir(protocol::Request& req) {
             "Session not ready.",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         return;
     }
     if(req.first_argument.empty()) {
@@ -1151,10 +1114,7 @@ void Session::mkdir(protocol::Request& req) {
                 "Directory path cannot be empty.",
                 ""
             };
-            res.chunks.clear();
-            json j;
-            protocol::to_json(j, res);
-            write_response_json(j);
+            send_res(res);
             return;
     }
     if(!storage_->try_acquire_user_lock(username_)) {
@@ -1164,10 +1124,7 @@ void Session::mkdir(protocol::Request& req) {
             "Server is busy",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         return;
     }
     std::filesystem::path requested_dir = fsutils::resolve_path(user_dir_, current_dir_, req.first_argument);
@@ -1178,10 +1135,7 @@ void Session::mkdir(protocol::Request& req) {
                 "Directory already exists.",
                 ""
             };
-            res.chunks.clear();
-            json j;
-            protocol::to_json(j, res);
-            write_response_json(j);
+            send_res(res);
             storage_->release_user_lock(username_);
             return;
         }
@@ -1192,10 +1146,7 @@ void Session::mkdir(protocol::Request& req) {
             "Access denied.",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         storage_->release_user_lock(username_);
         return;
     }
@@ -1206,10 +1157,7 @@ void Session::mkdir(protocol::Request& req) {
                 "Cannot create directory.",
                 ""
             };
-            res.chunks.clear();
-            json j;
-            protocol::to_json(j, res);
-            write_response_json(j);
+            send_res(res);
             storage_->release_user_lock(username_);
             return;
     }
@@ -1219,10 +1167,7 @@ void Session::mkdir(protocol::Request& req) {
             "Directory created.",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         storage_->release_user_lock(username_);
 }
 void Session::rmdir(protocol::Request& req) {
@@ -1233,10 +1178,7 @@ void Session::rmdir(protocol::Request& req) {
             "Session not ready.",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         return;
     }
     if(req.first_argument.empty()) {
@@ -1246,10 +1188,7 @@ void Session::rmdir(protocol::Request& req) {
                 "Directory path cannot be empty.",
                 ""
             };
-            res.chunks.clear();
-            json j;
-            protocol::to_json(j, res);
-            write_response_json(j);
+            send_res(res);
             return;
     }
     if(!storage_->try_acquire_user_lock(username_)) {
@@ -1259,10 +1198,7 @@ void Session::rmdir(protocol::Request& req) {
             "Server is busy",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         return;
     }
     std::filesystem::path requested_dir = fsutils::resolve_path(user_dir_, current_dir_, req.first_argument);
@@ -1273,10 +1209,7 @@ void Session::rmdir(protocol::Request& req) {
                 "Directory does no  exist.",
                 ""
             };
-            res.chunks.clear();
-            json j;
-            protocol::to_json(j, res);
-            write_response_json(j);
+            send_res(res);
             storage_->release_user_lock(username_);
             return;
         }
@@ -1287,10 +1220,7 @@ void Session::rmdir(protocol::Request& req) {
             "Access denied.",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         storage_->release_user_lock(username_);
         return;
     }
@@ -1301,10 +1231,7 @@ void Session::rmdir(protocol::Request& req) {
                 "Cannot delete directory.",
                 ""
             };
-            res.chunks.clear();
-            json j;
-            protocol::to_json(j, res);
-            write_response_json(j);
+            send_res(res);
             storage_->release_user_lock(username_);
             return;
     }
@@ -1314,10 +1241,7 @@ void Session::rmdir(protocol::Request& req) {
             "Directory deleted.",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         storage_->release_user_lock(username_);
 }
 void Session::move(protocol::Request& req) {
@@ -1328,10 +1252,7 @@ void Session::move(protocol::Request& req) {
             "Session not ready.",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         return;
     }
     if(req.first_argument.empty() || req.second_argument.empty()) {
@@ -1341,10 +1262,7 @@ void Session::move(protocol::Request& req) {
                 "File path cannot be empty.",
                 ""
             };
-            res.chunks.clear();
-            json j;
-            protocol::to_json(j, res);
-            write_response_json(j);
+            send_res(res);
             return;
     }
     if(!storage_->try_acquire_user_lock(username_)) {
@@ -1354,10 +1272,7 @@ void Session::move(protocol::Request& req) {
             "Server is busy",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         return;
     }
     std::filesystem::path requested_src = fsutils::resolve_path(user_dir_, current_dir_, req.first_argument);
@@ -1369,10 +1284,7 @@ void Session::move(protocol::Request& req) {
                 "Incorrect paths.",
                 ""
             };
-            res.chunks.clear();
-            json j;
-            protocol::to_json(j, res);
-            write_response_json(j);
+            send_res(res);
             storage_->release_user_lock(username_);
             return;
     }
@@ -1383,10 +1295,7 @@ void Session::move(protocol::Request& req) {
                 "Destination path already exists.",
                 ""
             };
-            res.chunks.clear();
-            json j;
-            protocol::to_json(j, res);
-            write_response_json(j);
+            send_res(res);
             storage_->release_user_lock(username_);
             return;
     }
@@ -1397,10 +1306,7 @@ void Session::move(protocol::Request& req) {
             "Access denied.",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         storage_->release_user_lock(username_);
         return;
     }
@@ -1411,10 +1317,7 @@ void Session::move(protocol::Request& req) {
                 "Cannot move paths.",
                 ""
             };
-            res.chunks.clear();
-            json j;
-            protocol::to_json(j, res);
-            write_response_json(j);
+            send_res(res);
             storage_->release_user_lock(username_);
             return;
     }
@@ -1424,10 +1327,7 @@ void Session::move(protocol::Request& req) {
             "Path moved.",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         storage_->release_user_lock(username_);
 }
 void Session::copy(protocol::Request& req) {
@@ -1438,10 +1338,7 @@ void Session::copy(protocol::Request& req) {
             "Session not ready.",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         return;
     }
     if(req.first_argument.empty() || req.second_argument.empty()) {
@@ -1451,10 +1348,7 @@ void Session::copy(protocol::Request& req) {
                 "File path cannot be empty.",
                 ""
             };
-            res.chunks.clear();
-            json j;
-            protocol::to_json(j, res);
-            write_response_json(j);
+            send_res(res);
             return;
     }
     if(!storage_->try_acquire_user_lock(username_)) {
@@ -1464,10 +1358,7 @@ void Session::copy(protocol::Request& req) {
             "Server is busy",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         return;
     }
     std::filesystem::path requested_src = fsutils::resolve_path(user_dir_, current_dir_, req.first_argument);
@@ -1479,10 +1370,7 @@ void Session::copy(protocol::Request& req) {
                 "Incorrect paths.",
                 ""
             };
-            res.chunks.clear();
-            json j;
-            protocol::to_json(j, res);
-            write_response_json(j);
+            send_res(res);
             storage_->release_user_lock(username_);
             return;
     }
@@ -1493,10 +1381,7 @@ void Session::copy(protocol::Request& req) {
                 "Destination path already exists.",
                 ""
             };
-            res.chunks.clear();
-            json j;
-            protocol::to_json(j, res);
-            write_response_json(j);
+            send_res(res);
             storage_->release_user_lock(username_);
             return;
     }
@@ -1507,10 +1392,7 @@ void Session::copy(protocol::Request& req) {
             "Access denied.",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         storage_->release_user_lock(username_);
         return;
     }
@@ -1521,10 +1403,7 @@ void Session::copy(protocol::Request& req) {
                 "Cannot copy paths.",
                 ""
             };
-            res.chunks.clear();
-            json j;
-            protocol::to_json(j, res);
-            write_response_json(j);
+            send_res(res);
             storage_->release_user_lock(username_);
             return;
     }
@@ -1534,15 +1413,104 @@ void Session::copy(protocol::Request& req) {
             "Path copied.",
             ""
         };
-        res.chunks.clear();
-        json j;
-        protocol::to_json(j, res);
-        write_response_json(j);
+        send_res(res);
         storage_->release_user_lock(username_);
 }
 
+// SYNC is a stateless listing request: it returns a recursive hash+mtime listing of the requested
+// directory and nothing else. Every mutation the client decides on afterwards is driven by the
+// ordinary single-item UPLOAD/DOWNLOAD/DELETE/MOVE/COPY/MKDIR/RMDIR handlers, one request at a time.
+// That is why the per-user lock must be released on *every* path out of this function before the
+// client can send the next request: Storage's lock is a non-reentrant busy-boolean, so a lock left
+// held here would make every follow-up command in the batch fail with "Server is busy" forever.
 void Session::sync(protocol::Request& req) {
-    // Implementation of sync
+    if(state_ != SessionState::READY) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::SERVICE_UNAVAILABLE,
+            "Session not ready.",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+    if(req.first_argument.empty()) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::BAD_REQUEST,
+            "Directory path cannot be empty.",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+    if(!storage_->try_acquire_user_lock(username_)) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::SERVICE_UNAVAILABLE,
+            "Server is busy",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+    std::filesystem::path requested_dir = fsutils::resolve_path(user_dir_, current_dir_, req.first_argument);
+    if(!fsutils::is_subpath(user_dir_, requested_dir)) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::FORBIDDEN,
+            "Access denied.",
+            ""
+        };
+        send_res(res);
+        storage_->release_user_lock(username_);
+        return;
+    }
+    if(!fsutils::is_directory(requested_dir)) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::PRECONDITION_FAILED,
+            "Remote sync directory does not exist.",
+            ""
+        };
+        send_res(res);
+        storage_->release_user_lock(username_);
+        return;
+    }
+
+    std::vector<fsutils::FileMetadata> files = fsutils::scan_directory(requested_dir, true);
+    if(fsutils::is_scan_dir_error(files)) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::INTERNAL_SERVER_ERROR,
+            "Failed to list directory",
+            ""
+        };
+        send_res(res);
+        storage_->release_user_lock(username_);
+        return;
+    }
+
+    protocol::Response res {
+        protocol::statuses::OK,
+        protocol::codes::OK,
+        "Listing of " + fsutils::relative(user_dir_, requested_dir).string(),
+        ""
+    };
+
+    for(const auto& file : files) {
+        bool is_dir = fsutils::is_directory(file.absolute_path);
+        res.files.push_back(protocol::FileEntry{
+            fsutils::relative(requested_dir, file.absolute_path).generic_string(),
+            is_dir ? 0u : file.size,
+            is_dir ? std::string() : fsutils::hash_to_hex(file.hash),
+            file.last_modified,
+            is_dir
+        });
+    }
+
+    send_res(res);
+    storage_->release_user_lock(username_);
 }
 bool Session::valid_file(const std::filesystem::path& partial_file, const std::array<uint8_t, crypto_generichash_BYTES>& expected) {
     std::array<uint8_t, crypto_generichash_BYTES> hash = fsutils::hash_file(partial_file);
@@ -1618,7 +1586,7 @@ void Session::upload_done() {
     transfer_.chunks.clear();
 
     storage_->release_user_lock(username_);
-    state_ = SessionState::READY;
+    if(resuming_) { handle_resumes(); } else { state_ = SessionState::READY; }
 }
 
 void Session::upload_abort(bool save, bool notify, uint8_t flag) {
@@ -1649,7 +1617,7 @@ void Session::upload_abort(bool save, bool notify, uint8_t flag) {
     }
 
     storage_->release_user_lock(username_);
-    state_ = SessionState::READY;
+    if(resuming_) { handle_resumes(); } else { state_ = SessionState::READY; }
 }
 
 void Session::upload_abort_exit(bool save, bool notify, uint8_t flag) {
@@ -1729,7 +1697,7 @@ void Session::download_done() {
     transfer_.chunks.clear();
 
     storage_->release_user_lock(username_);
-    state_ = SessionState::READY;
+    if(resuming_) { handle_resumes(); } else { state_ = SessionState::READY; }
 }
 
 void Session::download_abort(bool save, bool notify, uint8_t flag) {
@@ -1758,7 +1726,7 @@ void Session::download_abort(bool save, bool notify, uint8_t flag) {
         send_chunk(chunk_header, data);
     }
     storage_->release_user_lock(username_);
-    state_ = SessionState::READY;
+    if(resuming_) { handle_resumes(); } else { state_ = SessionState::READY; }
 }
 
 void Session::download_abort_exit(bool save, bool notify, uint8_t flag) {

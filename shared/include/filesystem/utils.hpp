@@ -15,6 +15,8 @@ namespace fsutils {
     inline constexpr std::array<uint8_t, crypto_generichash_BYTES> HASH_ERROR = {}; // For error in hashing functions 
 
     inline constexpr uint64_t SIZE_ERROR = UINT64_MAX; // For size > 4GB error
+    
+    inline constexpr uint64_t TIME_ERRROR = UINT64_MAX; // For last time error
 
     // Describes files
     struct FileMetadata {
