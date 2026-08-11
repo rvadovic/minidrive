@@ -1471,13 +1471,17 @@ void Client::upload_init() {
 }
 
 void Client::uploading() {
-    uint32_t index;
+    uint32_t index = UINT32_MAX;
 
     for(uint32_t i = 0; i < transfer_.chunk_state.size(); ++i) { // Finf first chunk that has not been sent yet
         if(!transfer_.chunk_state[i]) {
             index = i;
             break;
         }
+    }
+    if(index == UINT32_MAX) { // Every chunk already acknowledged - nothing left to send
+        spdlog::warn("uploading() called with no pending chunks (transfer {})", transfer_.transfer_id);
+        return;
     }
     protocol::ChunkInfo chunk = transfer_.chunks[index];
     uint8_t flag = protocol::flags::SEND;

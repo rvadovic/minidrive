@@ -10,5 +10,4 @@ target_link_libraries(minidrive_integration_smoke
 
 set_target_properties(minidrive_integration_smoke PROPERTIES OUTPUT_NAME integration_smoke)
 
-enable_testing()
 add_test(NAME dependency_smoke COMMAND minidrive_integration_smoke)

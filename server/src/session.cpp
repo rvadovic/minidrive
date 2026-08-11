@@ -1916,13 +1916,17 @@ void Session::download_init() {
 }
 
 void Session::downloading() {
-    uint32_t index;
+    uint32_t index = UINT32_MAX;
 
     for(uint32_t i = 0; i < transfer_.chunk_state.size(); ++i) {
         if(!transfer_.chunk_state[i]) {
             index = i;
             break;
         }
+    }
+    if(index == UINT32_MAX) { // Every chunk already acknowledged - nothing left to send
+        spdlog::warn("[{}] downloading() called with no pending chunks (transfer {})", username_, transfer_.transfer_id);
+        return;
     }
     protocol::ChunkInfo chunk = transfer_.chunks[index];
     uint8_t flag = protocol::flags::SEND;

@@ -160,12 +160,13 @@ class TestEnvironment:
 
     def _check_logging_support(self):
         """Check if the client supports the --log argument."""
+        process = None
         try:
             # Try running with --log argument
             # Use a temp file for the log check to avoid cluttering
             with tempfile.NamedTemporaryFile(delete=False) as tmp:
                 tmp_log = tmp.name
-            
+
             process = subprocess.Popen(
                 [CLIENT_EXE, f"127.0.0.1:{self.port}", "--log", tmp_log],
                 stdin=subprocess.PIPE,
@@ -175,7 +176,7 @@ class TestEnvironment:
                 cwd=self.client_cwd
             )
             stdout, _ = process.communicate(input="EXIT\n", timeout=2)
-            
+
             if os.path.exists(tmp_log):
                 os.remove(tmp_log)
 
@@ -184,6 +185,12 @@ class TestEnvironment:
                 return False
             return True
         except Exception as e:
+            # subprocess.communicate() does not kill the child on TimeoutExpired - without
+            # this it would leak an orphaned client process still holding a server connection
+            # open for every suite run.
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.communicate()
             print(f"Warning: Failed to check logging support: {e}")
             # Default to False if check fails to be safe
             return False

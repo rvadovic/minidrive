@@ -47,6 +47,11 @@ add_subdirectory(server)
 add_subdirectory(client)
 
 if(MINIDRIVE_BUILD_TESTS)
+    # Must be called at the top level: CTest only generates a root build/CTestTestfile.cmake
+    # (what `ctest --test-dir build` reads) when enable_testing() runs here, not just inside
+    # the tests/ subdirectory - otherwise `ctest` silently reports "No tests were found!!!"
+    # even though tests/CTestTestfile.cmake was generated correctly one level down.
+    enable_testing()
     add_subdirectory(tests)
 endif()
 

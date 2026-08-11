@@ -20,7 +20,7 @@ private:
     std::shared_ptr<Storage> storage_; // Manages server storage, locks per user
     std::unordered_set<std::shared_ptr<Session>> sessions_; // Set of active sessions
     std::mutex sessions_mutex_; // Mutex for sessions_
-    bool exit;
+    bool exit = false;
     void accept();
 
     void remove_session(std::shared_ptr<Session> session);
