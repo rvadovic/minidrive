@@ -39,7 +39,7 @@ jobs:
             echo "::endgroup::"
           done
 
-      - name: Package (CPack: .tar.gz + .deb)
+      - name: "Package (CPack: .tar.gz + .deb)"
         working-directory: build
         run: cpack
 
