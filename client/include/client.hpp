@@ -35,7 +35,8 @@ enum class ClientState {
     DOWNLOAD_INIT, // Download request sent, waiting for response
     DOWNLOADING, // Downloading chunks of data
     NEED_INPUT_RESUME_TRANSFER, // Resuming transfer
-    SYNC_LISTING // SYNC listing request sent, waiting for the server's recursive file listing
+    SYNC_LISTING, // SYNC listing request sent, waiting for the server's recursive file listing
+    TIERS_LISTING // TIERS request sent, waiting for the server's list of storage media
 };
 
 // Which command filled batch_queue_ - decides how the SYNC listing response is turned into ops and
@@ -184,6 +185,8 @@ private:
     void cmd_sync(std::istringstream& iss); // Ask the server for a recursive listing, then diff and drive a batch
     void cmd_upload_dir(std::istringstream& iss); // Walk a local directory and queue mkdir/upload ops
     void cmd_download_dir(std::istringstream& iss); // Fetch a recursive listing and queue download ops
+    void cmd_tiers(std::istringstream& iss); // Ask the server which storage media it has configured
+    void cmd_set_tier(std::istringstream& iss); // Ask the server to move this user's data to another medium
 
     // Command bodies, split from argument parsing so the batch engine can drive the very same
     // single-item request/response cycle the interactive commands use
@@ -195,6 +198,7 @@ private:
     void do_rmdir(const std::string& remote);
     void do_move(const std::string& remote_from, const std::string& remote_to);
     void do_copy(const std::string& remote_from, const std::string& remote_to);
+    void do_set_tier(const std::string& tier);
     void send_command(const std::string& cmd, const std::string& first, const std::string& second); // One-shot request, state_ = PROCESSING
 
     void batch_move_or_copy(std::istringstream& iss, bool is_move); // Shared MOVE/COPY parser, single or batched
@@ -206,6 +210,7 @@ private:
     void command_finished(bool success); // Terminal point of any command: advance the batch or read the next line
     void record_op_result(); // Count the finished op and update the baseline
     void handle_sync_listing(const protocol::Response& res); // Turn a recursive listing into a queue of ops
+    void handle_tiers_listing(const protocol::Response& res); // Print the storage media the server offers
     bool scan_local_tree(const std::filesystem::path& dir, std::map<std::string, SyncEntry>& out); // Recursive local scan, relative-path keyed
 
     // Upload

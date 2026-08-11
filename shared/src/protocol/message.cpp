@@ -41,6 +41,22 @@ void from_json(const json& j, FileEntry& fe) {
     };
 }
 
+void to_json(json& j, const TierInfo& ti) {
+    j = {
+        {"name", ti.name},
+        {"description", ti.description},
+        {"is_current", ti.is_current}
+    };
+}
+
+void from_json(const json& j, TierInfo& ti) {
+    ti = {
+        j.at("name").get<std::string>(),
+        j.at("description").get<std::string>(),
+        j.at("is_current").get<bool>()
+    };
+}
+
 void to_json(json& j, const Request& req) {
     j = {
         {"cmd", req.cmd},
@@ -70,6 +86,10 @@ void to_json(json& j, const Response& res) {
     if(!res.files.empty()) {
         j["files"] = res.files;
     }
+
+    if(!res.tiers.empty()) {
+        j["tiers"] = res.tiers;
+    }
 }
 
 void from_json(const json& j, Request& req) {
@@ -97,6 +117,10 @@ void from_json(const json& j, Response& res) {
 
     if(j.contains("files")) {
         res.files = j.at("files").get<std::vector<FileEntry>>();
+    }
+
+    if(j.contains("tiers")) {
+        res.tiers = j.at("tiers").get<std::vector<TierInfo>>();
     }
 }
 

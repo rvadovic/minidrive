@@ -1,0 +1,25 @@
+#pragma once
+
+#include <string_view>
+
+namespace minidrive {
+
+inline constexpr int version_major = @MiniDrive_VERSION_MAJOR@;
+inline constexpr int version_minor = @MiniDrive_VERSION_MINOR@;
+inline constexpr int version_patch = @MiniDrive_VERSION_PATCH@;
+
+inline constexpr std::string_view version() noexcept {
+    return "@MiniDrive_VERSION@";
+}
+
+// `git describe --tags --always --dirty` captured at configure time, e.g.
+// "v0.2.0-3-gabc1234" or "v0.2.0-3-gabc1234-dirty". Empty when the build tree isn't a git
+// checkout (e.g. a source tarball) or git wasn't found.
+inline constexpr std::string_view git_describe() noexcept {
+    return "@MINIDRIVE_GIT_DESCRIBE@";
+}
+
+// git_describe() when available, otherwise falls back to version().
+const char* resolved_version();
+
+} // namespace minidrive

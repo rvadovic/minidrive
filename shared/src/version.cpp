@@ -3,7 +3,7 @@
 namespace minidrive {
 
 const char* resolved_version() {
-    return version().data();
+    return git_describe().empty() ? version().data() : git_describe().data();
 }
 
 } // namespace minidrive

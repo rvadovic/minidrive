@@ -1,5 +1,5 @@
-file_path = "50mb2_file.bin"
-size_mb = 250
+file_path = "600mb_file.bin"
+size_mb = 600
 chunk_size = 1024 * 1024  # 1 MB
 
 with open(file_path, "wb") as f:

@@ -16,5 +16,7 @@ inline constexpr const char* COPY = "COPY";
 inline constexpr const char* SYNC = "SYNC";
 inline constexpr const char* NEED_INPUT = "NEED_INPUT";
 inline constexpr const char* AUTH = "AUTH";
+inline constexpr const char* TIERS = "TIERS"; // List storage media configured on the server
+inline constexpr const char* SET_TIER = "SET_TIER"; // Move the calling user to another medium
 
 }

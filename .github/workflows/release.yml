@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history/tags, so `git describe` resolves to this tag
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake python3
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Dependency link smoke test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Integration test suites (gating - a broken build must not be published)
+        run: |
+          for suite in basic core folder auth sync batch tiers sec err log; do
+            echo "::group::suite: $suite"
+            python3 tests/integration/run_all_tests.py --suite "$suite"
+            echo "::endgroup::"
+          done
+
+      - name: Package (CPack: .tar.gz + .deb)
+        working-directory: build
+        run: cpack
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/minidrive-*.tar.gz
+            build/minidrive-*.deb
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}

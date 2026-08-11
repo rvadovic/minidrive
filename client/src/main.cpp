@@ -5,8 +5,10 @@
 #include <unistd.h>
 #include <asio.hpp>
 #include <sodium.h>
+#include <spdlog/spdlog.h>
 
 #include "minidrive/version.hpp"
+#include "minidrive/logging.hpp"
 #include "client.hpp"
 
 struct UserHostPort {
@@ -46,15 +48,8 @@ static bool parse_host_port(const std::string& input, UserHostPort& out) {
 }
 
 int main(int argc, char* argv[]) {
-    // Echo full command line once for diagnostics
-    /*std::cout << "[cmd]";
-    for (int i = 0; i < argc; ++i) {
-        std::cout << " \"" << argv[i] << '"';
-    }
-    std::cout << std::endl;*/
-
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <host>:<port>" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " [username@]<host>:<port> [--log <log_file>] [--log-level <level>]" << std::endl;
         return 1;
     }
 
@@ -64,14 +59,39 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    //std::cerr << "MiniDrive client (version " << minidrive::version() << ")" << std::endl;
-    //std::cerr << "Connecting to " << hp.host << ':' << hp.port << std::endl;
+    std::string log_file;
+    std::string log_level_str = "info";
+    for (int i = 2; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--log") {
+            if (i + 1 >= argc) {
+                std::cerr << "--log requires a path\n";
+                return 1;
+            }
+            log_file = argv[++i];
+        } else if (arg == "--log-level") {
+            if (i + 1 >= argc) {
+                std::cerr << "--log-level requires a value (trace|debug|info|warn|error|critical|off)\n";
+                return 1;
+            }
+            log_level_str = argv[++i];
+        } else {
+            std::cerr << "Unknown argument: " << arg << std::endl;
+            return 1;
+        }
+    }
 
     // libsodium init
     if (sodium_init() < 0) {
         std::cerr << "libsodium failed to initialize\n";
         return 1;
     }
+
+    // File sink ONLY, never console: client stdout is the OK/ERROR protocol contract callers and
+    // tests parse (see docs/protocol.md) - a stray log line there would corrupt it. With no --log
+    // flag, log_file is empty and logging is a no-op (see minidrive::log::init).
+    minidrive::log::init("client", log_file, minidrive::log::level_from_string(log_level_str), /*also_console=*/false);
+    spdlog::debug("MiniDrive client {} connecting to {}:{}", minidrive::resolved_version(), hp.host, hp.port);
 
     asio::io_context io_context;
     auto work_guard = std::make_shared<asio::executor_work_guard<asio::io_context::executor_type>>(asio::make_work_guard(io_context));

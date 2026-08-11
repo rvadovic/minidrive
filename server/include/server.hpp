@@ -11,7 +11,7 @@
 // Manages sockets, aceppts new connecions
 class Server {
 public:
-    Server(asio::io_context& io_context, std::uint16_t port, const std::filesystem::path& root);
+    Server(asio::io_context& io_context, std::uint16_t port, StorageConfig config);
     void start(); // Start accepting
     void exit_all_sessions(); // Exit all sessions, triggered by signal
 

@@ -1,5 +1,6 @@
 add_library(minidrive_shared STATIC
     src/version.cpp
+    src/minidrive/logging.cpp
     src/protocol/message.cpp
     src/filesystem/utils.cpp
     src/filesystem/partmeta.cpp
@@ -8,6 +9,7 @@ add_library(minidrive_shared STATIC
 target_include_directories(minidrive_shared
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${CMAKE_BINARY_DIR}/generated>
         $<INSTALL_INTERFACE:include>
 )
 

@@ -5,15 +5,15 @@
 #include <vector>
 #include <mutex>
 #include <unordered_set>
-#include <iostream>
+#include <spdlog/spdlog.h>
 #include "storage.hpp"
 
 using asio::ip::tcp;
 
 
-Server::Server(asio::io_context& io_context, std::uint16_t port, const std::filesystem::path& root)
+Server::Server(asio::io_context& io_context, std::uint16_t port, StorageConfig config)
     : acceptor_(io_context, tcp::endpoint(tcp::v4(), port)) {
-    storage_ = std::make_shared<Storage>(root);
+    storage_ = std::make_shared<Storage>(std::move(config));
 }
 void Server::start(){
     storage_->setup();
@@ -38,12 +38,17 @@ void Server::exit_all_sessions() {
 void Server::accept() {
     acceptor_.async_accept([this](std::error_code ec, tcp::socket socket) {
         if (!ec) {
+            std::error_code endpoint_ec;
+            auto endpoint = socket.remote_endpoint(endpoint_ec);
+            spdlog::info("Accepted connection from {}", endpoint_ec ? "unknown" : endpoint.address().to_string() + ":" + std::to_string(endpoint.port()));
             auto session = std::make_shared<Session>(std::move(socket), storage_, [this](std::shared_ptr<Session> s) {
                 remove_session(s); // Session will remove itsefl from sessions_ on exit
             });
             add_session(session);
             session->start();
 
+        } else {
+            spdlog::warn("Accept failed: {}", ec.message());
         }
         if(!exit) accept();
     });

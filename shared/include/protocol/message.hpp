@@ -25,6 +25,14 @@ struct FileEntry {
     bool is_directory;
 };
 
+// One storage medium the server has configured (TIERS responses).
+// Deliberately carries no filesystem path - the server's disk layout is not client business.
+struct TierInfo {
+    std::string name; // Logical tier name, used as the SET_TIER argument
+    std::string description; // Admin supplied text
+    bool is_current; // True for the tier the calling user is on
+};
+
 // Client request JSON protocol
 struct Request {
     std::string cmd; // command
@@ -43,6 +51,7 @@ struct Response {
     std::string file_hash;
     std::vector<ChunkInfo> chunks;
     std::vector<FileEntry> files; // Recursive listing, only used by SYNC responses
+    std::vector<TierInfo> tiers; // Configured storage media, only used by TIERS responses
 };
 
 // Binary protocol for file transfers
@@ -60,6 +69,8 @@ void to_json(json& json, const ChunkInfo& ci);
 void from_json(const json& json, ChunkInfo& ci);
 void to_json(json& json, const FileEntry& fe);
 void from_json(const json& json, FileEntry& fe);
+void to_json(json& json, const TierInfo& ti);
+void from_json(const json& json, TierInfo& ti);
 void to_json(json& json, const Request& req);
 void to_json(json& json, const Response& res);
 void from_json(const json& json, Request& req);

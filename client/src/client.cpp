@@ -1,6 +1,7 @@
 #include <asio.hpp>
 #include <iostream>
 #include <vector>
+#include <spdlog/spdlog.h>
 #include "client.hpp"
 #include "terminalNoEcho.hpp"
 #include "protocol/message.hpp"
@@ -36,6 +37,8 @@ Client::Client(const std::string& username, asio::io_context& io_context, std::s
           {"SYNC",     [this](auto& iss){ cmd_sync(iss); }},
           {"UPLOAD_DIR",   [this](auto& iss){ cmd_upload_dir(iss); }},
           {"DOWNLOAD_DIR", [this](auto& iss){ cmd_download_dir(iss); }},
+          {"TIERS",    [this](auto& iss){ cmd_tiers(iss); }},
+          {"SET_TIER", [this](auto& iss){ cmd_set_tier(iss); }},
       } {
         is_tty_ = ::isatty(STDIN_FILENO) != 0;
         current_prompt_ = PROMPT;
@@ -279,7 +282,22 @@ void Client::process_char(char c) {
     read_char();
 }
 
+// Never log a password in plaintext: AUTH requests carry it as first_argument. The wire itself is
+// still plaintext until transport encryption lands, but the log file at least shouldn't be a
+// second place it leaks.
+namespace {
+json redact_for_log(const json& request_json) {
+    json redacted = request_json;
+    if(redacted.value("cmd", std::string()) == protocol::commands::AUTH) {
+        redacted["first_argument"] = "***";
+    }
+    return redacted;
+}
+} // namespace
+
 void Client::send_json(const json& j) {
+    spdlog::info("-> {}", redact_for_log(j).dump());
+
     auto write_buffer = std::make_shared<std::string>(j.dump());
 
     if(write_buffer->size() > std::numeric_limits<uint32_t>::max()) {
@@ -304,6 +322,8 @@ void Client::send_json(const json& j) {
 }
 
 void Client::send_json_exit(const json& j) {
+    spdlog::info("-> {} (exit)", redact_for_log(j).dump());
+
     auto write_buffer = std::make_shared<std::string>(j.dump());
 
     if(write_buffer->size() > std::numeric_limits<uint32_t>::max()) {
@@ -457,6 +477,7 @@ void Client::on_password_required() {
 }
 
 void Client::handle_error(const std::error_code& ec) {
+    spdlog::warn("Network error: {} ({})", ec.message(), ec.value());
     if(ec.value() != 125) {
         std::cerr << "Network error: " << ec.message() << " (" << ec.value() << ")" << std::endl;
     }
@@ -467,9 +488,11 @@ void Client::handle_error(const std::error_code& ec) {
 
 // Mostly sets state_ of client
 void Client::handle_response(const json& j) {
+    spdlog::info("<- {}", j.dump());
+
     protocol::Response res;
     protocol::from_json(j, res); // Parse
-    
+
     if(res.status == protocol::statuses::AUTH) {
         state_ = ClientState::AUTH;
         print(res.code, res.message, false);
@@ -502,6 +525,10 @@ void Client::handle_response(const json& j) {
         if(state_ == ClientState::SYNC_LISTING) {
             state_ = ClientState::READY;
             handle_sync_listing(res);
+            return;
+        } else if(state_ == ClientState::TIERS_LISTING) {
+            state_ = ClientState::READY;
+            handle_tiers_listing(res);
             return;
         } else if(state_ == ClientState::UPLOAD_INIT) {
             state_ = ClientState::UPLOADING;
@@ -794,6 +821,10 @@ void Client::do_mkdir(const std::string& remote) {
     send_command(protocol::commands::MKDIR, remote, "");
 }
 
+void Client::do_set_tier(const std::string& tier) {
+    send_command(protocol::commands::SET_TIER, tier, "");
+}
+
 void Client::do_rmdir(const std::string& remote) {
     send_command(protocol::commands::RMDIR, remote, "");
 }
@@ -978,6 +1009,26 @@ void Client::cmd_mkdir(std::istringstream& iss) {
         return;
     }
     do_mkdir(path);
+}
+
+void Client::cmd_tiers(std::istringstream& iss) {
+    (void)iss;
+    protocol::Request req{ protocol::commands::TIERS, "", "", 0, "" };
+    req.chunks.clear();
+    json j;
+    protocol::to_json(j, req);
+    send_json(j);
+    state_ = ClientState::TIERS_LISTING; // The tier list arrives in res.tiers, not in the message
+}
+
+void Client::cmd_set_tier(std::istringstream& iss) {
+    std::string tier;
+    if(!(iss >> tier)) {
+        print(protocol::codes::BAD_REQUEST, "Missing tier name. Use TIERS to see available media.");
+        read_line();
+        return;
+    }
+    do_set_tier(tier);
 }
 
 void Client::cmd_rmdir(std::istringstream& iss) {
@@ -1182,6 +1233,24 @@ bool Client::scan_local_tree(const std::filesystem::path& dir, std::map<std::str
         out[relative_path] = entry;
     }
     return true;
+}
+
+void Client::handle_tiers_listing(const protocol::Response& res) {
+    // The server only ever sends names and descriptions here, never its filesystem paths
+    for(const auto& tier : res.tiers) {
+        std::cout << (tier.is_current ? "  * " : "    ") << tier.name;
+        if(!tier.description.empty()) {
+            std::cout << "  -  " << tier.description;
+        }
+        if(tier.is_current) {
+            std::cout << "  (current)";
+        }
+        std::cout << std::endl;
+    }
+    if(!res.tiers.empty()) {
+        std::cout << "Use SET_TIER <name> to move your data to another medium." << std::endl;
+    }
+    command_finished(true);
 }
 
 void Client::handle_sync_listing(const protocol::Response& res) {

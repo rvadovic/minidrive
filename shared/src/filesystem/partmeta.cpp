@@ -1,7 +1,6 @@
 #include <mutex>
 #include <fstream>
 #include <filesystem>
-#include <iostream>
 #include <algorithm>
 #include <thread>
 #include <string>
@@ -183,7 +182,6 @@ void PartialMetadata::load() {
 std::vector<PartialMetadataEntry> PartialMetadata::get_entries() {
     std::lock_guard lock(partmeta_mutex_);
     std::vector<PartialMetadataEntry> result;
-    std::cout << metadata_file_ << std::endl;
     result.reserve(entries_.size());
     for (const auto& [id, entry] : entries_) {
         result.push_back(entry);

@@ -38,12 +38,36 @@ bool Database::validate_user(const std::string& username, const std::string& pas
     return false;
 }
 
-void Database::add_user(const std::string& username, const std::string& password) {
+void Database::add_user(const std::string& username, const std::string& password, const std::string& storage_class) {
     std::lock_guard<std::mutex> lock(db_mutex_);
     load();
     std::string password_hash = password::hash_password(password);
-    entries_.push_back(DatabaseEntry{username, password_hash});
+    entries_.push_back(DatabaseEntry{username, password_hash, storage_class});
     save();
+}
+
+std::string Database::get_storage_class(const std::string& username) {
+    std::lock_guard<std::mutex> lock(db_mutex_);
+    load();
+    for(const auto& entry : entries_) {
+        if(entry.username == username) {
+            return entry.storage_class;
+        }
+    }
+    return std::string();
+}
+
+bool Database::set_storage_class(const std::string& username, const std::string& storage_class) {
+    std::lock_guard<std::mutex> lock(db_mutex_);
+    load();
+    for(auto& entry : entries_) {
+        if(entry.username == username) {
+            entry.storage_class = storage_class;
+            save();
+            return true;
+        }
+    }
+    return false;
 }
 
 void Database::load() {
@@ -64,9 +88,12 @@ void Database::load() {
     f >> j;
     
     for(const auto& user: j["users"]) {
+        // storage_class was added after the first users.json files were written,
+        // so an entry without it is valid and means "server default tier"
         entries_.push_back(DatabaseEntry{
             user["username"].get<std::string>(),
-            user["password_hash"].get<std::string>()
+            user["password_hash"].get<std::string>(),
+            user.contains("storage_class") ? user["storage_class"].get<std::string>() : std::string()
         });
     }
    
@@ -86,7 +113,8 @@ void Database::save() {
     for(const auto& entry : entries_) {
         j["users"].push_back({
             {"username", entry.username},
-            {"password_hash", entry.password_hash}
+            {"password_hash", entry.password_hash},
+            {"storage_class", entry.storage_class}
         });
     }
     f << j.dump(4);

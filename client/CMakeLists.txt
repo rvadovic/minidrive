@@ -20,3 +20,9 @@ target_link_libraries(minidrive_client
 )
 
 set_target_properties(minidrive_client PROPERTIES OUTPUT_NAME client)
+
+if(MINIDRIVE_STATIC_RUNTIME AND NOT MSVC)
+    target_link_options(minidrive_client PRIVATE -static-libgcc -static-libstdc++)
+endif()
+
+install(TARGETS minidrive_client RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

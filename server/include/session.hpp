@@ -15,6 +15,7 @@ enum class SessionState {
     CONFLICT,
     NEED_INPUT_REGISTER, // Need input: (Y/n) for registration
     NEED_INPUT_RESUME_TREANSFER, //Need input: (Y/n) for resuming uploads/downloads
+    NEED_INPUT_SET_TIER, // Need input: (Y/n) for confirming a storage tier change
     BUSY,
     LOGIN, // Logging in with given username
     READY, // Ready to execute commands
@@ -50,6 +51,7 @@ private:
     std::atomic<bool> exiting_{false}; // Indicates exit has been called
     std::queue<PartialMetadataEntry> files_to_be_resumed; // Files to be resumed
     bool resuming_ = false; // True while working through files_to_be_resumed (gates handle_resumes() re-population)
+    std::string pending_tier_; // Tier the user asked to move to, held while waiting for their (Y/n)
 
     // Read loop and write using json protocol for communication
     void read_header_json(); // read header of json message using async_read, call read_body_json()
@@ -83,7 +85,7 @@ private:
     void handle_resumes(); // Handles resumable transfers
     // Automatic operations
     void login(protocol::Request& req); // Handle users existance in db_ (root/users.json), send NEED_INPUT or AUTH response to client, decide public/private mode
-    void setup_dir(); // Set up user directory after succesful login
+    bool setup_dir(); // Set up user directory on their storage tier after succesful login, false means it already sent an error response
     void auth(protocol::Request& req); // Handle password in private mode, store in db_ (root/users.json), send BAD_REQUEST reponse when needed
     void need_input(protocol::Request& req); // Handle registration and resume transfer questions (Y/n)
 
@@ -98,6 +100,9 @@ private:
     void move(protocol::Request& req); // Check arguments, acquire per user lock, execute using fsutils, release per user lock
     void copy(protocol::Request& req); // Check arguments, acquire per user lock, execute using fsutils, release per user lock
     void sync(protocol::Request& req);
+    void tiers(protocol::Request& req); // List storage media configured on the server, no lock needed
+    void set_tier(protocol::Request& req); // Check arguments, acquire per user lock, ask for confirmation
+    void finish_set_tier(); // Runs the migration after the user confirmed, releases per user lock
 
     // Upload - simular to clients download
     bool valid_file(const std::filesystem::path& partial_file, const std::array<uint8_t, crypto_generichash_BYTES>& expected);

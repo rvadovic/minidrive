@@ -25,6 +25,7 @@ TEST_SUITES = [
     ("auth", "Authentication", "test_authentication.py"),
     ("sync", "Sync Command", "test_sync_command.py"),
     ("batch", "Batch & Two-Way Sync", "test_batch_and_twoway_sync.py"),
+    ("tiers", "Storage Tiering", "test_storage_tiers.py"),
     ("conc", "Concurrency", "test_concurrency.py"),
     ("sec", "Security", "test_security.py"),
     ("err", "Error Handling", "test_error_handling.py"),

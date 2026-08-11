@@ -1,8 +1,8 @@
 #include <asio.hpp>
-#include <iostream>
 #include <memory>
 #include <vector>
 #include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 #include "session.hpp"
 #include "protocol/message.hpp"
 #include "protocol/commands.hpp"
@@ -31,6 +31,8 @@ Session::Session(tcp::socket socket, std::shared_ptr<Storage> storage, std::func
           {protocol::commands::MOVE,     [this](auto& req){ move(req); }},
           {protocol::commands::COPY,     [this](auto& req){ copy(req); }},
           {protocol::commands::SYNC,     [this](auto& req){ sync(req); }},
+          {protocol::commands::TIERS,    [this](auto& req){ tiers(req); }},
+          {protocol::commands::SET_TIER, [this](auto& req){ set_tier(req); }},
           {protocol::commands::LOGIN,     [this](auto& req){ login(req); }},
           {protocol::commands::NEED_INPUT, [this](auto& req){ need_input(req); }},
           {protocol::commands::AUTH, [this](auto& req){ auth(req); }}
@@ -92,7 +94,7 @@ void Session::write_response_json(const json& j) {
     auto write_buffer = std::make_shared<std::string>(j.dump());
 
     if(write_buffer->size() > std::numeric_limits<uint32_t>::max()) {
-        std::cout << std::endl << "File data was too large." << std::endl;
+        spdlog::error("[{}] Response body too large to send ({} bytes)", username_, write_buffer->size());
         return;
     }
 
@@ -101,7 +103,7 @@ void Session::write_response_json(const json& j) {
     std::vector<asio::const_buffer> buffers;
     buffers.push_back(asio::buffer(response_len.get(), sizeof(uint32_t)));
     buffers.push_back(asio::buffer(*write_buffer));
-    
+
     asio::async_write(socket_, buffers, [this, self, write_buffer, response_len](std::error_code ec, std::size_t) {
         if(ec) {
             handle_error(ec);
@@ -116,7 +118,7 @@ void Session::write_response_json_exit(const json& j) {
     auto write_buffer = std::make_shared<std::string>(j.dump());
 
     if(write_buffer->size() > std::numeric_limits<uint32_t>::max()) {
-        std::cout << std::endl << "File data was too large." << std::endl;
+        spdlog::error("[{}] Response body too large to send ({} bytes)", username_, write_buffer->size());
         return;
     }
 
@@ -212,6 +214,7 @@ void Session::send_chunk_exit(const protocol::ChunkHeader& ch, const std::vector
 }
 
 void Session::send_res(protocol::Response& res) {
+    spdlog::debug("[{}] -> {} {} {}", username_, res.status, res.code, res.message);
     res.chunks.clear();
     json j;
     protocol::to_json(j, res);
@@ -228,14 +231,14 @@ void Session::read_next() {
 }
 
 void Session::handle_error(const std::error_code& ec) {
-    std::cerr << "Network error: " << ec.message() << " (" << ec.value() << ")" << std::endl;
+    spdlog::warn("[{}] Network error: {} ({})", username_, ec.message(), ec.value());
     exit();
 }
 
 void Session::handle_request(const json& j) {
     protocol::Request req;
     protocol::from_json(j, req);
-    std::cout << req.cmd << std::endl;
+    spdlog::info("[{}] <- {}", username_.empty() ? "-" : username_, req.cmd);
     if(req.cmd == protocol::commands::EXIT) {
         exit();
         return;
@@ -265,7 +268,7 @@ void Session::handle_chunk(const protocol::ChunkHeader& ch, const std::vector<ui
                 uploading(ch.index, ch.size, data, protocol::flags::OK);
                 return;
             }
-            std::cout << "Invalid chunk received." << std::endl;
+            spdlog::warn("[{}] Invalid chunk received (index {}).", username_, ch.index);
             upload_abort(false, true, protocol::flags::CHUNK_MISMATCH);
             return;
         } else if(ch.flags == protocol::flags::LAST) {
@@ -277,7 +280,7 @@ void Session::handle_chunk(const protocol::ChunkHeader& ch, const std::vector<ui
                 uploading(ch.index, ch.size, data, protocol::flags::DONE);
                 return;
             }
-            std::cout << "Invalid last chunk received." << std::endl;
+            spdlog::warn("[{}] Invalid last chunk received (index {}).", username_, ch.index);
             upload_abort(false, true, protocol::flags::CHUNK_MISMATCH);
             return;
         } else if(ch.flags == protocol::flags::ERROR) {
@@ -359,7 +362,7 @@ void Session::login(protocol::Request& req) {
 
     if(req.first_argument.empty()) {
         username_ = "public";
-        setup_dir();
+        if(!setup_dir()) return; // setup_dir() already answered with the error
         protocol::Response res {
             protocol::statuses::OK,
             protocol::codes::OK,
@@ -373,7 +376,7 @@ void Session::login(protocol::Request& req) {
 
     if(req.first_argument == "public") {
             username_ = "public";
-            setup_dir();
+            if(!setup_dir()) return; // setup_dir() already answered with the error
             protocol::Response res {
                 protocol::statuses::OK,
                 protocol::codes::OK,
@@ -409,27 +412,39 @@ void Session::login(protocol::Request& req) {
     }
 }
 
-void Session::setup_dir() {
+bool Session::setup_dir() {
     if(username_ != "public") {
-        if(fsutils::is_directory(std::filesystem::path(root_ / "private" / username_))) {
-            if(!fsutils::is_directory(std::filesystem::path(root_ / "private" / username_ / "files"))) {
-                fsutils::mkdir(std::filesystem::path(root_ / "private" / username_ / "files"));
+        // Private data lives on the user's storage tier, which is not necessarily the control root
+        std::filesystem::path base = storage_->get_user_root(username_);
+        if(base.empty()) {
+            protocol::Response res {
+                protocol::statuses::ERROR,
+                protocol::codes::INTERNAL_SERVER_ERROR,
+                "Your storage tier is not configured on this server. Contact the administrator.",
+                ""
+            };
+            send_res(res);
+            return false;
+        }
+        if(fsutils::is_directory(std::filesystem::path(base / "private" / username_))) {
+            if(!fsutils::is_directory(std::filesystem::path(base / "private" / username_ / "files"))) {
+                fsutils::mkdir(std::filesystem::path(base / "private" / username_ / "files"));
             }
-            if(!fsutils::is_directory(std::filesystem::path(root_ / "private" / username_ / ".partial"))) {
-                fsutils::mkdir(std::filesystem::path(root_ / "private" / username_ / ".partial"));
-                fsutils::create_empty_file(std::filesystem::path(root_ / "private" / username_ / ".partial/partmeta.json"));
+            if(!fsutils::is_directory(std::filesystem::path(base / "private" / username_ / ".partial"))) {
+                fsutils::mkdir(std::filesystem::path(base / "private" / username_ / ".partial"));
+                fsutils::create_empty_file(std::filesystem::path(base / "private" / username_ / ".partial/partmeta.json"));
             }
-            if(!fsutils::is_file(std::filesystem::path(root_ / "private" / username_ / ".partial/partmeta.json"))) {
-                fsutils::create_empty_file(std::filesystem::path(root_ / "private" / username_ / ".partial/partmeta.json"));
+            if(!fsutils::is_file(std::filesystem::path(base / "private" / username_ / ".partial/partmeta.json"))) {
+                fsutils::create_empty_file(std::filesystem::path(base / "private" / username_ / ".partial/partmeta.json"));
             }
 
         } else {
-            fsutils::mkdir(std::filesystem::path(root_ / "private" / username_));
-            fsutils::mkdir(std::filesystem::path(root_ / "private" / username_ / "files"));
-            fsutils::mkdir(std::filesystem::path(root_ / "private" / username_ / ".partial"));
-            fsutils::create_empty_file(std::filesystem::path(root_ / "private" / username_ / ".partial/partmeta.json"));
+            fsutils::mkdir(std::filesystem::path(base / "private" / username_));
+            fsutils::mkdir(std::filesystem::path(base / "private" / username_ / "files"));
+            fsutils::mkdir(std::filesystem::path(base / "private" / username_ / ".partial"));
+            fsutils::create_empty_file(std::filesystem::path(base / "private" / username_ / ".partial/partmeta.json"));
         }
-        user_dir_ = fsutils::absolute(std::filesystem::path(root_ / "private" / username_ / "files"));
+        user_dir_ = fsutils::absolute(std::filesystem::path(base / "private" / username_ / "files"));
     } else {
         if(fsutils::is_directory(std::filesystem::path(root_ / "public"))) {
             if(!fsutils::is_directory(std::filesystem::path(root_ / "public" / "files"))) {
@@ -452,6 +467,7 @@ void Session::setup_dir() {
     }
     current_dir_ = user_dir_;
     partmeta_ = storage_->get_partmeta(username_);
+    return true;
 }
 
 void Session::auth(protocol::Request& req) {
@@ -477,7 +493,8 @@ void Session::auth(protocol::Request& req) {
         return;
     } else if(db_->user_exists(username_)) {
         if(db_->validate_user(username_, req.first_argument)) {
-            setup_dir();
+            spdlog::info("[{}] Authentication succeeded.", username_);
+            if(!setup_dir()) return; // setup_dir() already answered with the error
             state_ = SessionState::READY;
 
             // Send exactly one response: either the normal OK, or the resume question in its
@@ -501,6 +518,7 @@ void Session::auth(protocol::Request& req) {
             }
             return;
         } else {
+            spdlog::warn("[{}] Authentication failed: invalid password.", username_);
             protocol::Response res {
                 protocol::statuses::AUTH,
                 protocol::codes::UNAUTHORIZED,
@@ -511,8 +529,9 @@ void Session::auth(protocol::Request& req) {
             return;
         }
     } else if(!db_->user_exists(username_)) {
-        db_->add_user(username_, req.first_argument);
-        setup_dir();
+        db_->add_user(username_, req.first_argument, storage_->get_default_tier());
+        spdlog::info("[{}] Registered new user.", username_);
+        if(!setup_dir()) return; // setup_dir() already answered with the error
         protocol::Response res {
             protocol::statuses::OK,
             protocol::codes::OK,
@@ -541,7 +560,7 @@ void Session::need_input(protocol::Request& req) {
                 return; 
             } else if(req.first_argument == "n") {
                 username_ = "public";
-                setup_dir();
+                if(!setup_dir()) return; // setup_dir() already answered with the error
 
                 protocol::Response res {
                     protocol::statuses::OK,
@@ -619,6 +638,33 @@ void Session::need_input(protocol::Request& req) {
                 return;
             }
             handle_resumes();
+            break;
+        case SessionState::NEED_INPUT_SET_TIER:
+            if(req.first_argument == "y") {
+                finish_set_tier();
+                return;
+            } else if(req.first_argument == "n") {
+                pending_tier_.clear();
+                state_ = SessionState::READY;
+                storage_->release_user_lock(username_);
+                protocol::Response res {
+                    protocol::statuses::OK,
+                    protocol::codes::OK,
+                    "Tier change cancelled.",
+                    ""
+                };
+                send_res(res);
+                return;
+            } else {
+                protocol::Response res {
+                    protocol::statuses::ERROR,
+                    protocol::codes::BAD_REQUEST,
+                    "Invalid input for tier change. Y/n expected.",
+                    ""
+                };
+                send_res(res);
+                return; // stays in NEED_INPUT_SET_TIER, lock still held, question can be answered again
+            }
             break;
         default:
             protocol::Response res {
@@ -1512,6 +1558,222 @@ void Session::sync(protocol::Request& req) {
     send_res(res);
     storage_->release_user_lock(username_);
 }
+
+void Session::tiers(protocol::Request& req) {
+    (void)req;
+    if(state_ != SessionState::READY) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::SERVICE_UNAVAILABLE,
+            "Session not ready.",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+
+    // Reads configuration only, touches no user files, so it takes no user lock (same as cd())
+    std::string current = storage_->get_user_tier(username_);
+
+    protocol::Response res {
+        protocol::statuses::OK,
+        protocol::codes::OK,
+        username_ == "public"
+            ? "Available storage tiers (public mode uses the server's shared public storage):"
+            : "Available storage tiers:",
+        ""
+    };
+
+    for(const auto& tier : storage_->get_tiers()) {
+        // The tier's path is deliberately not sent - clients have no business knowing the
+        // server's disk layout, only the names they are allowed to pick from.
+        res.tiers.push_back(protocol::TierInfo{
+            tier.name,
+            tier.description,
+            !current.empty() && tier.name == current
+        });
+    }
+
+    send_res(res);
+}
+
+void Session::set_tier(protocol::Request& req) {
+    if(state_ != SessionState::READY) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::SERVICE_UNAVAILABLE,
+            "Session not ready.",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+
+    if(req.first_argument.empty()) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::BAD_REQUEST,
+            "Tier name cannot be empty.",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+
+    if(username_ == "public") {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::FORBIDDEN,
+            "Public mode has no storage tier. Log in with a username to change tiers.",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+
+    // The server only ever places users on media it was actually configured with
+    if(storage_->find_tier(req.first_argument) == nullptr) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::NOT_FOUND,
+            "Unknown storage tier '" + req.first_argument + "'. Use TIERS to see available media.",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+
+    std::string current = storage_->get_user_tier(username_);
+    if(current == req.first_argument) {
+        protocol::Response res {
+            protocol::statuses::OK,
+            protocol::codes::OK,
+            "Already on tier '" + current + "'.",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+
+    // Partial transfer records store absolute destination paths, so moving the tree out from
+    // under them would silently break every resume. Reconnecting offers to finish or discard them.
+    std::vector<PartialMetadataEntry> pending = partmeta_->get_entries();
+    if(!pending.empty()) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::CONFLICT,
+            "You have " + std::to_string(pending.size()) +
+                " unfinished transfer(s). Reconnect to finish or discard them before changing tier.",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+
+    // Held across the confirmation so a concurrent upload cannot start under the migration.
+    // finish_exit() releases it unconditionally, so a client that never answers cannot brick the user.
+    if(!storage_->try_acquire_user_lock(username_)) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::SERVICE_UNAVAILABLE,
+            "Server is busy",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+
+    uint64_t files = 0;
+    uint64_t bytes = 0;
+    std::vector<fsutils::FileMetadata> contents = fsutils::scan_directory(user_dir_, true);
+    if(!fsutils::is_scan_dir_error(contents)) {
+        for(const auto& file : contents) {
+            if(fsutils::is_directory(file.absolute_path)) continue;
+            files++;
+            bytes += file.size;
+        }
+    }
+
+    pending_tier_ = req.first_argument;
+    protocol::Response res {
+        protocol::statuses::NEED_INPUT,
+        protocol::codes::OK,
+        "Move " + std::to_string(files) + " file(s), " + std::to_string(bytes) + " bytes from tier '" +
+            current + "' to '" + pending_tier_ + "'? This may take a while. (Y/n)",
+        ""
+    };
+    send_res(res);
+    state_ = SessionState::NEED_INPUT_SET_TIER;
+}
+
+void Session::finish_set_tier() {
+    // Reached only from need_input()'s "y" branch, which holds the user lock taken by set_tier()
+    std::string target = pending_tier_;
+    pending_tier_.clear();
+    state_ = SessionState::READY;
+
+    std::string current = storage_->get_user_tier(username_);
+    const StorageTier* from = storage_->find_tier(current);
+    const StorageTier* to = storage_->find_tier(target);
+
+    if(from == nullptr || to == nullptr) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::INTERNAL_SERVER_ERROR,
+            "Storage tier is no longer configured on this server.",
+            ""
+        };
+        send_res(res);
+        storage_->release_user_lock(username_);
+        return;
+    }
+
+    // Synchronous on purpose: the per user lock already makes this user's other commands fail
+    // fast with "Server is busy", and the io_context runs a thread per core so the server keeps
+    // serving everyone else. A very large move still occupies one of those threads.
+    MigrationResult result = storage_->migrate_user(username_, *from, *to);
+
+    if(!result.ok) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::INTERNAL_SERVER_ERROR,
+            result.error,
+            ""
+        };
+        send_res(res);
+        storage_->release_user_lock(username_);
+        return;
+    }
+
+    if(!db_->set_storage_class(username_, target)) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::INTERNAL_SERVER_ERROR,
+            "Data was moved to tier '" + target + "' but the change could not be recorded.",
+            ""
+        };
+        send_res(res);
+        storage_->release_user_lock(username_);
+        return;
+    }
+
+    // Re-point user_dir_, current_dir_ and partmeta_ at the new medium
+    if(!setup_dir()) {
+        storage_->release_user_lock(username_);
+        return; // setup_dir() already answered with the error
+    }
+
+    protocol::Response res {
+        protocol::statuses::OK,
+        protocol::codes::OK,
+        "Moved to tier '" + target + "'. " + std::to_string(result.files) + " file(s), " +
+            std::to_string(result.bytes) + " bytes.",
+        ""
+    };
+    send_res(res);
+    storage_->release_user_lock(username_);
+}
+
 bool Session::valid_file(const std::filesystem::path& partial_file, const std::array<uint8_t, crypto_generichash_BYTES>& expected) {
     std::array<uint8_t, crypto_generichash_BYTES> hash = fsutils::hash_file(partial_file);
     return hash == expected && !fsutils::is_hash_error(hash);
@@ -1528,12 +1790,12 @@ bool Session::valid_chunk(const uint32_t& index, const uint32_t& size, const std
 void Session::upload_init() {
     partmeta_->add_partial_metadata(TransferType::UPLOAD, transfer_.fmeta, transfer_.chunks, transfer_.transfer_id);
     transfer_.partial_path = partmeta_->get_partial_path(transfer_.transfer_id);
-    std::cout << transfer_.partial_path.c_str() << std::endl;
+    spdlog::debug("[{}] Upload {} -> partial file {}", username_, transfer_.transfer_id, transfer_.partial_path.string());
     if(transfer_.partial_path.empty()) {
-        std::cout << "Failed to get partial path for upload." << std::endl;
+        spdlog::error("[{}] Failed to get partial path for upload {}.", username_, transfer_.transfer_id);
         upload_abort(false, true, protocol::flags::ERROR);
         return;
-    } 
+    }
     if(!fsutils::is_file(transfer_.partial_path)) {
         fsutils::create_empty_file(transfer_.partial_path);
     }
@@ -1546,7 +1808,7 @@ void Session::uploading(const uint32_t& index, const uint32_t& size, const std::
     uint32_t offset = fsutils::CHUNK_SIZE * index;
     if(!fsutils::write_chunk(transfer_.partial_path, offset, data)) {
         flag = protocol::flags::ERROR;
-        std::cout << "Failed to write chunk to file." << std::endl;
+        spdlog::error("[{}] Failed to write chunk {} of transfer {} to file.", username_, index, transfer_.transfer_id);
         upload_abort(false, true, flag);
         return;
     }
@@ -1554,7 +1816,7 @@ void Session::uploading(const uint32_t& index, const uint32_t& size, const std::
     if(flag == protocol::flags::DONE) {
         if(!valid_file(transfer_.partial_path, transfer_.fmeta.hash)) {
             flag = protocol::flags::ERROR;
-            std::cout << "Uploaded file hash mismatch." << std::endl;
+            spdlog::error("[{}] Uploaded file hash mismatch for transfer {}.", username_, transfer_.transfer_id);
             upload_abort(false, true, flag);
             return;
         }
