@@ -694,8 +694,9 @@ void Session::exit() {
     } else if (socket_opened) {
         protocol::Response res{
             protocol::statuses::EXIT,
-
-            
+            protocol::codes::OK,
+            "Goodbye.",
+            ""
         };
         res.chunks.clear();
         json j;
