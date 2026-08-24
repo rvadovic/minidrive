@@ -66,6 +66,11 @@ public:
     virtual void cancel(std::error_code& ec) = 0;
     virtual asio::any_io_executor get_executor() = 0;
 
+    // What this connection actually negotiated, once it is established - protocol version, cipher
+    // suite and key-exchange group for TLS. Logged on both sides so the posture in effect is a
+    // matter of record rather than of configuration intent.
+    virtual std::string describe_connection() = 0;
+
 protected:
     // Writes the whole buffer. The base class guarantees it is never called again until the
     // previous handler has run, which is what makes the TLS implementations legal.
@@ -104,6 +109,7 @@ public:
     void close(std::error_code& ec) override;
     void cancel(std::error_code& ec) override;
     asio::any_io_executor get_executor() override;
+    std::string describe_connection() override;
 
 protected:
     void async_write_impl(const asio::const_buffer& buffer, WriteHandler handler) override;
@@ -113,18 +119,27 @@ private:
 };
 
 #ifdef MINIDRIVE_ENABLE_TLS
+// Per-connection client-side handshake settings. The ssl::context carries everything shared by all
+// connections (trust store, versions, groups); these are the parts that depend on *which* server is
+// being reached, so they are applied to the SSL object just before the handshake.
+struct ClientHandshakeOptions {
+    std::string sni_host;       // Server Name Indication; empty when connecting to an IP literal
+    std::string verify_host;    // DNS name checked against the certificate's SANs; empty = no check
+    std::string verify_ip;      // IP address checked against the certificate's SANs
+    std::string pin_sha256_hex; // expected SPKI pin of the leaf certificate; empty = no pinning
+    bool pin_only = false;      // trust the pin alone - the chain is deliberately not validated
+};
+
 // Rungs 2-5: the same framing through asio::ssl::stream. Encryption happens inline on the existing
 // io_context, inside the same completion handlers - no thread is added anywhere.
-//
-// NOT YET SELECTABLE. This is the stream adapter only; nothing constructs it yet because choosing
-// and configuring an ssl::context (TLS version, chain validation, pinning, the X25519MLKEM768
-// group) is step 7. It compiles and links here so step 7 is context configuration plus a --rung
-// flag, with no further call-site churn.
 class TlsStream : public IStream {
 public:
-    enum class Role { Client, Server };
-
-    TlsStream(asio::ip::tcp::socket socket, asio::ssl::context& ctx);
+    // The context is shared by every connection and held by shared_ptr rather than reference, so a
+    // stream outliving the factory that made it is impossible by construction rather than by
+    // convention. `opts` is unused for server-side connections, which authenticate no peer at rung
+    // 3.5 (client certificates are rung 4, backlog).
+    TlsStream(asio::ip::tcp::socket socket, std::shared_ptr<asio::ssl::context> ctx,
+              ClientHandshakeOptions opts = {});
 
     void async_read_exact(void* dest, std::size_t n, ReadHandler handler) override;
     void async_connect(const asio::ip::tcp::resolver::results_type& endpoints,
@@ -135,12 +150,15 @@ public:
     void close(std::error_code& ec) override;
     void cancel(std::error_code& ec) override;
     asio::any_io_executor get_executor() override;
+    std::string describe_connection() override;
 
 protected:
     void async_write_impl(const asio::const_buffer& buffer, WriteHandler handler) override;
 
 private:
+    std::shared_ptr<asio::ssl::context> ctx_; // declared first: stream_ is built from it
     asio::ssl::stream<asio::ip::tcp::socket> stream_;
+    ClientHandshakeOptions opts_;
 };
 #endif // MINIDRIVE_ENABLE_TLS
 

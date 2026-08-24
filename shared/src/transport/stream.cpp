@@ -15,6 +15,15 @@
 #endif
 
 #include "filesystem/utils.hpp"
+#include "transport/tls.hpp"
+
+#ifdef MINIDRIVE_ENABLE_TLS
+#include <openssl/objects.h>
+#include <openssl/ssl.h>
+#ifndef _WIN32
+#include <dlfcn.h> // to resolve accessors newer than the OpenSSL headers this was built against
+#endif
+#endif
 
 // The chunk bound is the protocol's own chunk size; if that ever changes, this must move with it
 // or legitimate transfers start being rejected as oversized.
@@ -22,6 +31,35 @@ static_assert(transport::MAX_CHUNK_PAYLOAD == fsutils::CHUNK_SIZE,
               "MAX_CHUNK_PAYLOAD must match fsutils::CHUNK_SIZE");
 
 namespace transport {
+
+#ifdef MINIDRIVE_ENABLE_TLS
+namespace {
+
+// Resolves the negotiated group's name through the libssl that is actually loaded, rather than the
+// one this was compiled against.
+//
+// That distinction is not academic here: libssl is linked dynamically on purpose, so a package
+// built against OpenSSL 3.0 routinely runs on a machine with 3.5 - and in exactly that case the
+// hybrid group is available and gets negotiated, because SSL_CTX_set1_groups_list resolves group
+// names at runtime too. SSL_get0_group_name only exists from OpenSSL 3.2 on, so deciding with a
+// compile-time #if would leave that deployment unable to name the group it just used, and
+// X25519MLKEM768 has no NID for the older accessor to fall back on. Verified by running
+// 3.0-built binaries against a 3.5 libssl.
+const char* negotiated_group_name(SSL* ssl) {
+#ifndef _WIN32
+    using GroupNameFn = const char* (*)(SSL*);
+    static GroupNameFn get0_group_name =
+        reinterpret_cast<GroupNameFn>(::dlsym(RTLD_DEFAULT, "SSL_get0_group_name"));
+    if(get0_group_name != nullptr) {
+        return get0_group_name(ssl);
+    }
+#endif
+    const int nid = SSL_get_negotiated_group(ssl);
+    return nid == NID_undef ? nullptr : OBJ_nid2sn(nid);
+}
+
+} // namespace
+#endif // MINIDRIVE_ENABLE_TLS
 
 void IStream::async_write_all(Payload payload, WriteHandler handler) {
     write_queue_.push_back(QueuedWrite{std::move(payload), std::move(handler)});
@@ -155,10 +193,15 @@ asio::any_io_executor PlainStream::get_executor() {
     return socket_.get_executor();
 }
 
+std::string PlainStream::describe_connection() {
+    return "plaintext TCP (rung 0)";
+}
+
 #ifdef MINIDRIVE_ENABLE_TLS
 
-TlsStream::TlsStream(asio::ip::tcp::socket socket, asio::ssl::context& ctx)
-    : stream_(std::move(socket), ctx) {}
+TlsStream::TlsStream(asio::ip::tcp::socket socket, std::shared_ptr<asio::ssl::context> ctx,
+                     ClientHandshakeOptions opts)
+    : ctx_(std::move(ctx)), stream_(std::move(socket), *ctx_), opts_(std::move(opts)) {}
 
 void TlsStream::async_read_exact(void* dest, std::size_t n, ReadHandler handler) {
     asio::async_read(stream_, asio::buffer(dest, n), std::move(handler));
@@ -177,6 +220,10 @@ void TlsStream::async_connect(const asio::ip::tcp::resolver::results_type& endpo
                 handler(ec);
                 return;
             }
+            // SNI, hostname/IP verification and pinning are per-connection, so they go on the SSL
+            // object here rather than on the shared context - and before the handshake, because
+            // that is the only point at which they can still influence it.
+            apply_client_handshake_options(stream_, opts_);
             stream_.async_handshake(asio::ssl::stream_base::client,
                 [self, handler = std::move(handler)](const std::error_code& hs_ec) {
                     handler(hs_ec);
@@ -197,8 +244,19 @@ bool TlsStream::is_open() const {
 }
 
 void TlsStream::shutdown(std::error_code& ec) {
-    // Best effort close_notify; the TCP shutdown below is what actually ends the connection.
+    // Send close_notify, but never wait for the peer's.
+    //
+    // asio's ssl::stream::shutdown() is synchronous and, left alone, calls SSL_shutdown a second
+    // time to read the peer's close_notify - blocking this thread until it arrives. An
+    // unresponsive peer would hold an io thread hostage indefinitely, and on the client there is
+    // only one io thread, so that is the whole process. Marking the peer's close_notify as already
+    // received makes the first SSL_shutdown complete the shutdown from our side: ours is written,
+    // and the call returns rather than waiting for a reply that may never come.
+    if(SSL* ssl = stream_.native_handle()) {
+        SSL_set_shutdown(ssl, SSL_RECEIVED_SHUTDOWN);
+    }
     stream_.shutdown(ec);
+
     std::error_code tcp_ec;
     stream_.lowest_layer().shutdown(asio::ip::tcp::socket::shutdown_both, tcp_ec);
     if(!ec) ec = tcp_ec;
@@ -214,6 +272,30 @@ void TlsStream::cancel(std::error_code& ec) {
 
 asio::any_io_executor TlsStream::get_executor() {
     return stream_.lowest_layer().get_executor();
+}
+
+std::string TlsStream::describe_connection() {
+    const SSL* ssl = stream_.native_handle();
+    if(!ssl) return "TLS (not established)";
+
+    std::string out = SSL_get_version(ssl);
+    if(const char* cipher = SSL_get_cipher_name(ssl)) {
+        out += ", cipher ";
+        out += cipher;
+    }
+
+    // The negotiated group is the whole point of rung 3.5's post-quantum half, so it is reported
+    // by name.
+    SSL* mutable_ssl = const_cast<SSL*>(ssl);
+    if(const char* group = negotiated_group_name(mutable_ssl)) {
+        out += ", group ";
+        out += group;
+    } else if(const int id = SSL_get_negotiated_group(mutable_ssl); id != NID_undef) {
+        // A libssl too old to name this group, but new enough to have negotiated it. Reporting the
+        // raw TLS group id beats dropping the field: it still answers "which one did I get".
+        out += ", group id " + std::to_string(id);
+    }
+    return out;
 }
 
 #endif // MINIDRIVE_ENABLE_TLS

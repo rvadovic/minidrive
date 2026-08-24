@@ -28,6 +28,7 @@ TEST_SUITES = [
     ("tiers", "Storage Tiering", "test_storage_tiers.py"),
     ("conc", "Concurrency", "test_concurrency.py"),
     ("sec", "Security", "test_security.py"),
+    ("tls", "TLS Transport (rung 3.5)", "test_tls.py"),
     ("err", "Error Handling", "test_error_handling.py"),
     ("resume", "Resume Transfers", "test_resume.py"),
     ("log", "Client Logging", "test_logging.py"),

@@ -8,23 +8,65 @@ on:
 
 jobs:
   build-and-test:
+    # Two environments, because the transport behaves differently on each and both are real
+    # deployment targets:
+    #   - Ubuntu 24.04 has OpenSSL 3.0, which cannot do ML-KEM. The tls suite must show the hybrid
+    #     group being dropped with a warning and the handshake falling back to a classical group.
+    #     This is also what the release artifacts are currently built on.
+    #   - Debian 13 has OpenSSL 3.5, so the same suite must show X25519MLKEM768 actually
+    #     negotiated. Without this leg, nothing in CI ever exercises the post-quantum path.
+    # The tls suite asserts whichever of the two applies, so one suite gates both behaviours.
+    # Debian 13 also matches the dev container, so toolchain drift shows up here rather than on
+    # someone's next container rebuild.
+    name: ${{ matrix.name }}
     runs-on: ubuntu-latest
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu-24.04 (OpenSSL 3.0, classical fallback)
+            container: ''
+          - name: debian-13 (OpenSSL 3.5, hybrid post-quantum)
+            container: 'debian:13'
     steps:
+      # The plain container image has no git, and actions/checkout silently degrades to a REST
+      # tarball download without it. Installing it first keeps both legs checking out the same way.
+      - name: Install git (container leg only)
+        if: matrix.container != ''
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+
       - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Install build dependencies
+        # The runner leg needs sudo; inside the container this already runs as root.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake python3
+          SUDO=""
+          command -v sudo >/dev/null 2>&1 && SUDO="sudo"
+          $SUDO apt-get update
+          # libssl-dev is what enables the TLS transport (rung 3.5). Without it the build still
+          # succeeds - rung 0 only - and the tls suite would have nothing to test, so it is
+          # installed rather than left to chance. The openssl CLI is used by lab/gen-certs.sh.
+          $SUDO apt-get install -y --no-install-recommends \
+            build-essential cmake python3 libssl-dev openssl ca-certificates curl
+
+      - name: Report the OpenSSL in use
+        # Recorded per leg so a change in the base image's OpenSSL - which decides whether the
+        # hybrid group is available at all - is visible in the log rather than inferred.
+        run: openssl version
 
       - name: Cache FetchContent dependencies
         uses: actions/cache@v4
         with:
           path: build/_deps
-          key: ${{ runner.os }}-deps-${{ hashFiles('cmake/Dependencies.cmake') }}
+          # Keyed per leg: the two use different compilers, so their build artifacts are not
+          # interchangeable.
+          key: deps-${{ matrix.name }}-${{ hashFiles('cmake/Dependencies.cmake') }}
           restore-keys: |
-            ${{ runner.os }}-deps-
+            deps-${{ matrix.name }}-
 
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -40,7 +82,7 @@ jobs:
         # conc/multi/resume are deliberately run separately below, non-blocking - see that
         # step for why.
         run: |
-          for suite in basic core folder auth sync batch tiers sec err log; do
+          for suite in basic core folder auth sync batch tiers sec tls err log; do
             echo "::group::suite: $suite"
             python3 tests/integration/run_all_tests.py --suite "$suite"
             echo "::endgroup::"

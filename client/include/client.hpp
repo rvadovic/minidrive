@@ -10,6 +10,7 @@
 #include "terminalRaw.hpp"
 #include "protocol/message.hpp"
 #include "transport/stream.hpp"
+#include "transport/tls.hpp"
 #include "filesystem/utils.hpp"
 #include "filesystem/partmeta.hpp"
 #include "sync_manifest.hpp"
@@ -51,7 +52,11 @@ enum class BatchMode {
 
 class Client {
 public:
-    Client(const std::string& username, asio::io_context& io_context, std::shared_ptr<asio::executor_work_guard<asio::io_context::executor_type>> guard);
+    // `streams` fixes the security posture for this client: rung 0 wraps a bare socket, rung 3.5
+    // wraps one whose async_connect also runs the TLS handshake, chain validation and pin check.
+    Client(const std::string& username, asio::io_context& io_context,
+           std::shared_ptr<asio::executor_work_guard<asio::io_context::executor_type>> guard,
+           std::shared_ptr<transport::StreamFactory> streams);
     ~Client();
 
     // Connect and start listening loop
@@ -66,6 +71,7 @@ private:
     // runs io_context.run() on exactly one thread (see main.cpp), so its handlers - including the
     // signal handler and stdin reads - are already serialized.
     std::shared_ptr<transport::IStream> stream_;
+    bool secure_; // Whether the transport is TLS, i.e. worth reporting what it negotiated
     asio::posix::stream_descriptor input_;
     std::shared_ptr<asio::executor_work_guard<asio::io_context::executor_type>> guard_;
     std::unordered_map<std::string, std::function<void(std::istringstream&)>> commands_; // Map of commands and their functions

@@ -21,7 +21,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake python3
+          sudo apt-get install -y build-essential cmake python3 libssl-dev openssl
 
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -34,7 +34,7 @@ jobs:
 
       - name: Integration test suites (gating - a broken build must not be published)
         run: |
-          for suite in basic core folder auth sync batch tiers sec err log; do
+          for suite in basic core folder auth sync batch tiers sec tls err log; do
             echo "::group::suite: $suite"
             python3 tests/integration/run_all_tests.py --suite "$suite"
             echo "::endgroup::"

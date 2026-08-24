@@ -23,8 +23,9 @@ from datetime import datetime
 from pathlib import Path
 
 
-# Configuration
-BUILD_DIR = os.path.abspath("build")
+# Configuration. MINIDRIVE_BUILD_DIR points the suites at a differently-configured build tree -
+# e.g. one linked against a newer OpenSSL - without touching the default build/.
+BUILD_DIR = os.path.abspath(os.environ.get("MINIDRIVE_BUILD_DIR", "build"))
 
 def _get_exe_path(name, subfolder):
     """Find executable, checking build/subfolder/name then build/name."""
@@ -131,9 +132,14 @@ def communicate_and_log(proc: subprocess.Popen, input_data: str, stdout_log: str
 class TestEnvironment:
     """Manages the test environment including server, logs, and cleanup."""
     
-    def __init__(self, suite_name, port):
+    def __init__(self, suite_name, port, extra_server_args=None, extra_client_args=None):
         self.suite_name = suite_name
         self.port = port
+        # Suite-wide flags appended to every server/client the suite starts. The TLS suite uses
+        # these to run the whole environment at rung 3.5; every other suite passes nothing and
+        # keeps the plaintext behaviour it has always had.
+        self.extra_server_args = list(extra_server_args or [])
+        self.extra_client_args = list(extra_client_args or [])
         self.log_dir = get_test_log_dir(suite_name)
         self.server_root = os.path.abspath(f"data/test_{suite_name}_root")
         self.server_process = None
@@ -168,7 +174,7 @@ class TestEnvironment:
                 tmp_log = tmp.name
 
             process = subprocess.Popen(
-                [CLIENT_EXE, f"127.0.0.1:{self.port}", "--log", tmp_log],
+                [CLIENT_EXE, f"127.0.0.1:{self.port}", "--log", tmp_log] + self.extra_client_args,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -207,7 +213,9 @@ class TestEnvironment:
         args = ["stdbuf", "-o0", "-e0", CLIENT_EXE, address]
         if self.supports_logging and log_file:
             args.extend(["--log", log_file])
-            
+        args.extend(self.extra_client_args)
+
+
         return subprocess.Popen(
             args,
             stdin=subprocess.PIPE,
@@ -240,7 +248,7 @@ class TestEnvironment:
         """Start the MiniDrive server."""
         self.server_log_file = open(os.path.join(self.log_dir, "server.log"), "a")
         self.server_process = subprocess.Popen(
-            [SERVER_EXE, "--port", str(self.port), "--root", self.server_root],
+            [SERVER_EXE, "--port", str(self.port), "--root", self.server_root] + self.extra_server_args,
             stdout=self.server_log_file,
             stderr=self.server_log_file,
             text=True

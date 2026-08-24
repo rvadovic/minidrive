@@ -13,8 +13,9 @@
 using asio::ip::tcp;
 
 
-Server::Server(asio::io_context& io_context, std::uint16_t port, StorageConfig config)
-    : acceptor_(io_context, tcp::endpoint(tcp::v4(), port)) {
+Server::Server(asio::io_context& io_context, std::uint16_t port, StorageConfig config,
+               std::shared_ptr<transport::StreamFactory> streams)
+    : acceptor_(io_context, tcp::endpoint(tcp::v4(), port)), streams_(std::move(streams)) {
     storage_ = std::make_shared<Storage>(std::move(config));
 }
 void Server::start(){
@@ -49,7 +50,7 @@ void Server::accept() {
             std::error_code endpoint_ec;
             auto endpoint = socket.remote_endpoint(endpoint_ec);
             spdlog::info("Accepted connection from {}", endpoint_ec ? "unknown" : endpoint.address().to_string() + ":" + std::to_string(endpoint.port()));
-            auto stream = std::make_shared<transport::PlainStream>(std::move(socket));
+            auto stream = streams_->create(std::move(socket));
             auto session = std::make_shared<Session>(std::move(stream), storage_, [this](std::shared_ptr<Session> s) {
                 remove_session(s); // Session will remove itsefl from sessions_ on exit
             });

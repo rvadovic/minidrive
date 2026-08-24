@@ -38,6 +38,13 @@ roadmap — see [docs/requirements.md](docs/requirements.md) for the full featur
   (`--tier hot=/mnt/ssd --tier archive=/mnt/hdd ...`) and place each user on one of them. Clients
   list the available media with `TIERS` and relocate their own data with `SET_TIER`, which
   copies, verifies, and only then removes the original.
+- **TLS 1.3 transport with pinning and post-quantum key exchange** — `--rung 3.5` puts the whole
+  protocol inside TLS 1.3, with certificate chain validation, hostname checking, and optional
+  public-key **pinning** (which survives a rogue or compromised CA, as chain validation alone does
+  not). Key exchange prefers the hybrid group `X25519MLKEM768` — classical X25519 combined with
+  ML-KEM-768, so a recorded session stays secret even against a future quantum attacker — falling
+  back to a classical group, with a warning, on an OpenSSL older than 3.5. Certificates come from
+  `lab/gen-certs.sh`; see [docs/tls.md](docs/tls.md).
 - **Structured logging** — both `server` and `client` can log to a rotating file via spdlog
   (`--log-file`/`--log` respectively, plus `--log-level`). The client's log is file-only by
   design; its stdout is a stable, scriptable `OK`/`ERROR` protocol (see
@@ -97,6 +104,13 @@ roadmap instead of porting the CLI (see [docs/architecture.md](docs/architecture
 
 # Client logging (file only - never mixed with the OK/ERROR stdout protocol)
 ./build/client/client alice@127.0.0.1:9000 --log client.log --log-level debug
+
+# Server and client over TLS 1.3 (rung 3.5). Generate certificates first: lab/gen-certs.sh
+./build/server/server --port 9000 --root ./data/server_root --rung 3.5 \
+  --tls-cert lab/certs/server.crt --tls-key lab/certs/server.key
+
+./build/client/client alice@localhost:9000 --rung 3.5 \
+  --ca-file lab/certs/ca.crt --pin "$(cat lab/certs/server.pin)"
 ```
 
 Once connected, type `HELP` at the `>` prompt for the full command list. See
@@ -166,7 +180,8 @@ publishes a GitHub Release with those artifacts attached.
   filesystem helpers, logging, and version reporting used by both)
 - `cmake/` – dependency fetching (`Dependencies.cmake`) and release packaging (`Packaging.cmake`)
 - `.github/workflows/` – CI and release automation
-- `docs/` – architecture, protocol, flow, and feature-specification documentation
+- `docs/` – architecture, protocol, flow, transport-security, and feature-specification documentation
+- `lab/` – certificate generation for the TLS transport (`gen-certs.sh`); `lab/certs/` is git-ignored
 - `data/` – git-ignored scratch directory for local server/client roots during development
 - `tests/` – black-box integration test suite
 

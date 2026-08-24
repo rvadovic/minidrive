@@ -24,8 +24,15 @@ set(CPACK_DEBIAN_PACKAGE_MAINTAINER "MiniDrive project")
 set(CPACK_DEBIAN_PACKAGE_SECTION "net")
 set(CPACK_DEBIAN_PACKAGE_HOMEPAGE "https://github.com/rvadovic/minidrive")
 # Statically-linked libstdc++/libgcc plus header-only dependencies (Asio, nlohmann/json, spdlog)
-# and a from-source libsodium build mean the resulting binaries carry no shared-library
-# dependency beyond glibc/libc, which every supported Debian-family release already satisfies -
-# so no explicit Depends: list is needed here.
+# and a from-source libsodium build leave glibc as the only unconditional shared dependency.
+#
+# The TLS transport (rung 3.5) adds one more: OpenSSL's libssl/libcrypto, which are linked
+# dynamically on purpose - a statically embedded TLS library would freeze this package's
+# certificate handling and CVE exposure at build time, and stop it picking up the distribution's
+# security updates. dpkg-shlibdeps works the actual dependency out from the built binaries, so the
+# generated Depends: matches whichever OpenSSL the package was built against instead of a version
+# guessed here. A build configured with -DMINIDRIVE_ENABLE_TLS=OFF simply produces no such
+# dependency, and dpkg-shlibdeps notices that too.
+set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
 
 include(CPack)

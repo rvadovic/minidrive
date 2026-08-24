@@ -1,5 +1,15 @@
 build/
+build-*/
 install/
+
+# Generated certificates and private keys (lab/gen-certs.sh). A server's private key is its
+# identity - it is generated per deployment and never committed.
+lab/certs/
+*.pem
+*.key
+*.crt
+*.pin
+*.srl
 
 # Local runtime data (sample server/client roots, test fixtures)
 data/

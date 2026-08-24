@@ -5,6 +5,7 @@ add_library(minidrive_shared STATIC
     src/filesystem/utils.cpp
     src/filesystem/partmeta.cpp
     src/transport/stream.cpp
+    src/transport/tls.cpp
 )
 
 target_include_directories(minidrive_shared
@@ -28,7 +29,10 @@ target_link_libraries(minidrive_shared
 # transport/stream.hpp guards the class declaration on it, and a mismatch between the library's
 # view of the header and an executable's would be an ODR violation, not a missing symbol.
 if(MINIDRIVE_ENABLE_TLS)
-    target_link_libraries(minidrive_shared PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+    # CMAKE_DL_LIBS: transport/stream.cpp resolves SSL_get0_group_name with dlsym, so that a binary
+    # built against an older OpenSSL can still name a group negotiated by a newer libssl at runtime
+    # (empty on platforms where dlsym lives in libc).
+    target_link_libraries(minidrive_shared PUBLIC OpenSSL::SSL OpenSSL::Crypto ${CMAKE_DL_LIBS})
     target_compile_definitions(minidrive_shared PUBLIC MINIDRIVE_ENABLE_TLS)
 endif()
 

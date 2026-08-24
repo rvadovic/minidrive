@@ -63,9 +63,14 @@ void Session::start() {
     stream_->async_server_handshake([this, self](const std::error_code& ec) {
         if(exiting_) return;
         if(ec) {
+            // At rung 3.5 this is where a client with the wrong CA, a stale pin or no TLS at all
+            // ends up. It is a per-connection failure, not a server fault, so it is logged and the
+            // session is dropped rather than escalated.
+            spdlog::warn("Handshake failed: {}", ec.message());
             handle_error(ec);
             return;
         }
+        spdlog::info("Connection established: {}", stream_->describe_connection());
         read_header_json();
     });
 }

@@ -9,6 +9,7 @@
 #include "server.hpp"
 #include "tier_config.hpp"
 #include "filesystem/utils.hpp"
+#include "transport/tls.hpp"
 #include <filesystem>
 #include <sodium.h>
 #include <sys/stat.h>
@@ -63,6 +64,10 @@ int main(int argc, char* argv[]) {
     std::string default_tier;
     std::string log_file;
     std::string log_level_str = "info";
+    // Rung 0 is the default: the whole integration suite runs on it, and turning on TLS is an
+    // explicit act with certificates behind it.
+    transport::Rung rung = transport::Rung::Plain;
+    transport::TlsServerConfig tls;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -135,6 +140,55 @@ int main(int argc, char* argv[]) {
             }
             default_tier = argv[++i];
         }
+        else if (arg == "--rung") {
+            if (i + 1 >= argc) {
+                std::cerr << "--rung requires a value (0 or 3.5)\n";
+                return 1;
+            }
+            std::string error;
+            if (!transport::parse_rung(argv[++i], rung, error)) {
+                std::cerr << error << std::endl;
+                return 1;
+            }
+        }
+        else if (arg == "--tls-cert") {
+            if (i + 1 >= argc) {
+                std::cerr << "--tls-cert requires a path to a PEM certificate chain\n";
+                return 1;
+            }
+            tls.cert_file = argv[++i];
+        }
+        else if (arg == "--tls-key") {
+            if (i + 1 >= argc) {
+                std::cerr << "--tls-key requires a path to a PEM private key\n";
+                return 1;
+            }
+            tls.key_file = argv[++i];
+        }
+        else if (arg == "--tls-min-version") {
+            if (i + 1 >= argc) {
+                std::cerr << "--tls-min-version requires a value (1.2 or 1.3)\n";
+                return 1;
+            }
+            tls.min_version = argv[++i];
+        }
+        else if (arg == "--tls-ciphers") {
+            if (i + 1 >= argc) {
+                std::cerr << "--tls-ciphers requires a cipher list\n";
+                return 1;
+            }
+            tls.ciphers = argv[++i];
+        }
+        else if (arg == "--tls-groups") {
+            if (i + 1 >= argc) {
+                std::cerr << "--tls-groups requires a group list, e.g. X25519MLKEM768:X25519\n";
+                return 1;
+            }
+            tls.groups = argv[++i];
+        }
+        else if (arg == "--tls-require-pq") {
+            tls.require_pq = true;
+        }
         else if (arg == "--log-file") {
             if (i + 1 >= argc) {
                 std::cerr << "--log-file requires a path\n";
@@ -158,7 +212,10 @@ int main(int argc, char* argv[]) {
     if (!root_provided) {
         std::cerr << "Usage: " << argv[0] << " [--port <port>] --root <root_path>"
                   << " [--tier <name>=<path>]... [--tier-desc <name>=<text>]..."
-                  << " [--default-tier <name>] [--log-file <path>] [--log-level <level>]\n";
+                  << " [--default-tier <name>] [--log-file <path>] [--log-level <level>]"
+                  << " [--rung <0|3.5>] [--tls-cert <pem>] [--tls-key <pem>]"
+                  << " [--tls-min-version <1.2|1.3>] [--tls-ciphers <list>] [--tls-groups <list>]"
+                  << " [--tls-require-pq]\n";
         return 1;
     }
 
@@ -232,8 +289,41 @@ int main(int argc, char* argv[]) {
                      tier.name == default_tier ? " (default)" : "");
     }
 
+    // The transport is built before the port is bound, so an unreadable certificate or a key that
+    // does not match it is a startup failure with a specific message, not a stream of failed
+    // handshakes after the server is nominally "up".
+    std::shared_ptr<transport::StreamFactory> streams;
+    if (rung == transport::Rung::Plain) {
+        if (!tls.cert_file.empty() || !tls.key_file.empty()) {
+            spdlog::warn("--tls-cert/--tls-key were given but --rung is 0: the connection is plaintext. "
+                         "Pass --rung 3.5 to actually use them.");
+        }
+        streams = transport::make_plain_factory();
+    } else {
+        std::string error;
+        std::vector<std::string> warnings;
+        streams = transport::make_tls_server_factory(tls, error, warnings);
+        for (const auto& warning : warnings) spdlog::warn("{}", warning);
+        if (!streams) {
+            spdlog::critical("TLS setup failed: {}", error);
+            std::cerr << "TLS setup failed: " << error << std::endl;
+            return 1;
+        }
+
+        // Printed so a client can be pinned against this exact key without anyone having to run
+        // the openssl pipeline by hand.
+        std::string pin;
+        std::string pin_error;
+        if (transport::certificate_pin(tls.cert_file, pin, pin_error)) {
+            spdlog::info("Certificate public key pin: sha256:{}", pin);
+        } else {
+            spdlog::warn("Could not compute the certificate pin: {}", pin_error);
+        }
+    }
+    spdlog::info("Transport: {}", streams->describe());
+
     asio::io_context io_context;
-    Server server(io_context, port, StorageConfig{root, tiers, default_tier});
+    Server server(io_context, port, StorageConfig{root, tiers, default_tier}, streams);
 
     asio::signal_set signals(io_context, SIGINT, SIGTERM);
     signals.async_wait([&](const std::error_code& ec, int) {

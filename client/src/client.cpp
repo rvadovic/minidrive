@@ -17,10 +17,13 @@
 using asio::ip::tcp;
 using nlohmann::json;
 
-Client::Client(const std::string& username, asio::io_context& io_context, std::shared_ptr<asio::executor_work_guard<asio::io_context::executor_type>> guard)
-    : username_(username), 
+Client::Client(const std::string& username, asio::io_context& io_context,
+               std::shared_ptr<asio::executor_work_guard<asio::io_context::executor_type>> guard,
+               std::shared_ptr<transport::StreamFactory> streams)
+    : username_(username),
       io_context_(io_context),
-      stream_(std::make_shared<transport::PlainStream>(tcp::socket(io_context))),
+      stream_(streams->create(tcp::socket(io_context))),
+      secure_(streams->is_tls()),
       input_(io_context_, ::dup(STDIN_FILENO)),
       guard_(std::move(guard)),
       commands_{
@@ -59,9 +62,25 @@ void Client::connect(const std::string& host, uint16_t port) {
     stream_->async_connect(resolver.resolve(host, std::to_string(port)),
         [this](const std::error_code& ec) {
             if(!ec) {
+                // What was actually negotiated, not what was asked for - a pin or CA mismatch
+                // never gets this far, so this line is the client's proof of posture.
+                const std::string negotiated = stream_->describe_connection();
+                spdlog::info("Connected: {}", negotiated);
+                if(secure_) {
+                    print(protocol::codes::OK, "Secure connection: " + negotiated, false);
+                }
                 handle_request(username_);
                 read_header_json();
             } else {
+                // A refused TLS handshake is a security outcome, not a network glitch: say which
+                // it was, because "certificate verify failed" and "connection refused" call for
+                // completely different fixes.
+                if(transport::is_tls_error(ec)) {
+                    std::cerr << "TLS handshake failed: " << ec.message() << std::endl;
+                    std::cerr << "The server's certificate was not accepted. Check --ca-file and "
+                                 "--pin against the server's certificate, or that the server is "
+                                 "running at the same --rung." << std::endl;
+                }
                 handle_error(ec);
                 return;
             }
