@@ -100,33 +100,39 @@ std::filesystem::path Storage::get_root() {
     return root_;
 }
 
-bool Storage::try_acquire_user_lock(const std::string& user) {
+bool Storage::try_acquire_user_lock(const std::string& user, uint64_t owner) {
+    if(owner == 0) return false; // 0 means "free" in the map, so it can never identify a holder
+
     std::lock_guard<std::mutex> lock(user_lock_guard_);
     auto it = user_lock_.find(user);
     if(it != user_lock_.end()) {
-        if(it->second) {
+        if(it->second != 0) {
             return false;
         }
-        it->second = true;
+        it->second = owner;
         return true;
     }
     if(user == "public") {
-        user_lock_.emplace("public", true);
+        user_lock_.emplace("public", owner);
         return true;
     } else {
         if(!db_->user_exists(user)) {
             return false;
         }
-        auto [inserted_it, inserted] = user_lock_.emplace(user, true);
+        user_lock_.emplace(user, owner);
         return true;
     }
 }
 
-void Storage::release_user_lock(const std::string& user) {
+void Storage::release_user_lock(const std::string& user, uint64_t owner) {
     std::lock_guard<std::mutex> lock(user_lock_guard_);
     auto it = user_lock_.find(user);
     if(it == user_lock_.end()) return;
-    it->second = false;
+    // Only the holder may release. Every session releases unconditionally on exit, so without this
+    // check a second session for the same user freed the lock of whichever session actually held it
+    // just by disconnecting - which is how concurrent uploads got past a lock that looks airtight.
+    if(it->second != owner) return;
+    it->second = 0;
 }
 
 const std::vector<StorageTier>& Storage::get_tiers() const {

@@ -47,6 +47,26 @@ if(NOT TARGET libsodium::libsodium)
     endif()
 endif()
 
+# OpenSSL - asio::ssl wraps it directly, so it is the whole crypto stack for the transport rungs
+# (TLS 1.3, chain validation, pinning, and the hybrid X25519MLKEM768 group). Deliberately NOT
+# REQUIRED: rung 0 runs on PlainStream and must keep building on a machine or CI image without
+# libssl-dev. Rung 5's hybrid post-quantum group needs OpenSSL 3.5+ (which ships ML-KEM natively -
+# no liboqs); anything older still builds and gives TLS 1.3 without that group.
+option(MINIDRIVE_ENABLE_TLS "Build the TLS transport (requires OpenSSL)" ON)
+
+if(MINIDRIVE_ENABLE_TLS)
+    find_package(OpenSSL)
+    if(NOT OpenSSL_FOUND)
+        message(STATUS "OpenSSL not found - building without the TLS transport (rung 0 only)")
+        set(MINIDRIVE_ENABLE_TLS OFF)
+    elseif(OPENSSL_VERSION VERSION_LESS 3.5.0)
+        message(STATUS "OpenSSL ${OPENSSL_VERSION} found - TLS transport enabled, but the hybrid "
+                       "post-quantum group X25519MLKEM768 needs OpenSSL 3.5+")
+    else()
+        message(STATUS "OpenSSL ${OPENSSL_VERSION} found - TLS transport enabled")
+    endif()
+endif()
+
 # Helper interface library for shared warning flags
 add_library(minidrive_warnings INTERFACE)
 if(MSVC)

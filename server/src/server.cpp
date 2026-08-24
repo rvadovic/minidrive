@@ -1,6 +1,8 @@
 #include <asio.hpp>
+#include <asio/strand.hpp>
 #include "session.hpp"
 #include "server.hpp"
+#include "transport/stream.hpp"
 #include "filesystem/utils.hpp"
 #include <vector>
 #include <mutex>
@@ -36,12 +38,19 @@ void Server::exit_all_sessions() {
 }
 
 void Server::accept() {
-    acceptor_.async_accept([this](std::error_code ec, tcp::socket socket) {
+    // One strand per connection, over the same io_context thread pool - not an extra thread. The
+    // accepted socket is created *on* the strand, so every completion handler asio runs for that
+    // socket is dispatched through it and this session's state is never touched concurrently.
+    // Required before TLS: asio::ssl::stream is not thread-safe.
+    asio::any_io_executor strand = asio::make_strand(acceptor_.get_executor());
+
+    acceptor_.async_accept(strand, [this, strand](std::error_code ec, tcp::socket socket) {
         if (!ec) {
             std::error_code endpoint_ec;
             auto endpoint = socket.remote_endpoint(endpoint_ec);
             spdlog::info("Accepted connection from {}", endpoint_ec ? "unknown" : endpoint.address().to_string() + ":" + std::to_string(endpoint.port()));
-            auto session = std::make_shared<Session>(std::move(socket), storage_, [this](std::shared_ptr<Session> s) {
+            auto stream = std::make_shared<transport::PlainStream>(std::move(socket));
+            auto session = std::make_shared<Session>(std::move(stream), storage_, [this](std::shared_ptr<Session> s) {
                 remove_session(s); // Session will remove itsefl from sessions_ on exit
             });
             add_session(session);

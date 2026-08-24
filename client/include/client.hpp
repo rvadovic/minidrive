@@ -9,6 +9,7 @@
 #include "terminalNoEcho.hpp"
 #include "terminalRaw.hpp"
 #include "protocol/message.hpp"
+#include "transport/stream.hpp"
 #include "filesystem/utils.hpp"
 #include "filesystem/partmeta.hpp"
 #include "sync_manifest.hpp"
@@ -61,7 +62,10 @@ public:
 private:
     std::string username_;
     asio::io_context& io_context_;
-    asio::ip::tcp::socket socket_;
+    // The transport, rung 0 (PlainStream) unless configured otherwise. No strand here: the client
+    // runs io_context.run() on exactly one thread (see main.cpp), so its handlers - including the
+    // signal handler and stdin reads - are already serialized.
+    std::shared_ptr<transport::IStream> stream_;
     asio::posix::stream_descriptor input_;
     std::shared_ptr<asio::executor_work_guard<asio::io_context::executor_type>> guard_;
     std::unordered_map<std::string, std::function<void(std::istringstream&)>> commands_; // Map of commands and their functions
@@ -214,7 +218,7 @@ private:
     bool scan_local_tree(const std::filesystem::path& dir, std::map<std::string, SyncEntry>& out); // Recursive local scan, relative-path keyed
 
     // Upload
-    void upload_init(); // Create partial metadata  entry in partmeta_, call uploading()
+    void upload_init(const std::string& transfer_id); // Create partial metadata entry under the server assigned id, call uploading()
     void uploading(); // Pick chunk to send, read chunk of file and send it, call send_chunk()
     void upload_done(); // Delete partial file metadata, nullify transfer_, state_ = READY
     void upload_abort(bool save, bool notify, uint8_t flag); // Delete or save partial file metadta, notify server with protocol::flag

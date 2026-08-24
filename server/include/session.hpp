@@ -1,9 +1,11 @@
 #pragma once
 
+#include <asio/any_io_executor.hpp>
 #include <asio/ip/tcp.hpp>
 #include <atomic>
 #include <nlohmann/json.hpp>
 #include "protocol/message.hpp"
+#include "transport/stream.hpp"
 #include "filesystem/partmeta.hpp"
 #include "storage.hpp"
 #include "database.hpp"
@@ -29,11 +31,15 @@ enum class SessionState {
 
 class Session : public std::enable_shared_from_this<Session> {
 public:
-    Session(asio::ip::tcp::socket socket, std::shared_ptr<Storage> storage, std::function<void(std::shared_ptr<Session>)> on_exit);
-    void start(); // Start listening loop
-    void exit(); // Triggered by signals, server, client, sends notification to client or calls finish_exit()
+    Session(std::shared_ptr<transport::IStream> stream, std::shared_ptr<Storage> storage, std::function<void(std::shared_ptr<Session>)> on_exit);
+    void start(); // Complete the transport handshake, then start the listening loop
+    void exit(); // Triggered by signals, server, client; posts do_exit() onto this session's strand
 private:
-    asio::ip::tcp::socket socket_;
+    std::shared_ptr<transport::IStream> stream_; // The transport, rung 0 (PlainStream) unless configured otherwise
+    // Every completion handler for this session runs on this strand, so session state is never
+    // touched by two of the io_context's hardware_concurrency() threads at once. It is not a
+    // thread: it serializes work over the existing pool.
+    asio::any_io_executor strand_;
     std::filesystem::path root_; // Root of filesystem
     std::shared_ptr<Storage> storage_; // Handles operations on filesystem using one mutex per user
     std::function<void(std::shared_ptr<Session>)> on_exit_; // Removes this session from server list of sessions on exit
@@ -52,6 +58,11 @@ private:
     std::queue<PartialMetadataEntry> files_to_be_resumed; // Files to be resumed
     bool resuming_ = false; // True while working through files_to_be_resumed (gates handle_resumes() re-population)
     std::string pending_tier_; // Tier the user asked to move to, held while waiting for their (Y/n)
+    uint64_t session_id_; // Unique among live sessions, identifies this session as the holder of the per-user lock
+
+    // Per user lock, taken and released on behalf of this session only
+    bool acquire_lock();
+    void release_lock();
 
     // Read loop and write using json protocol for communication
     void read_header_json(); // read header of json message using async_read, call read_body_json()
@@ -75,7 +86,10 @@ private:
     // Protocol switch between binary data and json message based on state_
     void read_next();
 
-    // Closes socket and on exit removes itself from sessions_ list in server
+    // Body of exit(), always run on strand_
+    void do_exit();
+
+    // Closes the transport and on exit removes itself from sessions_ list in server
     void finish_exit();
 
     // Handlers
@@ -107,7 +121,7 @@ private:
     // Upload - simular to clients download
     bool valid_file(const std::filesystem::path& partial_file, const std::array<uint8_t, crypto_generichash_BYTES>& expected);
     bool valid_chunk(const uint32_t& index, const uint32_t& size, const std::vector<uint8_t>& data);
-    void upload_init();
+    bool upload_init(); // Allocates the transfer id and the .part file, false means it could not be prepared
     void uploading(const uint32_t& index, const uint32_t& size, const std::vector<uint8_t>& data, uint8_t flag);
     void upload_done(); // release per user lock
     void upload_abort(bool save, bool notify, uint8_t flag); // release per user lock

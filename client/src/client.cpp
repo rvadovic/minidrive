@@ -20,7 +20,7 @@ using nlohmann::json;
 Client::Client(const std::string& username, asio::io_context& io_context, std::shared_ptr<asio::executor_work_guard<asio::io_context::executor_type>> guard)
     : username_(username), 
       io_context_(io_context),
-      socket_(io_context_),
+      stream_(std::make_shared<transport::PlainStream>(tcp::socket(io_context))),
       input_(io_context_, ::dup(STDIN_FILENO)),
       guard_(std::move(guard)),
       commands_{
@@ -53,9 +53,11 @@ Client::~Client() {
 }
 
 void Client::connect(const std::string& host, uint16_t port) {
-    tcp::resolver resolver(socket_.get_executor());
-    asio::async_connect(socket_, resolver.resolve(host, std::to_string(port)),
-        [this](std::error_code ec, tcp::endpoint endpoint) {
+    tcp::resolver resolver(io_context_);
+    // For TLS this also completes the client handshake (and, from rung 3.5 on, chain validation
+    // and pinning) before the first byte of protocol is written.
+    stream_->async_connect(resolver.resolve(host, std::to_string(port)),
+        [this](const std::error_code& ec) {
             if(!ec) {
                 handle_request(username_);
                 read_header_json();
@@ -298,20 +300,14 @@ json redact_for_log(const json& request_json) {
 void Client::send_json(const json& j) {
     spdlog::info("-> {}", redact_for_log(j).dump());
 
-    auto write_buffer = std::make_shared<std::string>(j.dump());
+    const std::string body = j.dump();
 
-    if(write_buffer->size() > std::numeric_limits<uint32_t>::max()) {
+    if(body.size() > std::numeric_limits<uint32_t>::max()) {
         print(protocol::codes::INTERNAL_SERVER_ERROR, "File data was too large.");
         return;
     }
 
-    auto len = std::make_shared<uint32_t>(htonl(write_buffer->size())); // Host to network layer
-
-    std::vector<asio::const_buffer> buffers;
-    buffers.push_back(asio::buffer(len.get(), sizeof(uint32_t)));
-    buffers.push_back(asio::buffer(*write_buffer));
-
-    asio::async_write(socket_, buffers, [this, len, write_buffer](std::error_code ec, std::size_t) {
+    stream_->async_write_all(transport::frame_json(body), [this](const std::error_code& ec, std::size_t) {
         if(exiting_ || ec) {
             if(ec && ec != asio::error::operation_aborted) {
                 handle_error(ec);
@@ -324,28 +320,23 @@ void Client::send_json(const json& j) {
 void Client::send_json_exit(const json& j) {
     spdlog::info("-> {} (exit)", redact_for_log(j).dump());
 
-    auto write_buffer = std::make_shared<std::string>(j.dump());
+    const std::string body = j.dump();
 
-    if(write_buffer->size() > std::numeric_limits<uint32_t>::max()) {
+    if(body.size() > std::numeric_limits<uint32_t>::max()) {
         print(protocol::codes::INTERNAL_SERVER_ERROR, "File data was too large.");
+        finish_exit();
         return;
     }
 
-    auto len = std::make_shared<uint32_t>(htonl(write_buffer->size())); // Host to network layer
-
-    std::vector<asio::const_buffer> buffers;
-    buffers.push_back(asio::buffer(len.get(), sizeof(uint32_t)));
-    buffers.push_back(asio::buffer(*write_buffer));
-
-    asio::async_write(socket_, buffers, [this, len, write_buffer](std::error_code ec, std::size_t) {
+    stream_->async_write_all(transport::frame_json(body), [this](const std::error_code&, std::size_t) {
         finish_exit();
     });
 }
 
 void Client::read_header_json() {
     auto msg_len_local = std::make_shared<uint32_t>();
-    
-    asio::async_read(socket_, asio::buffer(msg_len_local.get(), sizeof(uint32_t)),[this, msg_len_local](std::error_code ec, std::size_t) {
+
+    stream_->async_read_exact(msg_len_local.get(), sizeof(uint32_t), [this, msg_len_local](const std::error_code& ec, std::size_t) {
         if(exiting_ || ec) {
             if(ec && ec != asio::error::operation_aborted) {
                 handle_error(ec);
@@ -353,13 +344,19 @@ void Client::read_header_json() {
             return;
         }
         msg_len_ = ntohl(*msg_len_local); // Network to host layer
+        // Bound what a peer's length field can make us allocate (see transport/stream.hpp).
+        if(msg_len_ == 0 || msg_len_ > transport::MAX_MESSAGE_SIZE) {
+            spdlog::warn("Rejected control message of {} bytes (limit {})", msg_len_, transport::MAX_MESSAGE_SIZE);
+            handle_error(asio::error::message_size);
+            return;
+        }
         buffer_.resize(msg_len_);
         read_body_json(); // Read body right after header
     });
 }
 
 void Client::read_body_json() {
-    asio::async_read(socket_, asio::buffer(buffer_),[this](std::error_code ec, std::size_t) {
+    stream_->async_read_exact(buffer_.data(), buffer_.size(), [this](const std::error_code& ec, std::size_t) {
         if(exiting_ || ec) {
             if(ec && ec != asio::error::operation_aborted) {
                 handle_error(ec);
@@ -383,7 +380,7 @@ void Client::read_body_json() {
 void Client::read_header_chunk() {
     auto header = std::make_shared<protocol::ChunkHeader>();
 
-    asio::async_read(socket_, asio::buffer(header.get(), sizeof(protocol::ChunkHeader)), [this, header](std::error_code ec, std::size_t) {
+    stream_->async_read_exact(header.get(), sizeof(protocol::ChunkHeader), [this, header](const std::error_code& ec, std::size_t) {
         if(exiting_ || ec) {
             if(ec && ec != asio::error::operation_aborted) {
                 handle_error(ec);
@@ -394,6 +391,11 @@ void Client::read_header_chunk() {
         ch_.index = ntohl(header->index);
         ch_.size = ntohl(header->size);
         ch_.flags = header->flags;
+        if(ch_.size > transport::MAX_CHUNK_PAYLOAD) {
+            spdlog::warn("Rejected chunk of {} bytes (limit {})", ch_.size, transport::MAX_CHUNK_PAYLOAD);
+            handle_error(asio::error::message_size);
+            return;
+        }
         read_body_chunk();
     });
 }
@@ -401,7 +403,7 @@ void Client::read_header_chunk() {
 void Client::read_body_chunk() {
     auto data = std::make_shared<std::vector<uint8_t>>(ch_.size);
 
-    asio::async_read(socket_, asio::buffer(*data), [this, data](std::error_code ec, std::size_t) {
+    stream_->async_read_exact(data->data(), data->size(), [this, data](const std::error_code& ec, std::size_t) {
         if(exiting_ || ec) {
             if(ec && ec != asio::error::operation_aborted) {
                 handle_error(ec);
@@ -414,19 +416,7 @@ void Client::read_body_chunk() {
 }
 
 void Client::send_chunk(const protocol::ChunkHeader& ch, const std::vector<uint8_t>& data) {
-    auto header = std::make_shared<protocol::ChunkHeader>();
-    header->transfer_id = htonl(ch.transfer_id); // Host to network layer
-    header->index = htonl(ch.index);
-    header->size = htonl(ch.size);
-    header->flags = ch.flags;
-
-    auto data_to_write = std::make_shared<std::vector<uint8_t>>(data);
-
-    std::vector<asio::const_buffer> buffers;
-    buffers.push_back(asio::buffer(header.get(), sizeof(protocol::ChunkHeader)));
-    buffers.push_back(asio::buffer(*data_to_write));
-
-    asio::async_write(socket_, buffers, [this, header, data_to_write](std::error_code ec, std::size_t) {
+    stream_->async_write_all(transport::frame_chunk(ch, data), [this](const std::error_code& ec, std::size_t) {
         if(exiting_ || ec) {
             if(ec && ec != asio::error::operation_aborted) {
                 handle_error(ec);
@@ -437,19 +427,7 @@ void Client::send_chunk(const protocol::ChunkHeader& ch, const std::vector<uint8
 }
 
 void Client::send_chunk_exit(const protocol::ChunkHeader& ch, const std::vector<uint8_t>& data) {
-     auto header = std::make_shared<protocol::ChunkHeader>();
-    header->transfer_id = htonl(ch.transfer_id); // Host to network layer
-    header->index = htonl(ch.index);
-    header->size = htonl(ch.size);
-    header->flags = ch.flags;
-
-    auto data_to_write = std::make_shared<std::vector<uint8_t>>(data);
-
-    std::vector<asio::const_buffer> buffers;
-    buffers.push_back(asio::buffer(header.get(), sizeof(protocol::ChunkHeader)));
-    buffers.push_back(asio::buffer(*data_to_write));
-
-    asio::async_write(socket_, buffers, [this, header, data_to_write](std::error_code ec, std::size_t) {
+    stream_->async_write_all(transport::frame_chunk(ch, data), [this](const std::error_code&, std::size_t) {
         finish_exit();
     });
 }
@@ -482,7 +460,8 @@ void Client::handle_error(const std::error_code& ec) {
         std::cerr << "Network error: " << ec.message() << " (" << ec.value() << ")" << std::endl;
     }
     print(protocol::codes::INTERNAL_SERVER_ERROR, ec.message());
-    socket_.close();
+    std::error_code close_ec;
+    stream_->close(close_ec);
     exit();
 }
 
@@ -532,7 +511,7 @@ void Client::handle_response(const json& j) {
             return;
         } else if(state_ == ClientState::UPLOAD_INIT) {
             state_ = ClientState::UPLOADING;
-            upload_init();
+            upload_init(res.file_hash); // the accepting response carries the server assigned transfer id
             return;
         } else if(state_ == ClientState::DOWNLOAD_INIT) {
             download_init(res.chunks, res.file_hash);
@@ -750,8 +729,8 @@ void Client::exit() {
     if(!exiting_.compare_exchange_strong(expected, true)) return; // Prevent multiple running exit() 
 
     input_.cancel();
-    
-    bool socket_opened = socket_.is_open();
+
+    bool socket_opened = stream_->is_open();
 
     if(state_ == ClientState::UPLOADING ) {                         // Notify server
         upload_abort_exit(true, socket_opened, protocol::flags::EXIT);
@@ -776,11 +755,11 @@ void Client::exit() {
 void Client::finish_exit() {
     state_ = ClientState::EXIT;
     std::error_code ec;
-    socket_.cancel(ec);
+    stream_->cancel(ec);
 
-    if(socket_.is_open()) {
-        socket_.shutdown(tcp::socket::shutdown_both, ec);
-        socket_.close(ec);
+    if(stream_->is_open()) {
+        stream_->shutdown(ec);
+        stream_->close(ec);
     }
     guard_->reset();
     io_context_.stop();
@@ -1464,8 +1443,20 @@ void Client::finish_batch() {
     read_line();
 }
 
-void Client::upload_init() {
-    transfer_.transfer_id = partmeta_->add_partial_metadata(TransferType::UPLOAD, transfer_.fmeta, transfer_.chunks, UINT32_MAX);
+void Client::upload_init(const std::string& transfer_id) {
+    // The server allocates the id and returns it here, so both sides key this transfer the same way
+    // and resume can look the entry up on either. An empty or unparseable field means the server did
+    // not assign one, in which case fall back to a local id (which is what this always used to do).
+    uint32_t id = UINT32_MAX;
+    if(!transfer_id.empty()) {
+        try {
+            id = static_cast<uint32_t>(std::stoul(transfer_id));
+        } catch(const std::exception&) {
+            spdlog::warn("Server sent an unusable transfer id ('{}'); allocating one locally.", transfer_id);
+            id = UINT32_MAX;
+        }
+    }
+    transfer_.transfer_id = partmeta_->add_partial_metadata(TransferType::UPLOAD, transfer_.fmeta, transfer_.chunks, id);
     //read_line();
     uploading();
 }

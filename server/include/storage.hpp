@@ -32,8 +32,11 @@ public:
     std::shared_ptr<Database> get_database(); // Gets database of user data
     std::shared_ptr<PartialMetadata> get_partmeta(const std::string& user); // Gets database of partial file metadata for user, lazy initialization
     std::filesystem::path get_root(); // Gets server control root (users.json, public/)
-    bool try_acquire_user_lock(const std::string& user); // Returns if user can use lock, lazy initialization
-    void release_user_lock(const std::string& user); // Set the value of user lock"
+    // The lock is per user but a user can have several live sessions, so it records which session
+    // holds it. owner is any non-zero id unique among live sessions; releasing with a different one
+    // is ignored, otherwise a second session frees a transfer it knows nothing about.
+    bool try_acquire_user_lock(const std::string& user, uint64_t owner); // Returns if user can use lock, lazy initialization
+    void release_user_lock(const std::string& user, uint64_t owner); // Releases only if owner currently holds it
 
     // Storage tiering
     const std::vector<StorageTier>& get_tiers() const; // All media configured with --tier
@@ -51,6 +54,6 @@ private:
     std::mutex user_partmeta_guard_; // Mutex for user_partmeta_ map
     std::mutex user_lock_guard_; // Mutex for user_transfer_map
     std::unordered_map<std::string, std::shared_ptr<PartialMetadata>> user_partmeta_; // Map of users and their partial file metadata database
-    std::unordered_map<std::string, bool> user_lock_; // Map of users and their operation lock value
+    std::unordered_map<std::string, uint64_t> user_lock_; // Map of users and the session id holding their lock, 0 when free
     std::shared_ptr<Database> db_; // Database of user data
 };

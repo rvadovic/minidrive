@@ -53,7 +53,10 @@ uint32_t PartialMetadata::add_partial_metadata(TransferType type, fsutils::FileM
         std::chrono::system_clock::now()
     };
 
-    entries_.emplace(id, std::move(entry));
+    // insert_or_assign, not emplace: with an explicit id that is already present emplace keeps the
+    // old entry and reports nothing, so the caller would run its new transfer against another
+    // transfer's chunk list and offsets. A generated id is never already present.
+    entries_.insert_or_assign(id, std::move(entry));
     return id;
 }
 

@@ -14,11 +14,19 @@
 using asio::ip::tcp;
 using nlohmann::json;
 
-Session::Session(tcp::socket socket, std::shared_ptr<Storage> storage, std::function<void(std::shared_ptr<Session>)> on_exit) 
-    : socket_(std::move(socket)),
+namespace {
+// Identifies a session to Storage's per-user lock. Starts at 1 because 0 marks the lock as free.
+std::atomic<uint64_t> next_session_id{1};
+} // namespace
+
+Session::Session(std::shared_ptr<transport::IStream> stream, std::shared_ptr<Storage> storage, std::function<void(std::shared_ptr<Session>)> on_exit)
+    // Order matches the declaration order in session.hpp; members are initialized in that order
+    // regardless, and listing them out of order only produced a -Wreorder warning.
+    : stream_(std::move(stream)),
+      strand_(stream_->get_executor()),
+      root_(storage->get_root()),
       storage_(storage),
       on_exit_(on_exit),
-      root_(storage->get_root()),
       db_(storage_->get_database()),
       requests_{
           {protocol::commands::LIST,     [this](auto& req){ list(req); }},
@@ -36,19 +44,37 @@ Session::Session(tcp::socket socket, std::shared_ptr<Storage> storage, std::func
           {protocol::commands::LOGIN,     [this](auto& req){ login(req); }},
           {protocol::commands::NEED_INPUT, [this](auto& req){ need_input(req); }},
           {protocol::commands::AUTH, [this](auto& req){ auth(req); }}
-      } {
+      },
+      session_id_(next_session_id.fetch_add(1)) {
         transfer_.transfer_id = UINT32_MAX;
 }
 
+bool Session::acquire_lock() {
+    return storage_->try_acquire_user_lock(username_, session_id_);
+}
+
+void Session::release_lock() {
+    storage_->release_user_lock(username_, session_id_);
+}
+
 void Session::start() {
-    read_header_json();
+    auto self = shared_from_this();
+    // Plain TCP reports success immediately; TLS completes its handshake here before any framing.
+    stream_->async_server_handshake([this, self](const std::error_code& ec) {
+        if(exiting_) return;
+        if(ec) {
+            handle_error(ec);
+            return;
+        }
+        read_header_json();
+    });
 }
 
 void Session::read_header_json() {
     auto self = shared_from_this();
     auto msg_len_local = std::make_shared<uint32_t>();
 
-    asio::async_read(socket_, asio::buffer(msg_len_local.get(), sizeof(uint32_t)),[this, self, msg_len_local](std::error_code ec, std::size_t) {
+    stream_->async_read_exact(msg_len_local.get(), sizeof(uint32_t), [this, self, msg_len_local](const std::error_code& ec, std::size_t) {
         if(exiting_ || ec) {
             if(ec && ec != asio::error::operation_aborted) {
                 handle_error(ec);
@@ -56,9 +82,16 @@ void Session::read_header_json() {
             return;
         }
         msg_len_ = ntohl(*msg_len_local);
+        // The length is peer-controlled: without this bound, four bytes buy a 4 GiB allocation
+        // before a single byte of body has been read or authenticated.
+        if(msg_len_ == 0 || msg_len_ > transport::MAX_MESSAGE_SIZE) {
+            spdlog::warn("[{}] Rejected control message of {} bytes (limit {})", username_, msg_len_, transport::MAX_MESSAGE_SIZE);
+            handle_error(asio::error::message_size);
+            return;
+        }
         buffer_.resize(msg_len_);
         read_body_json();
-        
+
     });
 }
 
@@ -68,7 +101,7 @@ void Session::read_body_json() {
         handle_error(asio::error::invalid_argument);
         return;
     }
-    asio::async_read(socket_, asio::buffer(buffer_),[this, self](std::error_code ec, std::size_t) {
+    stream_->async_read_exact(buffer_.data(), buffer_.size(), [this, self](const std::error_code& ec, std::size_t) {
         if(exiting_ || ec) {
             if(ec && ec != asio::error::operation_aborted) {
                 handle_error(ec);
@@ -91,20 +124,14 @@ void Session::read_body_json() {
 void Session::write_response_json(const json& j) {
     auto self = shared_from_this();
 
-    auto write_buffer = std::make_shared<std::string>(j.dump());
+    const std::string body = j.dump();
 
-    if(write_buffer->size() > std::numeric_limits<uint32_t>::max()) {
-        spdlog::error("[{}] Response body too large to send ({} bytes)", username_, write_buffer->size());
+    if(body.size() > std::numeric_limits<uint32_t>::max()) {
+        spdlog::error("[{}] Response body too large to send ({} bytes)", username_, body.size());
         return;
     }
 
-    auto response_len = std::make_shared<uint32_t>(htonl(write_buffer->size()));
-
-    std::vector<asio::const_buffer> buffers;
-    buffers.push_back(asio::buffer(response_len.get(), sizeof(uint32_t)));
-    buffers.push_back(asio::buffer(*write_buffer));
-
-    asio::async_write(socket_, buffers, [this, self, write_buffer, response_len](std::error_code ec, std::size_t) {
+    stream_->async_write_all(transport::frame_json(body), [this, self](const std::error_code& ec, std::size_t) {
         if(ec) {
             handle_error(ec);
             return;
@@ -115,20 +142,15 @@ void Session::write_response_json(const json& j) {
 void Session::write_response_json_exit(const json& j) {
     auto self = shared_from_this();
 
-    auto write_buffer = std::make_shared<std::string>(j.dump());
+    const std::string body = j.dump();
 
-    if(write_buffer->size() > std::numeric_limits<uint32_t>::max()) {
-        spdlog::error("[{}] Response body too large to send ({} bytes)", username_, write_buffer->size());
+    if(body.size() > std::numeric_limits<uint32_t>::max()) {
+        spdlog::error("[{}] Response body too large to send ({} bytes)", username_, body.size());
+        finish_exit();
         return;
     }
 
-    auto response_len = std::make_shared<uint32_t>(htonl(write_buffer->size()));
-
-    std::vector<asio::const_buffer> buffers;
-    buffers.push_back(asio::buffer(response_len.get(), sizeof(uint32_t)));
-    buffers.push_back(asio::buffer(*write_buffer));
-    
-    asio::async_write(socket_, buffers, [this, self, write_buffer, response_len](std::error_code ec, std::size_t) {
+    stream_->async_write_all(transport::frame_json(body), [this, self](const std::error_code&, std::size_t) {
         finish_exit();
     });
 }
@@ -138,7 +160,7 @@ void Session::read_header_chunk() {
 
     auto header = std::make_shared<protocol::ChunkHeader>();
 
-    asio::async_read(socket_, asio::buffer(header.get(), sizeof(protocol::ChunkHeader)), [this, self, header](std::error_code ec, std::size_t) {
+    stream_->async_read_exact(header.get(), sizeof(protocol::ChunkHeader), [this, self, header](const std::error_code& ec, std::size_t) {
         if(exiting_ || ec) {
             if(ec && ec != asio::error::operation_aborted) {
                 handle_error(ec);
@@ -149,6 +171,13 @@ void Session::read_header_chunk() {
         ch_.index = ntohl(header->index);
         ch_.size = ntohl(header->size);
         ch_.flags = header->flags;
+        // Same peer-controlled-length problem as the JSON header above, and the protocol never
+        // produces a chunk larger than one CHUNK_SIZE.
+        if(ch_.size > transport::MAX_CHUNK_PAYLOAD) {
+            spdlog::warn("[{}] Rejected chunk of {} bytes (limit {})", username_, ch_.size, transport::MAX_CHUNK_PAYLOAD);
+            handle_error(asio::error::message_size);
+            return;
+        }
         read_body_chunk();
     });
 }
@@ -158,7 +187,7 @@ void Session::read_body_chunk() {
 
     auto data = std::make_shared<std::vector<uint8_t>>(ch_.size);
 
-    asio::async_read(socket_, asio::buffer(*data), [this, self, data](std::error_code ec, std::size_t) {
+    stream_->async_read_exact(data->data(), data->size(), [this, self, data](const std::error_code& ec, std::size_t) {
         if(exiting_ || ec) {
             if(ec && ec != asio::error::operation_aborted) {
                 handle_error(ec);
@@ -173,19 +202,7 @@ void Session::read_body_chunk() {
 void Session::send_chunk(const protocol::ChunkHeader& ch, const std::vector<uint8_t>& data) {
     auto self = shared_from_this();
 
-    auto header = std::make_shared<protocol::ChunkHeader>();
-    header->transfer_id = htonl(ch.transfer_id);
-    header->index = htonl(ch.index);
-    header->size = htonl(ch.size);
-    header->flags = ch.flags;
-
-    auto data_to_write = std::make_shared<std::vector<uint8_t>>(data);
-
-    std::vector<asio::const_buffer> buffers;
-    buffers.push_back(asio::buffer(header.get(), sizeof(protocol::ChunkHeader)));
-    buffers.push_back(asio::buffer(*data_to_write));
-
-    asio::async_write(socket_, buffers, [this, self, header, data_to_write](std::error_code ec, std::size_t) {
+    stream_->async_write_all(transport::frame_chunk(ch, data), [this, self](const std::error_code& ec, std::size_t) {
         if(ec) {
             handle_error(ec);
             return;
@@ -196,19 +213,7 @@ void Session::send_chunk(const protocol::ChunkHeader& ch, const std::vector<uint
 void Session::send_chunk_exit(const protocol::ChunkHeader& ch, const std::vector<uint8_t>& data) {
     auto self = shared_from_this();
 
-    auto header = std::make_shared<protocol::ChunkHeader>();
-    header->transfer_id = htonl(ch.transfer_id);
-    header->index = htonl(ch.index);
-    header->size = htonl(ch.size);
-    header->flags = ch.flags;
-
-    auto data_to_write = std::make_shared<std::vector<uint8_t>>(data);
-
-    std::vector<asio::const_buffer> buffers;
-    buffers.push_back(asio::buffer(header.get(), sizeof(protocol::ChunkHeader)));
-    buffers.push_back(asio::buffer(*data_to_write));
-
-    asio::async_write(socket_, buffers, [this, self, header, data_to_write](std::error_code ec, std::size_t) {
+    stream_->async_write_all(transport::frame_chunk(ch, data), [this, self](const std::error_code&, std::size_t) {
         finish_exit();
     });
 }
@@ -259,12 +264,19 @@ void Session::handle_request(const json& j) {
 
 void Session::handle_chunk(const protocol::ChunkHeader& ch, const std::vector<uint8_t>& data) {
     if(state_ == SessionState::UPLOADING) {
+        // The id belongs to the server (allocated in upload(), or carried by the resume kickoff).
+        // It used to be adopted from this header, and since every fresh client numbers its transfers
+        // from 1, two clients uploading as the same user both claimed id 1 and wrote into the same
+        // <user>/.partial/1.part. Data-carrying chunks for another id are not part of this transfer.
+        // Abort headers are exempt: the client clears its own id before sending them.
+        if((ch.flags == protocol::flags::SEND || ch.flags == protocol::flags::LAST)
+           && ch.transfer_id != transfer_.transfer_id) {
+            spdlog::warn("[{}] Chunk for transfer {} received during transfer {}.", username_, ch.transfer_id, transfer_.transfer_id);
+            upload_abort(false, true, protocol::flags::CHUNK_MISMATCH);
+            return;
+        }
         if(ch.flags == protocol::flags::SEND) {
             if(valid_chunk(ch.index, ch.size, data)) {
-                if(transfer_.transfer_id == UINT32_MAX) { // transfer_id not initilized -> upload not initialized
-                    transfer_.transfer_id = ch.transfer_id;
-                    upload_init();
-                }
                 uploading(ch.index, ch.size, data, protocol::flags::OK);
                 return;
             }
@@ -272,10 +284,6 @@ void Session::handle_chunk(const protocol::ChunkHeader& ch, const std::vector<ui
             upload_abort(false, true, protocol::flags::CHUNK_MISMATCH);
             return;
         } else if(ch.flags == protocol::flags::LAST) {
-            if(transfer_.transfer_id == UINT32_MAX) { // transfer_id not initilized -> upload not initialized
-                transfer_.transfer_id = ch.transfer_id;
-                upload_init();
-            }
             if(valid_chunk(ch.index, ch.size, data)) {
                 uploading(ch.index, ch.size, data, protocol::flags::DONE);
                 return;
@@ -587,7 +595,7 @@ void Session::need_input(protocol::Request& req) {
                 PartialMetadataEntry entry = files_to_be_resumed.front();
                 files_to_be_resumed.pop();
 
-                if(!storage_->try_acquire_user_lock(username_)) {
+                if(!acquire_lock()) {
                     protocol::Response res {
                         protocol::statuses::ERROR,
                         protocol::codes::SERVICE_UNAVAILABLE,
@@ -616,7 +624,7 @@ void Session::need_input(protocol::Request& req) {
                 send_res(res);
 
                 if(entry.type == TransferType::UPLOAD) {
-                    state_ = SessionState::UPLOADING; // client drives sending; handle_chunk() already skips upload_init() since transfer_id != UINT32_MAX
+                    state_ = SessionState::UPLOADING; // client drives sending; transfer_ is seeded from the entry above, so no upload_init() is needed
                 } else {
                     state_ = SessionState::DOWNLOADING;
                     downloading(); // server drives sending, resumes at first chunk_state==false
@@ -646,7 +654,7 @@ void Session::need_input(protocol::Request& req) {
             } else if(req.first_argument == "n") {
                 pending_tier_.clear();
                 state_ = SessionState::READY;
-                storage_->release_user_lock(username_);
+                release_lock();
                 protocol::Response res {
                     protocol::statuses::OK,
                     protocol::codes::OK,
@@ -683,7 +691,17 @@ void Session::exit() {
     bool expected = false;
     if(!exiting_.compare_exchange_strong(expected, true)) return;
 
-    bool socket_opened = socket_.is_open();
+    // exit() is also called from Server::exit_all_sessions() on the signal-handling thread, which
+    // until now touched state_/transfer_/the socket while this session's own handlers could be
+    // running on another pool thread. Hop onto the strand so the teardown is serialized with
+    // everything else this session does. exiting_ is set above, synchronously, so in-flight
+    // handlers still bail out immediately rather than waiting for this post to run.
+    auto self = shared_from_this();
+    asio::post(strand_, [this, self] { do_exit(); });
+}
+
+void Session::do_exit() {
+    bool socket_opened = stream_->is_open();
 
     if(state_ == SessionState::UPLOADING ) {
         upload_abort_exit(true, socket_opened, protocol::flags::EXIT);
@@ -710,11 +728,11 @@ void Session::exit() {
 void Session::finish_exit() {
     auto self = shared_from_this();
 
-    storage_->release_user_lock(username_);
+    release_lock();
 
     std::error_code ec;
-    socket_.shutdown(tcp::socket::shutdown_both, ec);
-    socket_.close(ec);
+    stream_->shutdown(ec);
+    stream_->close(ec);
 
     state_ = SessionState::EXIT;
     on_exit_(self);
@@ -731,7 +749,7 @@ void Session::list(protocol::Request& req) {
         send_res(res);
         return;
     }
-    if(!storage_->try_acquire_user_lock(username_)) {
+    if(!acquire_lock()) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::SERVICE_UNAVAILABLE,
@@ -752,7 +770,7 @@ void Session::list(protocol::Request& req) {
                 ""
             };
             send_res(res);
-            storage_->release_user_lock(username_);
+            release_lock();
             return;
         }
         auto curr_rel = fsutils::relative(user_dir_, current_dir_);
@@ -768,7 +786,7 @@ void Session::list(protocol::Request& req) {
             ""
         };
         send_res(res);
-        storage_->release_user_lock(username_);
+        release_lock();
         return;
     }else {
         std::filesystem::path requested_dir = fsutils::resolve_path(user_dir_, current_dir_, req.first_argument);
@@ -780,7 +798,7 @@ void Session::list(protocol::Request& req) {
                 ""
             };
             send_res(res);
-            storage_->release_user_lock(username_);
+            release_lock();
             return;
         }
         if(!fsutils::is_subpath(user_dir_, requested_dir)) {
@@ -791,7 +809,7 @@ void Session::list(protocol::Request& req) {
                 ""
             };
             send_res(res);
-            storage_->release_user_lock(username_);
+            release_lock();
             return;
         }
         std::vector<fsutils::FileMetadata> files = fsutils::scan_directory(requested_dir, false);
@@ -803,7 +821,7 @@ void Session::list(protocol::Request& req) {
                 ""
             };
             send_res(res);
-            storage_->release_user_lock(username_);
+            release_lock();
             return;
         }
         std::string file_list;
@@ -818,7 +836,7 @@ void Session::list(protocol::Request& req) {
             ""
         };
         send_res(res);
-        storage_->release_user_lock(username_);
+        release_lock();
         return;
     }
 }
@@ -834,7 +852,7 @@ void Session::delete_file(protocol::Request& req) {
         send_res(res);
         return;
     }
-    if(!storage_->try_acquire_user_lock(username_)) {
+    if(!acquire_lock()) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::SERVICE_UNAVAILABLE,
@@ -853,7 +871,7 @@ void Session::delete_file(protocol::Request& req) {
                 ""
             };
             send_res(res);
-            storage_->release_user_lock(username_);
+            release_lock();
             return;
         }
         if(!fsutils::is_subpath(user_dir_, requested_file)) {
@@ -864,7 +882,7 @@ void Session::delete_file(protocol::Request& req) {
                 ""
             };
             send_res(res);
-            storage_->release_user_lock(username_);
+            release_lock();
             return;
         }
         if(!fsutils::remove_file(requested_file)) {
@@ -875,7 +893,7 @@ void Session::delete_file(protocol::Request& req) {
                 ""
             };
             send_res(res);
-            storage_->release_user_lock(username_);
+            release_lock();
             return;
         }
         protocol::Response res {
@@ -885,7 +903,7 @@ void Session::delete_file(protocol::Request& req) {
             ""
         };
         send_res(res);
-        storage_->release_user_lock(username_);
+        release_lock();
 }
 
 void Session::upload(protocol::Request& req) {
@@ -899,7 +917,7 @@ void Session::upload(protocol::Request& req) {
         send_res(res);
         return;
     }
-    if(!storage_->try_acquire_user_lock(username_)) {
+    if(!acquire_lock()) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::SERVICE_UNAVAILABLE,
@@ -918,7 +936,7 @@ void Session::upload(protocol::Request& req) {
                 ""
             };
             send_res(res);
-            storage_->release_user_lock(username_);
+            release_lock();
             return;
     }
     if(fsutils::is_directory(requested_file)) {
@@ -929,7 +947,7 @@ void Session::upload(protocol::Request& req) {
                 ""
             };
             send_res(res);
-            storage_->release_user_lock(username_);
+            release_lock();
             return;
     }
     if(!fsutils::is_subpath(user_dir_, requested_file)) {
@@ -940,7 +958,7 @@ void Session::upload(protocol::Request& req) {
             ""
         };
         send_res(res);
-        storage_->release_user_lock(username_);
+        release_lock();
         return;
     }
     if(req.size > UINT32_MAX) {
@@ -951,7 +969,7 @@ void Session::upload(protocol::Request& req) {
             ""
         };
         send_res(res);
-        storage_->release_user_lock(username_);
+        release_lock();
         return;
     }
     fsutils::FileMetadata fmeta{
@@ -963,13 +981,26 @@ void Session::upload(protocol::Request& req) {
 
     transfer_.fmeta = fmeta;
     transfer_.chunks = req.chunks;
-    transfer_.chunk_state = transfer_.chunk_state = std::vector<bool>(req.chunks.size(), false);
+    transfer_.chunk_state = std::vector<bool>(req.chunks.size(), false);
+    transfer_.transfer_id = UINT32_MAX; // upload_init() allocates the real one
+
+    if(!upload_init()) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::INTERNAL_SERVER_ERROR,
+            "Failed to prepare the upload.",
+            ""
+        };
+        send_res(res);
+        release_lock();
+        return;
+    }
 
     protocol::Response res {
         protocol::statuses::OK,
         protocol::codes::OK,
         "Starting upload to file: " + fsutils::relative(user_dir_, requested_file).string(),
-        ""
+        std::to_string(transfer_.transfer_id) // file_hash carries the transfer id, as the RESUME kickoff already does
     };
     send_res(res);
     state_ = SessionState::UPLOADING;
@@ -987,7 +1018,7 @@ void Session::download(protocol::Request& req) {
         send_res(res);
         return;
     }
-    if(!storage_->try_acquire_user_lock(username_)) {
+    if(!acquire_lock()) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::SERVICE_UNAVAILABLE,
@@ -1006,7 +1037,7 @@ void Session::download(protocol::Request& req) {
             ""
         };
         send_res(res);
-        storage_->release_user_lock(username_);
+        release_lock();
         return;
     }
     if(fsutils::is_directory(requested_file)) {
@@ -1017,7 +1048,7 @@ void Session::download(protocol::Request& req) {
             ""
         };
         send_res(res);
-        storage_->release_user_lock(username_);
+        release_lock();
         return;
     }
     if(!fsutils::is_subpath(user_dir_, requested_file)) {
@@ -1028,7 +1059,7 @@ void Session::download(protocol::Request& req) {
             ""
         };
         send_res(res);
-        storage_->release_user_lock(username_);
+        release_lock();
         return;
     }
     fsutils::FileMetadata fmeta = fsutils::scan_file(requested_file);
@@ -1041,7 +1072,7 @@ void Session::download(protocol::Request& req) {
             ""
         };
         send_res(res);
-        storage_->release_user_lock(username_);
+        release_lock();
         return;
     }
 
@@ -1053,7 +1084,7 @@ void Session::download(protocol::Request& req) {
             ""
         };
         send_res(res);
-        storage_->release_user_lock(username_);
+        release_lock();
         return;
     }
 
@@ -1067,7 +1098,7 @@ void Session::download(protocol::Request& req) {
             ""
         };
         send_res(res);
-        storage_->release_user_lock(username_);
+        release_lock();
         return;
     }
 
@@ -1083,7 +1114,7 @@ void Session::download(protocol::Request& req) {
             ""
         };
         send_res(res);
-        storage_->release_user_lock(username_);
+        release_lock();
         return;
     }
 
@@ -1164,7 +1195,7 @@ void Session::mkdir(protocol::Request& req) {
             send_res(res);
             return;
     }
-    if(!storage_->try_acquire_user_lock(username_)) {
+    if(!acquire_lock()) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::SERVICE_UNAVAILABLE,
@@ -1183,7 +1214,7 @@ void Session::mkdir(protocol::Request& req) {
                 ""
             };
             send_res(res);
-            storage_->release_user_lock(username_);
+            release_lock();
             return;
         }
     if(!fsutils::is_subpath(user_dir_, requested_dir)) {
@@ -1194,7 +1225,7 @@ void Session::mkdir(protocol::Request& req) {
             ""
         };
         send_res(res);
-        storage_->release_user_lock(username_);
+        release_lock();
         return;
     }
     if(!fsutils::mkdir(requested_dir)) {
@@ -1205,7 +1236,7 @@ void Session::mkdir(protocol::Request& req) {
                 ""
             };
             send_res(res);
-            storage_->release_user_lock(username_);
+            release_lock();
             return;
     }
     protocol::Response res {
@@ -1215,7 +1246,7 @@ void Session::mkdir(protocol::Request& req) {
             ""
         };
         send_res(res);
-        storage_->release_user_lock(username_);
+        release_lock();
 }
 void Session::rmdir(protocol::Request& req) {
     if(state_ != SessionState::READY) {
@@ -1238,7 +1269,7 @@ void Session::rmdir(protocol::Request& req) {
             send_res(res);
             return;
     }
-    if(!storage_->try_acquire_user_lock(username_)) {
+    if(!acquire_lock()) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::SERVICE_UNAVAILABLE,
@@ -1257,7 +1288,7 @@ void Session::rmdir(protocol::Request& req) {
                 ""
             };
             send_res(res);
-            storage_->release_user_lock(username_);
+            release_lock();
             return;
         }
     if(!fsutils::is_subpath(user_dir_, requested_dir) || user_dir_ == requested_dir) {
@@ -1268,7 +1299,7 @@ void Session::rmdir(protocol::Request& req) {
             ""
         };
         send_res(res);
-        storage_->release_user_lock(username_);
+        release_lock();
         return;
     }
     if(!fsutils::rmdir(requested_dir)) {
@@ -1279,7 +1310,7 @@ void Session::rmdir(protocol::Request& req) {
                 ""
             };
             send_res(res);
-            storage_->release_user_lock(username_);
+            release_lock();
             return;
     }
     protocol::Response res {
@@ -1289,7 +1320,7 @@ void Session::rmdir(protocol::Request& req) {
             ""
         };
         send_res(res);
-        storage_->release_user_lock(username_);
+        release_lock();
 }
 void Session::move(protocol::Request& req) {
     if(state_ != SessionState::READY) {
@@ -1312,7 +1343,7 @@ void Session::move(protocol::Request& req) {
             send_res(res);
             return;
     }
-    if(!storage_->try_acquire_user_lock(username_)) {
+    if(!acquire_lock()) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::SERVICE_UNAVAILABLE,
@@ -1332,7 +1363,7 @@ void Session::move(protocol::Request& req) {
                 ""
             };
             send_res(res);
-            storage_->release_user_lock(username_);
+            release_lock();
             return;
     }
     if(fsutils::is_directory(requested_dst) || fsutils::is_file(requested_dst)) {
@@ -1343,7 +1374,7 @@ void Session::move(protocol::Request& req) {
                 ""
             };
             send_res(res);
-            storage_->release_user_lock(username_);
+            release_lock();
             return;
     }
     if(!fsutils::is_subpath(user_dir_, requested_src) || !fsutils::is_subpath(user_dir_, requested_dst)) {
@@ -1354,7 +1385,7 @@ void Session::move(protocol::Request& req) {
             ""
         };
         send_res(res);
-        storage_->release_user_lock(username_);
+        release_lock();
         return;
     }
     if(!(fsutils::move_path(requested_src ,requested_dst, false))) {
@@ -1365,7 +1396,7 @@ void Session::move(protocol::Request& req) {
                 ""
             };
             send_res(res);
-            storage_->release_user_lock(username_);
+            release_lock();
             return;
     }
     protocol::Response res {
@@ -1375,7 +1406,7 @@ void Session::move(protocol::Request& req) {
             ""
         };
         send_res(res);
-        storage_->release_user_lock(username_);
+        release_lock();
 }
 void Session::copy(protocol::Request& req) {
     if(state_ != SessionState::READY) {
@@ -1398,7 +1429,7 @@ void Session::copy(protocol::Request& req) {
             send_res(res);
             return;
     }
-    if(!storage_->try_acquire_user_lock(username_)) {
+    if(!acquire_lock()) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::SERVICE_UNAVAILABLE,
@@ -1418,7 +1449,7 @@ void Session::copy(protocol::Request& req) {
                 ""
             };
             send_res(res);
-            storage_->release_user_lock(username_);
+            release_lock();
             return;
     }
     if(fsutils::is_directory(requested_dst) || fsutils::is_file(requested_dst)) {
@@ -1429,7 +1460,7 @@ void Session::copy(protocol::Request& req) {
                 ""
             };
             send_res(res);
-            storage_->release_user_lock(username_);
+            release_lock();
             return;
     }
     if(!fsutils::is_subpath(user_dir_, requested_src) || !fsutils::is_subpath(user_dir_, requested_dst)) {
@@ -1440,7 +1471,7 @@ void Session::copy(protocol::Request& req) {
             ""
         };
         send_res(res);
-        storage_->release_user_lock(username_);
+        release_lock();
         return;
     }
     if(!(fsutils::copy_path(requested_src, requested_dst, false))) {
@@ -1451,7 +1482,7 @@ void Session::copy(protocol::Request& req) {
                 ""
             };
             send_res(res);
-            storage_->release_user_lock(username_);
+            release_lock();
             return;
     }
     protocol::Response res {
@@ -1461,7 +1492,7 @@ void Session::copy(protocol::Request& req) {
             ""
         };
         send_res(res);
-        storage_->release_user_lock(username_);
+        release_lock();
 }
 
 // SYNC is a stateless listing request: it returns a recursive hash+mtime listing of the requested
@@ -1491,7 +1522,7 @@ void Session::sync(protocol::Request& req) {
         send_res(res);
         return;
     }
-    if(!storage_->try_acquire_user_lock(username_)) {
+    if(!acquire_lock()) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::SERVICE_UNAVAILABLE,
@@ -1510,7 +1541,7 @@ void Session::sync(protocol::Request& req) {
             ""
         };
         send_res(res);
-        storage_->release_user_lock(username_);
+        release_lock();
         return;
     }
     if(!fsutils::is_directory(requested_dir)) {
@@ -1521,7 +1552,7 @@ void Session::sync(protocol::Request& req) {
             ""
         };
         send_res(res);
-        storage_->release_user_lock(username_);
+        release_lock();
         return;
     }
 
@@ -1534,7 +1565,7 @@ void Session::sync(protocol::Request& req) {
             ""
         };
         send_res(res);
-        storage_->release_user_lock(username_);
+        release_lock();
         return;
     }
 
@@ -1557,7 +1588,7 @@ void Session::sync(protocol::Request& req) {
     }
 
     send_res(res);
-    storage_->release_user_lock(username_);
+    release_lock();
 }
 
 void Session::tiers(protocol::Request& req) {
@@ -1673,7 +1704,7 @@ void Session::set_tier(protocol::Request& req) {
 
     // Held across the confirmation so a concurrent upload cannot start under the migration.
     // finish_exit() releases it unconditionally, so a client that never answers cannot brick the user.
-    if(!storage_->try_acquire_user_lock(username_)) {
+    if(!acquire_lock()) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::SERVICE_UNAVAILABLE,
@@ -1725,7 +1756,7 @@ void Session::finish_set_tier() {
             ""
         };
         send_res(res);
-        storage_->release_user_lock(username_);
+        release_lock();
         return;
     }
 
@@ -1742,7 +1773,7 @@ void Session::finish_set_tier() {
             ""
         };
         send_res(res);
-        storage_->release_user_lock(username_);
+        release_lock();
         return;
     }
 
@@ -1754,13 +1785,13 @@ void Session::finish_set_tier() {
             ""
         };
         send_res(res);
-        storage_->release_user_lock(username_);
+        release_lock();
         return;
     }
 
     // Re-point user_dir_, current_dir_ and partmeta_ at the new medium
     if(!setup_dir()) {
-        storage_->release_user_lock(username_);
+        release_lock();
         return; // setup_dir() already answered with the error
     }
 
@@ -1772,7 +1803,7 @@ void Session::finish_set_tier() {
         ""
     };
     send_res(res);
-    storage_->release_user_lock(username_);
+    release_lock();
 }
 
 bool Session::valid_file(const std::filesystem::path& partial_file, const std::array<uint8_t, crypto_generichash_BYTES>& expected) {
@@ -1788,18 +1819,24 @@ bool Session::valid_chunk(const uint32_t& index, const uint32_t& size, const std
     return hash == fsutils::hex_to_hash(chunk.chunk_hash) && !fsutils::is_hash_error(hash);
 }
 
-void Session::upload_init() {
-    partmeta_->add_partial_metadata(TransferType::UPLOAD, transfer_.fmeta, transfer_.chunks, transfer_.transfer_id);
+bool Session::upload_init() {
+    // transfer_.transfer_id is UINT32_MAX for a fresh upload, so the id is allocated here out of
+    // this user's partial metadata database - which is shared by all of their sessions and hands
+    // out each id once. Called before the accepting response is sent, so the client can be told
+    // which id to use instead of choosing one itself.
+    transfer_.transfer_id = partmeta_->add_partial_metadata(TransferType::UPLOAD, transfer_.fmeta, transfer_.chunks, transfer_.transfer_id);
     transfer_.partial_path = partmeta_->get_partial_path(transfer_.transfer_id);
     spdlog::debug("[{}] Upload {} -> partial file {}", username_, transfer_.transfer_id, transfer_.partial_path.string());
     if(transfer_.partial_path.empty()) {
         spdlog::error("[{}] Failed to get partial path for upload {}.", username_, transfer_.transfer_id);
-        upload_abort(false, true, protocol::flags::ERROR);
-        return;
+        partmeta_->delete_partial_metadata(transfer_.transfer_id);
+        transfer_.transfer_id = UINT32_MAX;
+        return false;
     }
     if(!fsutils::is_file(transfer_.partial_path)) {
         fsutils::create_empty_file(transfer_.partial_path);
     }
+    return true;
 }
 
 void Session::uploading(const uint32_t& index, const uint32_t& size, const std::vector<uint8_t>& data, uint8_t flag) {
@@ -1821,6 +1858,15 @@ void Session::uploading(const uint32_t& index, const uint32_t& size, const std::
             upload_abort(false, true, flag);
             return;
         }
+        // Move into place before acknowledging: the client takes a DONE chunk as "stored", so this
+        // failing after the fact reported a success no file backed up.
+        if(!fsutils::move_path(transfer_.partial_path, transfer_.fmeta.absolute_path, true)) {
+            flag = protocol::flags::ERROR;
+            spdlog::error("[{}] Failed to store the uploaded file of transfer {} at {}.",
+                          username_, transfer_.transfer_id, transfer_.fmeta.absolute_path.string());
+            upload_abort(false, true, flag);
+            return;
+        }
     }
     protocol::ChunkHeader ch{
         transfer_.transfer_id,
@@ -1839,7 +1885,7 @@ void Session::uploading(const uint32_t& index, const uint32_t& size, const std::
 }
 
 void Session::upload_done() {
-    fsutils::move_path(transfer_.partial_path, transfer_.fmeta.absolute_path, true);
+    // The file was already moved into place by uploading(), before the DONE chunk went out
     partmeta_->delete_partial_metadata(transfer_.transfer_id);
 
     transfer_.partial_path = std::filesystem::path("");
@@ -1848,7 +1894,7 @@ void Session::upload_done() {
     transfer_.chunk_state.clear();
     transfer_.chunks.clear();
 
-    storage_->release_user_lock(username_);
+    release_lock();
     if(resuming_) { handle_resumes(); } else { state_ = SessionState::READY; }
 }
 
@@ -1879,7 +1925,7 @@ void Session::upload_abort(bool save, bool notify, uint8_t flag) {
         send_chunk(ch, data);
     }
 
-    storage_->release_user_lock(username_);
+    release_lock();
     if(resuming_) { handle_resumes(); } else { state_ = SessionState::READY; }
 }
 
@@ -1963,7 +2009,7 @@ void Session::download_done() {
     transfer_.chunk_state.clear();
     transfer_.chunks.clear();
 
-    storage_->release_user_lock(username_);
+    release_lock();
     if(resuming_) { handle_resumes(); } else { state_ = SessionState::READY; }
 }
 
@@ -1992,7 +2038,7 @@ void Session::download_abort(bool save, bool notify, uint8_t flag) {
 
         send_chunk(chunk_header, data);
     }
-    storage_->release_user_lock(username_);
+    release_lock();
     if(resuming_) { handle_resumes(); } else { state_ = SessionState::READY; }
 }
 

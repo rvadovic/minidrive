@@ -4,6 +4,7 @@ add_library(minidrive_shared STATIC
     src/protocol/message.cpp
     src/filesystem/utils.cpp
     src/filesystem/partmeta.cpp
+    src/transport/stream.cpp
 )
 
 target_include_directories(minidrive_shared
@@ -22,5 +23,13 @@ target_link_libraries(minidrive_shared
     PUBLIC
         minidrive_warnings
 )
+
+# TlsStream compiles only where OpenSSL was found. PUBLIC so the define reaches server/client too:
+# transport/stream.hpp guards the class declaration on it, and a mismatch between the library's
+# view of the header and an executable's would be an ODR violation, not a missing symbol.
+if(MINIDRIVE_ENABLE_TLS)
+    target_link_libraries(minidrive_shared PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_definitions(minidrive_shared PUBLIC MINIDRIVE_ENABLE_TLS)
+endif()
 
 set_target_properties(minidrive_shared PROPERTIES EXPORT_NAME shared)
