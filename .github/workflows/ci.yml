@@ -25,9 +25,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: ubuntu-24.04 (OpenSSL 3.0, classical fallback)
+          - id: ubuntu-24.04
+            name: ubuntu-24.04 (OpenSSL 3.0, classical fallback)
             container: ''
-          - name: debian-13 (OpenSSL 3.5, hybrid post-quantum)
+          - id: debian-13
+            name: debian-13 (OpenSSL 3.5, hybrid post-quantum)
             container: 'debian:13'
     steps:
       # The plain container image has no git, and actions/checkout silently degrades to a REST
@@ -63,10 +65,11 @@ jobs:
         with:
           path: build/_deps
           # Keyed per leg: the two use different compilers, so their build artifacts are not
-          # interchangeable.
-          key: deps-${{ matrix.name }}-${{ hashFiles('cmake/Dependencies.cmake') }}
+          # interchangeable. Uses matrix.id, not matrix.name - cache keys can't contain commas,
+          # and the display name does.
+          key: deps-${{ matrix.id }}-${{ hashFiles('cmake/Dependencies.cmake') }}
           restore-keys: |
-            deps-${{ matrix.name }}-
+            deps-${{ matrix.id }}-
 
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
