@@ -2378,15 +2378,25 @@ void Session::uploading(const uint32_t& index, const uint32_t& size, const std::
 
     std::vector<uint8_t> response_data;
 
-    send_chunk(ch, response_data);
-
+    // Finished and unlocked before the DONE goes out: the client takes DONE as the end of the
+    // command and may exit at once, and its next command arrives on a new connection that can be
+    // served before this handler returns. Releasing after sending made that command race this
+    // session for the lock and lose with 503 "Server is busy".
     if(flag == protocol::flags::DONE) {
         upload_done();
+    }
+
+    send_chunk(ch, response_data);
+
+    // After the DONE, never before it: a resume follow-up must not overtake the chunk on the wire
+    if(flag == protocol::flags::DONE) {
+        if(resuming_) { handle_resumes(); } else { state_ = SessionState::READY; }
     }
 }
 
 void Session::upload_done() {
-    // The file was already moved into place by uploading(), before the DONE chunk went out
+    // The file was already moved into place by uploading(), before the DONE chunk went out.
+    // Leaves state_ alone: uploading() moves on only once the DONE is queued.
     partmeta_->delete_partial_metadata(transfer_.transfer_id);
 
     transfer_.partial_path = std::filesystem::path("");
@@ -2399,7 +2409,6 @@ void Session::upload_done() {
     transfer_.plaintext_size = 0;
 
     lock_.release(); // The transfer's lock, parked by upload()/download() or by a resume kickoff
-    if(resuming_) { handle_resumes(); } else { state_ = SessionState::READY; }
 }
 
 void Session::upload_abort(bool save, bool notify, uint8_t flag) {
@@ -2419,6 +2428,9 @@ void Session::upload_abort(bool save, bool notify, uint8_t flag) {
         transfer_.plaintext_size = 0;
     }
 
+    // Released before notifying, for the same reason as upload_done(): the notice ends the command
+    lock_.release(); // The transfer's lock, parked by upload()/download() or by a resume kickoff
+
     if(notify) {
         protocol::ChunkHeader ch{
             transfer_.transfer_id,
@@ -2432,7 +2444,6 @@ void Session::upload_abort(bool save, bool notify, uint8_t flag) {
         send_chunk(ch, data);
     }
 
-    lock_.release(); // The transfer's lock, parked by upload()/download() or by a resume kickoff
     if(resuming_) { handle_resumes(); } else { state_ = SessionState::READY; }
 }
 
@@ -2508,6 +2519,14 @@ void Session::downloading() {
         return;
     }
     send_chunk(chunk_header, data);
+
+    // The client ends a download by sending DONE and exits without waiting for a reply, so its
+    // next command, on a new connection, can arrive before that DONE is read here. Holding the lock
+    // until download_done() made that command lose with 503. Once the last chunk is read the file
+    // is never touched again, so there is nothing left for the lock to protect.
+    if(flag == protocol::flags::LAST) {
+        lock_.release();
+    }
 }
 
 void Session::download_done() {
@@ -2542,6 +2561,9 @@ void Session::download_abort(bool save, bool notify, uint8_t flag) {
         transfer_.plaintext_size = 0;
     }
 
+    // Released before notifying, for the same reason as upload_done(): the notice ends the command
+    lock_.release(); // The transfer's lock, parked by upload()/download() or by a resume kickoff
+
     if(notify) {
         protocol::ChunkHeader chunk_header{
             transfer_.transfer_id,
@@ -2554,7 +2576,6 @@ void Session::download_abort(bool save, bool notify, uint8_t flag) {
 
         send_chunk(chunk_header, data);
     }
-    lock_.release(); // The transfer's lock, parked by upload()/download() or by a resume kickoff
     if(resuming_) { handle_resumes(); } else { state_ = SessionState::READY; }
 }
 

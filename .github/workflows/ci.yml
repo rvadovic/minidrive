@@ -91,6 +91,17 @@ jobs:
             echo "::endgroup::"
           done
 
+      - name: Upload test logs (on failure)
+        # The step log only shows pass/fail per check. The client and server transcripts under
+        # test_logs/ are what actually say why a check failed (e.g. a 503 hidden behind a
+        # has_ok_response() false positive), and they vanish with the runner otherwise.
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ matrix.id }}
+          path: test_logs/
+          retention-days: 7
+
       - name: Integration test suites (known pre-existing gaps, non-blocking)
         # conc/multi: two individual checks in these suites have a test-harness false
         # positive (the assertion matches "ok" anywhere in the client's login-banner output

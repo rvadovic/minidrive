@@ -40,6 +40,14 @@ jobs:
             echo "::endgroup::"
           done
 
+      - name: Upload test logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-release
+          path: test_logs/
+          retention-days: 7
+
       - name: "Package (CPack: .tar.gz + .deb)"
         working-directory: build
         run: cpack
