@@ -5,6 +5,7 @@ add_executable(minidrive_client
     src/terminalRaw.cpp
     src/sync_manifest.cpp
     src/sync_diff.cpp
+    src/vault.cpp
 )
 
 target_include_directories(minidrive_client

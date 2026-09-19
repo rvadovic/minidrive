@@ -85,7 +85,7 @@ jobs:
         # conc/multi/resume are deliberately run separately below, non-blocking - see that
         # step for why.
         run: |
-          for suite in basic core folder auth sync batch tiers sec tls err log; do
+          for suite in basic core folder auth sync batch tiers sec tls vault err robust log; do
             echo "::group::suite: $suite"
             python3 tests/integration/run_all_tests.py --suite "$suite"
             echo "::endgroup::"

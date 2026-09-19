@@ -43,7 +43,7 @@ Storage::Storage(StorageConfig config)
     }
 }
 
-void Storage::setup() {
+bool Storage::setup() {
     if(!fsutils::exists(root_)) {
         fsutils::mkdir(std::filesystem::path(root_));
     }
@@ -65,7 +65,16 @@ void Storage::setup() {
         }
     }
     db_ = std::make_shared<Database>(std::filesystem::path(root_ / "users.json"));
+    // Loud at boot rather than at the first login: a server that comes up with an unreadable
+    // account database looks healthy right up until nobody can sign in.
+    if(!db_->is_healthy()) {
+        spdlog::critical("Account database {} could not be read. Restore it (or move it aside to "
+                         "start with no accounts) before starting the server.",
+                         (root_ / "users.json").string());
+        return false;
+    }
     spdlog::info("Root directory is set up ({}).", root_.string());
+    return true;
 }
 
 std::shared_ptr<Database> Storage::get_database() {
@@ -94,6 +103,42 @@ std::shared_ptr<PartialMetadata> Storage::get_partmeta(const std::string& user) 
         auto [inserted_it, inserted] = user_partmeta_.emplace(user, std::make_shared<PartialMetadata>(partmeta_file));
         return inserted_it->second;
     }
+}
+
+std::shared_ptr<VaultStore> Storage::get_vault(const std::string& user) {
+    // Public mode is shared by everyone and has no database row, so it cannot own a vault:
+    // a key hierarchy rooted in one person's password makes no sense for an anonymous shared area.
+    if(user == "public") return nullptr;
+
+    std::lock_guard<std::mutex> lock(user_partmeta_guard_);
+    auto it = user_vault_.find(user);
+    if(it != user_vault_.end()) return it->second;
+
+    std::filesystem::path user_root = get_user_root(user);
+    if(user_root.empty()) return nullptr;
+
+    auto vault_file = fsutils::absolute(std::filesystem::path(user_root / "private" / user / ".vault" / "vault.json"));
+    auto [inserted_it, inserted] = user_vault_.emplace(user, std::make_shared<VaultStore>(vault_file));
+    return inserted_it->second;
+}
+
+std::shared_ptr<DekManifest> Storage::get_dek_manifest(const std::string& user) {
+    if(user == "public") return nullptr;
+
+    std::lock_guard<std::mutex> lock(user_partmeta_guard_);
+    auto it = user_dek_.find(user);
+    if(it != user_dek_.end()) return it->second;
+
+    std::filesystem::path user_root = get_user_root(user);
+    if(user_root.empty()) return nullptr;
+
+    auto manifest_file = fsutils::absolute(std::filesystem::path(user_root / "private" / user / ".vault" / "dek_manifest.json"));
+    auto [inserted_it, inserted] = user_dek_.emplace(user, std::make_shared<DekManifest>(manifest_file));
+    return inserted_it->second;
+}
+
+AuthLimiter& Storage::get_auth_limiter() {
+    return auth_limiter_;
 }
 
 std::filesystem::path Storage::get_root() {
@@ -199,7 +244,12 @@ std::filesystem::path Storage::get_user_root(const std::string& user) {
 
 void Storage::invalidate_partmeta(const std::string& user) {
     std::lock_guard<std::mutex> lock(user_partmeta_guard_);
+    // Every one of these caches an absolute path into the tier the user was on. After a migration
+    // they would all keep writing to the old medium, which for the vault would mean the key
+    // material and the files it opens ending up on different disks.
     user_partmeta_.erase(user);
+    user_vault_.erase(user);
+    user_dek_.erase(user);
 }
 
 MigrationResult Storage::migrate_user(const std::string& user, const StorageTier& from, const StorageTier& to) {
@@ -223,11 +273,19 @@ MigrationResult Storage::migrate_user(const std::string& user, const StorageTier
             "'; a previous migration may have failed. Contact the administrator.", 0, 0};
     }
 
-    // Snapshot the source first so the copy can be verified before anything is deleted
+    // Snapshot the source first so the copy can be verified before anything is deleted.
+    // .vault/ is snapshotted alongside files/: copy_path carries it either way, but an unverified
+    // key manifest is the one thing whose loss makes every copied file permanently unopenable.
     std::map<std::string, std::string> before;
     uint64_t bytes = 0;
     if(!snapshot_files(src / "files", before, bytes)) {
         return MigrationResult{false, "Failed to read your files on tier '" + from.name + "'.", 0, 0};
+    }
+
+    std::map<std::string, std::string> vault_before;
+    uint64_t vault_bytes = 0;
+    if(!snapshot_files(src / ".vault", vault_before, vault_bytes)) {
+        return MigrationResult{false, "Failed to read your vault on tier '" + from.name + "'.", 0, 0};
     }
 
     // Copy the whole user directory, files/ and .partial/ together, so the tree stays consistent
@@ -250,6 +308,14 @@ MigrationResult Storage::migrate_user(const std::string& user, const StorageTier
         fsutils::rmdir(dst);
         return MigrationResult{false, "The copy on tier '" + to.name +
             "' did not match the source; nothing was removed.", 0, 0};
+    }
+
+    std::map<std::string, std::string> vault_after;
+    uint64_t vault_copied_bytes = 0;
+    if(!snapshot_files(dst / ".vault", vault_after, vault_copied_bytes) || vault_before != vault_after) {
+        fsutils::rmdir(dst);
+        return MigrationResult{false, "Your vault did not copy correctly to tier '" + to.name +
+            "'; nothing was removed.", 0, 0};
     }
 
     // The destination is verified complete, so the move counts as done even if cleaning up

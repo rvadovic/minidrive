@@ -5,6 +5,7 @@
 #include <thread>
 #include <string>
 #include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 #include "filesystem/partmeta.hpp"
 #include "filesystem/utils.hpp"
 
@@ -81,6 +82,18 @@ void PartialMetadata::mark_chunk_received(uint32_t id, uint32_t chunk_index) {
     entry.last_activity = std::chrono::system_clock::now();
 }
 
+void PartialMetadata::set_vault_info(uint32_t id, const protocol::WrappedBlob& wrapped_dek,
+                                     const std::string& plaintext_hash, uint32_t plaintext_size) {
+    std::lock_guard lock(partmeta_mutex_);
+
+    auto it = entries_.find(id);
+    if(it == entries_.end()) return;
+
+    it->second.wrapped_dek = wrapped_dek;
+    it->second.plaintext_hash = plaintext_hash;
+    it->second.plaintext_size = plaintext_size;
+}
+
 bool PartialMetadata::is_expired(uint32_t id) {
     std::lock_guard lock(partmeta_mutex_);
 
@@ -92,14 +105,14 @@ bool PartialMetadata::is_expired(uint32_t id) {
     return (std::chrono::system_clock::now() - entry.last_activity) > TRANSFER_TIMEOUT;
 }
 
-void PartialMetadata::save() {
+bool PartialMetadata::save() {
     std::lock_guard lock(partmeta_mutex_);
 
     json j;
     j["entries"] = json::array();
 
     for (const auto& [id, entry] : entries_) {
-        j["entries"].push_back({
+        json item = {
             {"id", entry.id},
             {"absolute_path", entry.absolute_path.string()},
             {"size", entry.size},
@@ -108,19 +121,22 @@ void PartialMetadata::save() {
             {"chunks", entry.chunks},
             {"chunk_state", entry.chunk_state},
             {"last_activity", std::chrono::duration_cast<std::chrono::seconds>(entry.last_activity.time_since_epoch()).count()}
-        });
+        };
+        if(!entry.wrapped_dek.empty()) { // Absent for every plain transfer, so old files still load
+            item["wrapped_dek"] = entry.wrapped_dek;
+            item["plaintext_hash"] = entry.plaintext_hash;
+            item["plaintext_size"] = entry.plaintext_size;
+        }
+        j["entries"].push_back(std::move(item));
     }
 
-    std::filesystem::path tmp = metadata_file_;
-    tmp += ".tmp";
-
-    std::ofstream f(tmp);
-    if(!f) throw std::runtime_error("Failed to open partial file database for writing");
-
-    f << j.dump(4);
-    f.close();
-
-    std::filesystem::rename(tmp, metadata_file_);
+    // Unique temp name + non-throwing rename: several clients sharing one working directory used
+    // to race on a fixed "<file>.tmp", and the loser's throwing rename aborted the process.
+    if(!fsutils::atomic_write_file(metadata_file_, j.dump(4))) {
+        spdlog::error("Failed to save partial transfer metadata to {}", metadata_file_.string());
+        return false;
+    }
+    return true;
 }
 
 void PartialMetadata::cleanup_expired() {
@@ -152,34 +168,62 @@ void PartialMetadata::load() {
     if(!fsutils::exists(metadata_file_)) return;
 
     std::ifstream f(metadata_file_);
-    if(!f) throw std::runtime_error("Failed to open partial file database");
-
-    // check if database is empty
-    if(f.peek() == std::ifstream::traits_type::eof()) {
-        entries_.clear();
+    if(!f) {
+        spdlog::error("Failed to open partial transfer metadata {}", metadata_file_.string());
         return;
     }
 
-    json j;
-    f >> j;
+    // check if database is empty
+    if(f.peek() == std::ifstream::traits_type::eof()) return;
 
-    for(const auto& e : j.at("entries")) {
-        PartialMetadataEntry entry;
-        entry.id = e.at("id").get<uint32_t>();
-        entry.absolute_path = std::filesystem::path(e.at("absolute_path").get<std::string>());
-        entry.size = e.at("size").get<uint32_t>();
-        entry.file_hash = fsutils::hex_to_hash(e.at("file_hash").get<std::string>());
-        entry.type = static_cast<TransferType>(e.at("type").get<int>());
-        entry.chunks = e.at("chunks").get<std::vector<protocol::ChunkInfo>>();
-        entry.chunk_state = e.at("chunk_state").get<std::vector<bool>>();
-        auto ts = e.at("last_activity").get<uint64_t>();
-        entry.last_activity = std::chrono::system_clock::time_point(std::chrono::seconds(ts));
+    // The parse and the entry loop are guarded together: .at()/.get<T>() throw on type confusion,
+    // not just on malformed JSON, and a half-consumed loop would leave partial entries behind.
+    // Uncaught, this ran inside an asio handler on the server (one user's truncated file killed
+    // the process for everyone) and in the client's constructor (every later client in that
+    // directory aborted at startup). Losing resume state is the right outcome: the transfer
+    // simply starts over.
+    try {
+        json j;
+        f >> j;
 
-        entries_.emplace(entry.id, std::move(entry));
-        next_id_ = std::max(next_id_, entry.id + 1);
+        uint32_t next_id = 1;
+        std::unordered_map<uint32_t, PartialMetadataEntry> loaded;
+        for(const auto& e : j.at("entries")) {
+            PartialMetadataEntry entry;
+            entry.id = e.at("id").get<uint32_t>();
+            entry.absolute_path = std::filesystem::path(e.at("absolute_path").get<std::string>());
+            entry.size = e.at("size").get<uint32_t>();
+            entry.file_hash = fsutils::hex_to_hash(e.at("file_hash").get<std::string>());
+            entry.type = static_cast<TransferType>(e.at("type").get<int>());
+            entry.chunks = e.at("chunks").get<std::vector<protocol::ChunkInfo>>();
+            entry.chunk_state = e.at("chunk_state").get<std::vector<bool>>();
+            auto ts = e.at("last_activity").get<uint64_t>();
+            entry.last_activity = std::chrono::system_clock::time_point(std::chrono::seconds(ts));
+            if(e.contains("wrapped_dek")) {
+                protocol::from_json(e.at("wrapped_dek"), entry.wrapped_dek);
+                entry.plaintext_hash = e.value("plaintext_hash", std::string());
+                entry.plaintext_size = e.value("plaintext_size", uint32_t{0});
+            }
+
+            next_id = std::max(next_id, entry.id + 1);
+            loaded.insert_or_assign(entry.id, std::move(entry));
+        }
+
+        entries_ = std::move(loaded);
+        next_id_ = next_id;
+    } catch(const std::exception& e) {
+        entries_.clear();
+        next_id_ = 1;
+        f.close();
+
+        // Move the bad file aside so the next save() does not silently destroy the evidence
+        std::filesystem::path aside = metadata_file_;
+        aside += ".corrupt";
+        std::error_code ec;
+        std::filesystem::rename(metadata_file_, aside, ec);
+        spdlog::error("Partial transfer metadata {} is corrupted ({}); pending transfers discarded, file moved to {}",
+                      metadata_file_.string(), e.what(), ec ? std::string("<rename failed>") : aside.string());
     }
-
-    f.close();
 }
 
 std::vector<PartialMetadataEntry> PartialMetadata::get_entries() {

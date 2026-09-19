@@ -80,10 +80,14 @@ bool paths_equal(const fs::path& p1, const fs::path& p2) {
 }
 
 bool is_subpath(const fs::path& base, const fs::path& sub) {
-    std::error_code ec;
-    fs::path canon_base = fs::weakly_canonical(base, ec);
-    fs::path canon_sub  = fs::weakly_canonical(sub, ec);
-    if(ec) {
+    // One error_code per call, deliberately: sharing one let a failure on the first call be
+    // overwritten by a success on the second, so a base that could not be canonicalized went
+    // unnoticed. This is the traversal boundary - it has to fail closed on either failure.
+    std::error_code base_ec;
+    std::error_code sub_ec;
+    fs::path canon_base = fs::weakly_canonical(base, base_ec);
+    fs::path canon_sub  = fs::weakly_canonical(sub, sub_ec);
+    if(base_ec || sub_ec) {
         return false;
     }
 
@@ -147,6 +151,59 @@ bool remove_file(const fs::path& path) {
         result = false;
     }
     return result;
+}
+
+bool atomic_write_file(const fs::path& path, const std::string& contents, bool owner_only) {
+    std::error_code ec;
+    if(!path.parent_path().empty()) {
+        fs::create_directories(path.parent_path(), ec);
+        if(ec) return false;
+    }
+
+    // A fixed "<path>.tmp" is a name two writers share: the loser renames a file the winner has
+    // already moved away (filesystem_error), or renames the winner's half-written bytes into
+    // place. A random suffix gives each writer its own temp file. randombytes_buf rather than
+    // getpid() so this stays portable; both binaries call sodium_init() before any of this runs.
+    unsigned char rnd[8];
+    randombytes_buf(rnd, sizeof(rnd));
+    static const char* hex = "0123456789abcdef";
+    std::string suffix;
+    for(unsigned char b : rnd) {
+        suffix += hex[b >> 4];
+        suffix += hex[b & 0x0F];
+    }
+
+    fs::path tmp = path;
+    tmp += "." + suffix + ".tmp";
+
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if(!f) return false;
+        if(owner_only) {
+            fs::permissions(tmp, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace, ec);
+            if(ec) {
+                f.close();
+                std::error_code cleanup;
+                fs::remove(tmp, cleanup);
+                return false;
+            }
+        }
+        f << contents;
+        f.flush();
+        if(!f) {
+            f.close();
+            fs::remove(tmp, ec);
+            return false;
+        }
+    }
+
+    fs::rename(tmp, path, ec);
+    if(ec) {
+        std::error_code cleanup;
+        fs::remove(tmp, cleanup);
+        return false;
+    }
+    return true;
 }
 
 bool copy_path(const fs::path& src, const fs::path& dest, bool overwrite) {

@@ -5,6 +5,10 @@ add_executable(minidrive_server
     src/password.cpp
     src/database.cpp
     src/storage.cpp
+    src/vault.cpp
+    src/user_lock.cpp
+    src/path_guard.cpp
+    src/auth_limiter.cpp
 )
 
 target_include_directories(minidrive_server

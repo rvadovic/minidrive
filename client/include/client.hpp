@@ -15,14 +15,15 @@
 #include "filesystem/partmeta.hpp"
 #include "sync_manifest.hpp"
 #include "sync_diff.hpp"
+#include "vault.hpp"
 
 // Stores data of currently active file transfer
 struct ActiveTransfer{
-    uint32_t transfer_id; // ID used in partmeta_ database
-    fsutils::FileMetadata fmeta; // File metadata
-    std::filesystem::path partial_path; // Path of .part file (user/.partial/id.part)
-    std::vector<protocol::ChunkInfo> chunks; // Sizes, indexes and hashes of chunks
-    std::vector<bool> chunk_state; // Represents received/sent chunks
+    uint32_t transfer_id = UINT32_MAX; // ID used in partmeta_ database
+    fsutils::FileMetadata fmeta{}; // File metadata
+    std::filesystem::path partial_path{}; // Path of .part file (user/.partial/id.part)
+    std::vector<protocol::ChunkInfo> chunks{}; // Sizes, indexes and hashes of chunks
+    std::vector<bool> chunk_state{}; // Represents received/sent chunks
 };
 
 enum class ClientState {
@@ -38,7 +39,19 @@ enum class ClientState {
     DOWNLOADING, // Downloading chunks of data
     NEED_INPUT_RESUME_TRANSFER, // Resuming transfer
     SYNC_LISTING, // SYNC listing request sent, waiting for the server's recursive file listing
-    TIERS_LISTING // TIERS request sent, waiting for the server's list of storage media
+    TIERS_LISTING, // TIERS request sent, waiting for the server's list of storage media
+    DEVICES_LISTING, // DEVICES request sent, waiting for the server's list of enrolled devices
+    VAULT_PENDING // A vault command is in flight whose key material is only committed once it succeeds
+};
+
+// Which vault command VAULT_PENDING is waiting on. Both hold generated key material that must not
+// be kept if the server refuses the request - a device whose keys only this machine knows about
+// would be able to unlock nothing, and a vault key the server never stored would seal files that
+// can never be opened again.
+enum class VaultPending {
+    NONE,
+    INIT,
+    ENROLL
 };
 
 // Which command filled batch_queue_ - decides how the SYNC listing response is turned into ops and
@@ -105,6 +118,28 @@ private:
     ActiveTransfer transfer_{UINT32_MAX, fsutils::FileMetadata{}, std::filesystem::path(""), {}, {}}; // Current active transfer info
     std::filesystem::path root_; // Client root
     std::optional<PartialMetadata> partmeta_; // Database for partial file metadata
+
+    // Vault. Everything that can read file contents lives here and nowhere else - the server is
+    // handed sealed blobs and never a key that opens one.
+    std::string host_; // Remembered from connect(), only to name the device key entry
+    uint16_t port_ = 0;
+    std::optional<vault::Key> vault_key_; // VK, in memory only, only while this session is unlocked
+    protocol::VaultInfo vault_info_; // Salt and Argon2id parameters the server handed back at login
+    std::vector<protocol::DeviceInfo> vault_devices_; // Devices enrolled at the time of login
+    // The password is kept for the life of the session so VAULT_INIT can derive a master key later.
+    // It is wiped on exit; the tradeoff is written up in docs/vault.md.
+    std::string password_;
+    std::optional<vault::DeviceKeys> device_keys_; // This machine's keys for this account, if enrolled
+    VaultPending vault_pending_ = VaultPending::NONE;
+    std::optional<vault::Key> pending_vault_key_; // Committed only once VAULT_INIT is accepted
+    protocol::VaultInfo pending_vault_info_;
+    std::optional<vault::DeviceKeys> pending_device_keys_; // Committed only once ENROLL_DEVICE is accepted
+
+    // Per-transfer vault state
+    std::filesystem::path upload_cipher_temp_; // Ciphertext actually uploaded, removed when the transfer ends
+    bool download_encrypted_ = false; // The incoming file is sealed and has to be opened locally
+    vault::Key download_dek_{}; // Its data key, already unwrapped
+    std::string download_plaintext_hash_; // What the file must hash to once decrypted
 
     // Batch engine. One queue-draining mechanism shared by SYNC, UPLOAD_DIR/DOWNLOAD_DIR and the
     // multi-argument DELETE/MOVE/COPY forms: each op is driven through the ordinary single-item
@@ -197,6 +232,11 @@ private:
     void cmd_download_dir(std::istringstream& iss); // Fetch a recursive listing and queue download ops
     void cmd_tiers(std::istringstream& iss); // Ask the server which storage media it has configured
     void cmd_set_tier(std::istringstream& iss); // Ask the server to move this user's data to another medium
+    void cmd_vault_init(std::istringstream& iss); // Create this account's vault, locally, from the password
+    void cmd_vault_status(std::istringstream& iss); // Report locally whether the vault exists and is unlocked
+    void cmd_devices(std::istringstream& iss); // Ask the server which devices are enrolled
+    void cmd_enroll_device(std::istringstream& iss); // Generate this machine's keys and seal the vault key to them
+    void cmd_revoke_device(std::istringstream& iss); // Ask the server to drop a device, with confirmation
 
     // Command bodies, split from argument parsing so the batch engine can drive the very same
     // single-item request/response cycle the interactive commands use
@@ -221,6 +261,15 @@ private:
     void record_op_result(); // Count the finished op and update the baseline
     void handle_sync_listing(const protocol::Response& res); // Turn a recursive listing into a queue of ops
     void handle_tiers_listing(const protocol::Response& res); // Print the storage media the server offers
+    void handle_devices_listing(const protocol::Response& res); // Print the devices enrolled in the vault
+
+    // Vault helpers
+    void unlock_vault(const protocol::Response& res); // Recover VK from a device key, or from the password
+    void commit_vault_pending(); // Apply key material once the server accepted the command that created it
+    std::filesystem::path device_key_file() const; // Where this machine keeps its own device private keys
+    std::string account_key() const; // "user@host:port", which device key entry belongs to this connection
+    void clean_vault_temp(); // Drop ciphertext scratch files no unfinished transfer refers to any more
+    void discard_cipher_temp(); // Remove the ciphertext behind the transfer that just ended
     bool scan_local_tree(const std::filesystem::path& dir, std::map<std::string, SyncEntry>& out); // Recursive local scan, relative-path keyed
 
     // Upload
@@ -233,7 +282,7 @@ private:
     // Download
     bool valid_file(const std::filesystem::path& partial_file, const std::array<uint8_t, crypto_generichash_BYTES>& expected); // Compute hash of full file after download and compare with expected
     bool valid_chunk(const uint32_t& index, const uint32_t& size, const std::vector<uint8_t>& data); // Compute hash of chunk data and compare with expected
-    void download_init(const std::vector<protocol::ChunkInfo>& chunks, const std::string& file_hash); // Prepare transfer_ data, call downloading()
+    void download_init(const protocol::Response& res); // Prepare transfer_ data (and unwrap the file's key, if sealed)
     void download_prepare_partmeta(); // Create partial metadata entry in database partmeta_ (client_root/.partial/partmeta.json) and create .part file
     void downloading(const uint32_t& index, const uint32_t& size, const std::vector<uint8_t>& data, uint8_t flag); // Systemtically sends one chunk, is called by handle_chunk()
     void download_done(); // Delete partial metadata from database partmeta_ (client_root/.partial/partmeta.json)

@@ -41,6 +41,10 @@ Session::Session(std::shared_ptr<transport::IStream> stream, std::shared_ptr<Sto
           {protocol::commands::SYNC,     [this](auto& req){ sync(req); }},
           {protocol::commands::TIERS,    [this](auto& req){ tiers(req); }},
           {protocol::commands::SET_TIER, [this](auto& req){ set_tier(req); }},
+          {protocol::commands::VAULT_INIT,    [this](auto& req){ vault_init(req); }},
+          {protocol::commands::ENROLL_DEVICE, [this](auto& req){ enroll_device(req); }},
+          {protocol::commands::REVOKE_DEVICE, [this](auto& req){ revoke_device(req); }},
+          {protocol::commands::DEVICES,       [this](auto& req){ devices(req); }},
           {protocol::commands::LOGIN,     [this](auto& req){ login(req); }},
           {protocol::commands::NEED_INPUT, [this](auto& req){ need_input(req); }},
           {protocol::commands::AUTH, [this](auto& req){ auth(req); }}
@@ -49,12 +53,8 @@ Session::Session(std::shared_ptr<transport::IStream> stream, std::shared_ptr<Sto
         transfer_.transfer_id = UINT32_MAX;
 }
 
-bool Session::acquire_lock() {
-    return storage_->try_acquire_user_lock(username_, session_id_);
-}
-
-void Session::release_lock() {
-    storage_->release_user_lock(username_, session_id_);
+UserLock Session::acquire_lock() {
+    return UserLock(storage_, username_, session_id_);
 }
 
 void Session::start() {
@@ -121,7 +121,16 @@ void Session::read_body_json() {
             handle_error(asio::error::invalid_argument);
             return;
         }
-        handle_request(j);
+        // The one funnel every command passes through. UserLock releases on unwind, which is what
+        // makes catching here safe: a caught exception cannot strand the user in permanent 503.
+        responded_ = false;
+        SessionState state_before = state_;
+        try {
+            handle_request(j);
+        } catch(const std::exception& e) {
+            recover_from_exception("request", e, state_before);
+        }
+        if(exiting_) return;
         read_next();
     });
 }
@@ -136,6 +145,7 @@ void Session::write_response_json(const json& j) {
         return;
     }
 
+    responded_ = true;
     stream_->async_write_all(transport::frame_json(body), [this, self](const std::error_code& ec, std::size_t) {
         if(ec) {
             handle_error(ec);
@@ -199,7 +209,14 @@ void Session::read_body_chunk() {
             }
             return;
         }
-        handle_chunk(ch_, *data);
+        try {
+            handle_chunk(ch_, *data);
+        } catch(const std::exception& e) {
+            // Mid-transfer there is no request to answer with a JSON 500 - the peer is speaking
+            // chunk framing - so end this session; do_exit() keeps the transfer resumable.
+            recover_from_exception("chunk", e, SessionState::EXIT);
+        }
+        if(exiting_) return;
         read_next();
     });
 }
@@ -226,9 +243,31 @@ void Session::send_chunk_exit(const protocol::ChunkHeader& ch, const std::vector
 void Session::send_res(protocol::Response& res) {
     spdlog::debug("[{}] -> {} {} {}", username_, res.status, res.code, res.message);
     res.chunks.clear();
+
+    // auth() sets this flag rather than sending a second message, because a back-to-back response
+    // races against whatever the client already has buffered on stdin (bugs #1 and #7). Whichever
+    // response the successful login actually produces is the one that carries the vault material.
+    if(send_vault_info_) {
+        send_vault_info_ = false;
+        if(vault_ && vault_->is_initialized()) {
+            res.vault = vault_->get_info();
+            for(const auto& device : vault_->get_devices()) {
+                res.devices.push_back(protocol::DeviceInfo{
+                    device.device_id, device.device_name, device.algorithm,
+                    device.x25519_pub, device.mlkem_pub, device.wrapped_vk,
+                    device.created_at, device.last_seen
+                });
+            }
+        }
+    }
+
     json j;
     protocol::to_json(j, res);
     write_response_json(j);
+}
+
+std::string Session::vault_key_for(const std::filesystem::path& absolute_path) const {
+    return fsutils::relative(user_dir_, absolute_path).generic_string();
 }
 
 void Session::read_next() {
@@ -238,6 +277,46 @@ void Session::read_next() {
     } else {
         read_header_json();
     }
+}
+
+void Session::recover_from_exception(const char* where, const std::exception& e, SessionState state_before) {
+    spdlog::critical("[{}] Unexpected exception in {} handler: {}", username_.empty() ? "-" : username_, where, e.what());
+
+    if(!responded_ && state_ == state_before && !exiting_) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::INTERNAL_SERVER_ERROR,
+            "Internal server error.",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+    // Either the peer already has its answer or the state machine moved, so the session's state
+    // can no longer be trusted. Ending it is safe; every other session is unaffected.
+    exit();
+}
+
+bool Session::require_database() {
+    if(db_->is_healthy()) return true;
+    refuse_database();
+    return false;
+}
+
+void Session::refuse_database() {
+    spdlog::error("[{}] Refusing login: account database is unavailable.", username_.empty() ? "-" : username_);
+    // One response, then close: leaving the session in LOGIN would only have every following
+    // command refused, and a separate goodbye would be a second response to this request.
+    protocol::Response res {
+        protocol::statuses::ERROR,
+        protocol::codes::INTERNAL_SERVER_ERROR,
+        "Account database is unavailable.",
+        ""
+    };
+    json j;
+    protocol::to_json(j, res);
+    exiting_ = true;
+    write_response_json_exit(j);
 }
 
 void Session::handle_error(const std::error_code& ec) {
@@ -401,6 +480,9 @@ void Session::login(protocol::Request& req) {
             return;
         }
 
+    // Public mode never reads users.json, so only an account login needs it to be readable
+    if(!require_database()) return;
+
     username_ = req.first_argument;
     if(!db_->user_exists(req.first_argument)) {
         protocol::Response res {
@@ -457,6 +539,10 @@ bool Session::setup_dir() {
             fsutils::mkdir(std::filesystem::path(base / "private" / username_ / ".partial"));
             fsutils::create_empty_file(std::filesystem::path(base / "private" / username_ / ".partial/partmeta.json"));
         }
+        // Sits beside .partial/, outside files/, so it never shows up in a listing or a SYNC diff
+        if(!fsutils::is_directory(std::filesystem::path(base / "private" / username_ / ".vault"))) {
+            fsutils::mkdir(std::filesystem::path(base / "private" / username_ / ".vault"));
+        }
         user_dir_ = fsutils::absolute(std::filesystem::path(base / "private" / username_ / "files"));
     } else {
         if(fsutils::is_directory(std::filesystem::path(root_ / "public"))) {
@@ -480,6 +566,10 @@ bool Session::setup_dir() {
     }
     current_dir_ = user_dir_;
     partmeta_ = storage_->get_partmeta(username_);
+    // Both are null in public mode by design: a shared anonymous area has no owner whose password
+    // could root a key hierarchy. Every vault handler treats null as "no vault here".
+    vault_ = storage_->get_vault(username_);
+    dek_ = storage_->get_dek_manifest(username_);
     return true;
 }
 
@@ -505,10 +595,34 @@ void Session::auth(protocol::Request& req) {
         send_res(res);
         return;
     } else if(db_->user_exists(username_)) {
+        // Consulted before the password is verified, so an attempt made during a lockout is
+        // rejected without ever reaching record_failure() and therefore cannot extend the lockout.
+        // That is what stops the lockout itself becoming a way to keep a real user locked out.
+        AuthLimiter& limiter = storage_->get_auth_limiter();
+        AuthLimiter::Decision decision = limiter.check(username_);
+        if(!decision.allowed) {
+            spdlog::warn("[{}] Authentication refused: locked out for another {}s.",
+                         username_, decision.retry_after_seconds);
+            protocol::Response res {
+                protocol::statuses::AUTH,
+                protocol::codes::TOO_MANY_REQUESTS,
+                "Too many failed attempts. Try again in " +
+                    std::to_string(decision.retry_after_seconds) + " second(s).",
+                ""
+            };
+            send_res(res);
+            return;
+        }
+
         if(db_->validate_user(username_, req.first_argument)) {
+            limiter.record_success(username_);
             spdlog::info("[{}] Authentication succeeded.", username_);
             if(!setup_dir()) return; // setup_dir() already answered with the error
             state_ = SessionState::READY;
+            // The next response out of send_res() carries the salt, Argon2id parameters and sealed
+            // vault key, if this account has a vault - everything the client needs to derive its
+            // master key locally, and nothing that lets the server derive it.
+            send_vault_info_ = true;
 
             // Send exactly one response: either the normal OK, or the resume question in its
             // place -- never both, since a second back-to-back response races against whatever
@@ -531,7 +645,26 @@ void Session::auth(protocol::Request& req) {
             }
             return;
         } else {
+            limiter.record_failure(username_);
             spdlog::warn("[{}] Authentication failed: invalid password.", username_);
+
+            // Report the lockout on the attempt that caused it, rather than letting the caller
+            // discover it on the next try - and say the same thing to everyone, since the message
+            // itself must not become a signal about whether the username is worth attacking.
+            AuthLimiter::Decision after = limiter.check(username_);
+            if(!after.allowed) {
+                spdlog::warn("[{}] Locked out for {}s after repeated failures.", username_, after.retry_after_seconds);
+                protocol::Response res {
+                    protocol::statuses::AUTH,
+                    protocol::codes::TOO_MANY_REQUESTS,
+                    "Too many failed attempts. Try again in " +
+                        std::to_string(after.retry_after_seconds) + " second(s).",
+                    ""
+                };
+                send_res(res);
+                return;
+            }
+
             protocol::Response res {
                 protocol::statuses::AUTH,
                 protocol::codes::UNAUTHORIZED,
@@ -542,7 +675,13 @@ void Session::auth(protocol::Request& req) {
             return;
         }
     } else if(!db_->user_exists(username_)) {
-        db_->add_user(username_, req.first_argument, storage_->get_default_tier());
+        // Refused when users.json has become unreadable since LOGIN - the fail-closed Database
+        // will not write over it, and then an existing account can also look "missing" here.
+        if(!db_->add_user(username_, req.first_argument, storage_->get_default_tier())) {
+            spdlog::error("[{}] Registration failed: account database could not be written.", username_);
+            refuse_database();
+            return;
+        }
         spdlog::info("[{}] Registered new user.", username_);
         if(!setup_dir()) return; // setup_dir() already answered with the error
         protocol::Response res {
@@ -600,7 +739,11 @@ void Session::need_input(protocol::Request& req) {
                 PartialMetadataEntry entry = files_to_be_resumed.front();
                 files_to_be_resumed.pop();
 
-                if(!acquire_lock()) {
+                // The resumed transfer outlives this handler, so its lock is parked straight away
+                // rather than moved on a success path - there is no failure path between here and
+                // the transfer starting.
+                lock_ = acquire_lock();
+                if(!lock_) {
                     protocol::Response res {
                         protocol::statuses::ERROR,
                         protocol::codes::SERVICE_UNAVAILABLE,
@@ -619,6 +762,11 @@ void Session::need_input(protocol::Request& req) {
                 transfer_.chunks = entry.chunks;
                 transfer_.chunk_state = entry.chunk_state;
                 transfer_.partial_path = partmeta_->get_partial_path(entry.id);
+                // Without these a resumed vaulted upload would finish and be stored with no key
+                // entry, leaving a file nobody - including its owner - could ever open again
+                transfer_.wrapped_dek = entry.wrapped_dek;
+                transfer_.plaintext_hash = entry.plaintext_hash;
+                transfer_.plaintext_size = entry.plaintext_size;
 
                 protocol::Response res {
                     protocol::statuses::RESUME,
@@ -626,6 +774,18 @@ void Session::need_input(protocol::Request& req) {
                     to_string(entry.type) + " " + fsutils::relative(user_dir_, entry.absolute_path).string(),
                     std::to_string(entry.id) // reuse file_hash field to carry the transfer id being resumed
                 };
+
+                // A resumed download needs its data key just as much as a fresh one does. The
+                // DOWNLOAD response that would normally carry it never happens here, so it rides
+                // on the kickoff instead - otherwise the client would finish the transfer and
+                // write the server's ciphertext to disk under the plaintext file's name.
+                if(entry.type == TransferType::DOWNLOAD && dek_ != nullptr) {
+                    if(std::optional<DekEntry> dek_entry = dek_->get(vault_key_for(entry.absolute_path))) {
+                        res.wrapped_dek = dek_entry->wrapped_dek;
+                        res.plaintext_hash = dek_entry->plaintext_hash;
+                    }
+                }
+
                 send_res(res);
 
                 if(entry.type == TransferType::UPLOAD) {
@@ -659,7 +819,7 @@ void Session::need_input(protocol::Request& req) {
             } else if(req.first_argument == "n") {
                 pending_tier_.clear();
                 state_ = SessionState::READY;
-                release_lock();
+                lock_.release(); // The lock set_tier() parked for the confirmation
                 protocol::Response res {
                     protocol::statuses::OK,
                     protocol::codes::OK,
@@ -677,6 +837,32 @@ void Session::need_input(protocol::Request& req) {
                 };
                 send_res(res);
                 return; // stays in NEED_INPUT_SET_TIER, lock still held, question can be answered again
+            }
+            break;
+        case SessionState::NEED_INPUT_REVOKE_DEVICE:
+            if(req.first_argument == "y") {
+                finish_revoke_device();
+                return;
+            } else if(req.first_argument == "n") {
+                pending_device_.clear();
+                state_ = SessionState::READY;
+                protocol::Response res {
+                    protocol::statuses::OK,
+                    protocol::codes::OK,
+                    "Device revocation cancelled.",
+                    ""
+                };
+                send_res(res);
+                return;
+            } else {
+                protocol::Response res {
+                    protocol::statuses::ERROR,
+                    protocol::codes::BAD_REQUEST,
+                    "Invalid input for device revocation. Y/n expected.",
+                    ""
+                };
+                send_res(res);
+                return; // stays in NEED_INPUT_REVOKE_DEVICE, the question can be answered again
             }
             break;
         default:
@@ -733,7 +919,10 @@ void Session::do_exit() {
 void Session::finish_exit() {
     auto self = shared_from_this();
 
-    release_lock();
+    // Whatever a transfer or a pending tier change parked. Synchronous handlers hold theirs on the
+    // stack and cannot still be running here, so this is the only lock left to let go of; the
+    // member's destructor is the backstop if a path ever reaches destruction without getting here.
+    lock_.release();
 
     std::error_code ec;
     stream_->shutdown(ec);
@@ -754,7 +943,8 @@ void Session::list(protocol::Request& req) {
         send_res(res);
         return;
     }
-    if(!acquire_lock()) {
+    UserLock lock = acquire_lock();
+    if(!lock) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::SERVICE_UNAVAILABLE,
@@ -775,7 +965,6 @@ void Session::list(protocol::Request& req) {
                 ""
             };
             send_res(res);
-            release_lock();
             return;
         }
         auto curr_rel = fsutils::relative(user_dir_, current_dir_);
@@ -791,22 +980,12 @@ void Session::list(protocol::Request& req) {
             ""
         };
         send_res(res);
-        release_lock();
         return;
     }else {
-        std::filesystem::path requested_dir = fsutils::resolve_path(user_dir_, current_dir_, req.first_argument);
-        if(!fsutils::is_directory(requested_dir)) {
-            protocol::Response res {
-                protocol::statuses::ERROR,
-                protocol::codes::BAD_REQUEST,
-                "Directory does not exist.",
-                ""
-            };
-            send_res(res);
-            release_lock();
-            return;
-        }
-        if(!fsutils::is_subpath(user_dir_, requested_dir)) {
+        // Containment first, before the filesystem is asked anything at all: answering "does not
+        // exist" for a path outside the root would tell the caller whether it exists.
+        std::optional<std::filesystem::path> requested_dir = guard_path(user_dir_, current_dir_, req.first_argument);
+        if(!requested_dir) {
             protocol::Response res {
                 protocol::statuses::ERROR,
                 protocol::codes::FORBIDDEN,
@@ -814,10 +993,19 @@ void Session::list(protocol::Request& req) {
                 ""
             };
             send_res(res);
-            release_lock();
             return;
         }
-        std::vector<fsutils::FileMetadata> files = fsutils::scan_directory(requested_dir, false);
+        if(!fsutils::is_directory(*requested_dir)) {
+            protocol::Response res {
+                protocol::statuses::ERROR,
+                protocol::codes::BAD_REQUEST,
+                "Directory does not exist.",
+                ""
+            };
+            send_res(res);
+            return;
+        }
+        std::vector<fsutils::FileMetadata> files = fsutils::scan_directory(*requested_dir, false);
         if(fsutils::is_scan_dir_error(files)) {
             protocol::Response res {
                 protocol::statuses::ERROR,
@@ -826,12 +1014,11 @@ void Session::list(protocol::Request& req) {
                 ""
             };
             send_res(res);
-            release_lock();
             return;
         }
         std::string file_list;
         for (const auto& file : files) {
-            std::filesystem::path relative = fsutils::relative(requested_dir, file.absolute_path);
+            std::filesystem::path relative = fsutils::relative(*requested_dir, file.absolute_path);
             file_list += relative.string() + "\n";
         }
         protocol::Response res {
@@ -841,7 +1028,6 @@ void Session::list(protocol::Request& req) {
             ""
         };
         send_res(res);
-        release_lock();
         return;
     }
 }
@@ -857,7 +1043,8 @@ void Session::delete_file(protocol::Request& req) {
         send_res(res);
         return;
     }
-    if(!acquire_lock()) {
+    UserLock lock = acquire_lock();
+    if(!lock) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::SERVICE_UNAVAILABLE,
@@ -867,48 +1054,47 @@ void Session::delete_file(protocol::Request& req) {
         send_res(res);
         return;
     }
-    std::filesystem::path requested_file = fsutils::resolve_path(user_dir_, current_dir_, req.first_argument);
-    if(!fsutils::is_file(requested_file)) {
-            protocol::Response res {
-                protocol::statuses::ERROR,
-                protocol::codes::BAD_REQUEST,
-                "File does not exist.",
-                ""
-            };
-            send_res(res);
-            release_lock();
-            return;
-        }
-        if(!fsutils::is_subpath(user_dir_, requested_file)) {
-            protocol::Response res {
-                protocol::statuses::ERROR,
-                protocol::codes::FORBIDDEN,
-                "Access denied.",
-                ""
-            };
-            send_res(res);
-            release_lock();
-            return;
-        }
-        if(!fsutils::remove_file(requested_file)) {
-            protocol::Response res {
-                protocol::statuses::ERROR,
-                protocol::codes::INTERNAL_SERVER_ERROR,
-                "Cannot remove file",
-                ""
-            };
-            send_res(res);
-            release_lock();
-            return;
-        }
+    std::optional<std::filesystem::path> requested_file = guard_path(user_dir_, current_dir_, req.first_argument);
+    if(!requested_file) {
         protocol::Response res {
-            protocol::statuses::OK,
-            protocol::codes::OK,
-            "File deleted",
+            protocol::statuses::ERROR,
+            protocol::codes::FORBIDDEN,
+            "Access denied.",
             ""
         };
         send_res(res);
-        release_lock();
+        return;
+    }
+    if(!fsutils::is_file(*requested_file)) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::BAD_REQUEST,
+            "File does not exist.",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+    if(!fsutils::remove_file(*requested_file)) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::INTERNAL_SERVER_ERROR,
+            "Cannot remove file",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+    // A key for a file that is gone is dead weight that would also be handed back if the same
+    // path were later reused by a plain upload
+    if(dek_ != nullptr) dek_->remove(vault_key_for(*requested_file));
+    protocol::Response res {
+        protocol::statuses::OK,
+        protocol::codes::OK,
+        "File deleted",
+        ""
+    };
+    send_res(res);
 }
 
 void Session::upload(protocol::Request& req) {
@@ -922,7 +1108,8 @@ void Session::upload(protocol::Request& req) {
         send_res(res);
         return;
     }
-    if(!acquire_lock()) {
+    UserLock lock = acquire_lock();
+    if(!lock) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::SERVICE_UNAVAILABLE,
@@ -932,30 +1119,8 @@ void Session::upload(protocol::Request& req) {
         send_res(res);
         return;
     }
-    std::filesystem::path requested_file = fsutils::resolve_path(user_dir_, current_dir_, req.first_argument);
-    if(fsutils::is_file(requested_file)) {
-            protocol::Response res {
-                protocol::statuses::ERROR,
-                protocol::codes::PRECONDITION_FAILED,
-                "File already exists.",
-                ""
-            };
-            send_res(res);
-            release_lock();
-            return;
-    }
-    if(fsutils::is_directory(requested_file)) {
-            protocol::Response res {
-                protocol::statuses::ERROR,
-                protocol::codes::PRECONDITION_FAILED,
-                "Requested file is an existing directory.",
-                ""
-            };
-            send_res(res);
-            release_lock();
-            return;
-    }
-    if(!fsutils::is_subpath(user_dir_, requested_file)) {
+    std::optional<std::filesystem::path> guarded = guard_path(user_dir_, current_dir_, req.first_argument);
+    if(!guarded) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::FORBIDDEN,
@@ -963,7 +1128,27 @@ void Session::upload(protocol::Request& req) {
             ""
         };
         send_res(res);
-        release_lock();
+        return;
+    }
+    const std::filesystem::path requested_file = *guarded;
+    if(fsutils::is_file(requested_file)) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::PRECONDITION_FAILED,
+            "File already exists.",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+    if(fsutils::is_directory(requested_file)) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::PRECONDITION_FAILED,
+            "Requested file is an existing directory.",
+            ""
+        };
+        send_res(res);
         return;
     }
     if(req.size > UINT32_MAX) {
@@ -974,7 +1159,6 @@ void Session::upload(protocol::Request& req) {
             ""
         };
         send_res(res);
-        release_lock();
         return;
     }
     fsutils::FileMetadata fmeta{
@@ -988,6 +1172,12 @@ void Session::upload(protocol::Request& req) {
     transfer_.chunks = req.chunks;
     transfer_.chunk_state = std::vector<bool>(req.chunks.size(), false);
     transfer_.transfer_id = UINT32_MAX; // upload_init() allocates the real one
+    // What arrives on the wire for a vaulted account is ciphertext, and req.file_hash above is its
+    // hash: the server verifies and stores exactly the bytes it is given, as it always has. These
+    // three describe what is inside, and only the client can act on them.
+    transfer_.wrapped_dek = req.wrapped_dek;
+    transfer_.plaintext_hash = req.plaintext_hash;
+    transfer_.plaintext_size = req.plaintext_size;
 
     if(!upload_init()) {
         protocol::Response res {
@@ -997,7 +1187,6 @@ void Session::upload(protocol::Request& req) {
             ""
         };
         send_res(res);
-        release_lock();
         return;
     }
 
@@ -1008,6 +1197,9 @@ void Session::upload(protocol::Request& req) {
         std::to_string(transfer_.transfer_id) // file_hash carries the transfer id, as the RESUME kickoff already does
     };
     send_res(res);
+    // The transfer outlives this handler, so it takes the lock with it; upload_done()/upload_abort()
+    // release it. Moving only here means every error path above released by simply returning.
+    lock_ = std::move(lock);
     state_ = SessionState::UPLOADING;
     return;
 }
@@ -1023,7 +1215,8 @@ void Session::download(protocol::Request& req) {
         send_res(res);
         return;
     }
-    if(!acquire_lock()) {
+    UserLock lock = acquire_lock();
+    if(!lock) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::SERVICE_UNAVAILABLE,
@@ -1033,7 +1226,18 @@ void Session::download(protocol::Request& req) {
         send_res(res);
         return;
     }
-    std::filesystem::path requested_file = fsutils::resolve_path(user_dir_, current_dir_, req.first_argument);
+    std::optional<std::filesystem::path> guarded = guard_path(user_dir_, current_dir_, req.first_argument);
+    if(!guarded) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::FORBIDDEN,
+            "Access denied.",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+    const std::filesystem::path requested_file = *guarded;
     if(!fsutils::is_file(requested_file)) {
         protocol::Response res {
             protocol::statuses::ERROR,
@@ -1042,7 +1246,6 @@ void Session::download(protocol::Request& req) {
             ""
         };
         send_res(res);
-        release_lock();
         return;
     }
     if(fsutils::is_directory(requested_file)) {
@@ -1053,18 +1256,6 @@ void Session::download(protocol::Request& req) {
             ""
         };
         send_res(res);
-        release_lock();
-        return;
-    }
-    if(!fsutils::is_subpath(user_dir_, requested_file)) {
-        protocol::Response res {
-            protocol::statuses::ERROR,
-            protocol::codes::FORBIDDEN,
-            "Access denied.",
-            ""
-        };
-        send_res(res);
-        release_lock();
         return;
     }
     fsutils::FileMetadata fmeta = fsutils::scan_file(requested_file);
@@ -1077,7 +1268,6 @@ void Session::download(protocol::Request& req) {
             ""
         };
         send_res(res);
-        release_lock();
         return;
     }
 
@@ -1089,7 +1279,6 @@ void Session::download(protocol::Request& req) {
             ""
         };
         send_res(res);
-        release_lock();
         return;
     }
 
@@ -1103,7 +1292,6 @@ void Session::download(protocol::Request& req) {
             ""
         };
         send_res(res);
-        release_lock();
         return;
     }
 
@@ -1119,7 +1307,6 @@ void Session::download(protocol::Request& req) {
             ""
         };
         send_res(res);
-        release_lock();
         return;
     }
 
@@ -1130,9 +1317,20 @@ void Session::download(protocol::Request& req) {
         fsutils::hash_to_hex(transfer_.fmeta.hash)
     };
     res.chunks = transfer_.chunks;
+
+    // A file stored before the vault existed has no entry here, so it downloads as plain bytes -
+    // which is correct, because that is what is on disk. Only sealed files carry a sealed key.
+    if(dek_ != nullptr) {
+        if(std::optional<DekEntry> entry = dek_->get(vault_key_for(requested_file))) {
+            res.wrapped_dek = entry->wrapped_dek;
+            res.plaintext_hash = entry->plaintext_hash;
+        }
+    }
     json j;
     protocol::to_json(j, res);
     write_response_json(j);
+    // Handed to the transfer, same as upload(); download_done()/download_abort() release it
+    lock_ = std::move(lock);
     state_ = SessionState::DOWNLOADING;
     download_init();
     return;
@@ -1149,35 +1347,35 @@ void Session::cd(protocol::Request& req) {
         send_res(res);
         return;
     }
-    std::filesystem::path requested_dir = fsutils::resolve_path(user_dir_, current_dir_, req.first_argument);
-    if(!fsutils::is_directory(requested_dir)) {
-            protocol::Response res {
-                protocol::statuses::ERROR,
-                protocol::codes::BAD_REQUEST,
-                "Directory does not exist.",
-                ""
-            };
-            send_res(res);
-            return;
-        }
-        if(!fsutils::is_subpath(user_dir_, requested_dir)) {
-            protocol::Response res {
-                protocol::statuses::ERROR,
-                protocol::codes::FORBIDDEN,
-                "Access denied.",
-                ""
-            };
-            send_res(res);
-            return;
-        }
-        current_dir_ = requested_dir;
+    std::optional<std::filesystem::path> requested_dir = guard_path(user_dir_, current_dir_, req.first_argument);
+    if(!requested_dir) {
         protocol::Response res {
-            protocol::statuses::OK,
-            protocol::codes::OK,
-            "Directory changed.",
+            protocol::statuses::ERROR,
+            protocol::codes::FORBIDDEN,
+            "Access denied.",
             ""
         };
         send_res(res);
+        return;
+    }
+    if(!fsutils::is_directory(*requested_dir)) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::BAD_REQUEST,
+            "Directory does not exist.",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+    current_dir_ = *requested_dir;
+    protocol::Response res {
+        protocol::statuses::OK,
+        protocol::codes::OK,
+        "Directory changed.",
+        ""
+    };
+    send_res(res);
 }
 void Session::mkdir(protocol::Request& req) {
     if(state_ != SessionState::READY) {
@@ -1200,7 +1398,8 @@ void Session::mkdir(protocol::Request& req) {
             send_res(res);
             return;
     }
-    if(!acquire_lock()) {
+    UserLock lock = acquire_lock();
+    if(!lock) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::SERVICE_UNAVAILABLE,
@@ -1210,19 +1409,8 @@ void Session::mkdir(protocol::Request& req) {
         send_res(res);
         return;
     }
-    std::filesystem::path requested_dir = fsutils::resolve_path(user_dir_, current_dir_, req.first_argument);
-    if(fsutils::is_directory(requested_dir)) {
-            protocol::Response res {
-                protocol::statuses::ERROR,
-                protocol::codes::PRECONDITION_FAILED,
-                "Directory already exists.",
-                ""
-            };
-            send_res(res);
-            release_lock();
-            return;
-        }
-    if(!fsutils::is_subpath(user_dir_, requested_dir)) {
+    std::optional<std::filesystem::path> requested_dir = guard_path(user_dir_, current_dir_, req.first_argument);
+    if(!requested_dir) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::FORBIDDEN,
@@ -1230,28 +1418,35 @@ void Session::mkdir(protocol::Request& req) {
             ""
         };
         send_res(res);
-        release_lock();
         return;
     }
-    if(!fsutils::mkdir(requested_dir)) {
+    if(fsutils::is_directory(*requested_dir)) {
         protocol::Response res {
-                protocol::statuses::ERROR,
-                protocol::codes::INTERNAL_SERVER_ERROR,
-                "Cannot create directory.",
-                ""
-            };
-            send_res(res);
-            release_lock();
-            return;
-    }
-    protocol::Response res {
-            protocol::statuses::OK,
-            protocol::codes::OK,
-            "Directory created.",
+            protocol::statuses::ERROR,
+            protocol::codes::PRECONDITION_FAILED,
+            "Directory already exists.",
             ""
         };
         send_res(res);
-        release_lock();
+        return;
+    }
+    if(!fsutils::mkdir(*requested_dir)) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::INTERNAL_SERVER_ERROR,
+            "Cannot create directory.",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+    protocol::Response res {
+        protocol::statuses::OK,
+        protocol::codes::OK,
+        "Directory created.",
+        ""
+    };
+    send_res(res);
 }
 void Session::rmdir(protocol::Request& req) {
     if(state_ != SessionState::READY) {
@@ -1274,7 +1469,8 @@ void Session::rmdir(protocol::Request& req) {
             send_res(res);
             return;
     }
-    if(!acquire_lock()) {
+    UserLock lock = acquire_lock();
+    if(!lock) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::SERVICE_UNAVAILABLE,
@@ -1284,19 +1480,10 @@ void Session::rmdir(protocol::Request& req) {
         send_res(res);
         return;
     }
-    std::filesystem::path requested_dir = fsutils::resolve_path(user_dir_, current_dir_, req.first_argument);
-    if(!fsutils::is_directory(requested_dir)) {
-            protocol::Response res {
-                protocol::statuses::ERROR,
-                protocol::codes::BAD_REQUEST,
-                "Directory does no  exist.",
-                ""
-            };
-            send_res(res);
-            release_lock();
-            return;
-        }
-    if(!fsutils::is_subpath(user_dir_, requested_dir) || user_dir_ == requested_dir) {
+    std::optional<std::filesystem::path> requested_dir = guard_path(user_dir_, current_dir_, req.first_argument);
+    // The root itself is inside the root, so guard_path accepts it - removing it is a separate
+    // rule, and deliberately answers the same 403 so the two are indistinguishable from outside.
+    if(!requested_dir || *requested_dir == user_dir_) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::FORBIDDEN,
@@ -1304,28 +1491,37 @@ void Session::rmdir(protocol::Request& req) {
             ""
         };
         send_res(res);
-        release_lock();
         return;
     }
-    if(!fsutils::rmdir(requested_dir)) {
+    if(!fsutils::is_directory(*requested_dir)) {
         protocol::Response res {
-                protocol::statuses::ERROR,
-                protocol::codes::INTERNAL_SERVER_ERROR,
-                "Cannot delete directory.",
-                ""
-            };
-            send_res(res);
-            release_lock();
-            return;
-    }
-    protocol::Response res {
-            protocol::statuses::OK,
-            protocol::codes::OK,
-            "Directory deleted.",
+            protocol::statuses::ERROR,
+            protocol::codes::BAD_REQUEST,
+            "Directory does no  exist.",
             ""
         };
         send_res(res);
-        release_lock();
+        return;
+    }
+    if(!fsutils::rmdir(*requested_dir)) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::INTERNAL_SERVER_ERROR,
+            "Cannot delete directory.",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+    // rmdir takes the whole subtree with it, and so must every key under it
+    if(dek_ != nullptr) dek_->remove_subtree(vault_key_for(*requested_dir));
+    protocol::Response res {
+        protocol::statuses::OK,
+        protocol::codes::OK,
+        "Directory deleted.",
+        ""
+    };
+    send_res(res);
 }
 void Session::move(protocol::Request& req) {
     if(state_ != SessionState::READY) {
@@ -1348,7 +1544,8 @@ void Session::move(protocol::Request& req) {
             send_res(res);
             return;
     }
-    if(!acquire_lock()) {
+    UserLock lock = acquire_lock();
+    if(!lock) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::SERVICE_UNAVAILABLE,
@@ -1358,31 +1555,9 @@ void Session::move(protocol::Request& req) {
         send_res(res);
         return;
     }
-    std::filesystem::path requested_src = fsutils::resolve_path(user_dir_, current_dir_, req.first_argument);
-    std::filesystem::path requested_dst = fsutils::resolve_path(user_dir_, current_dir_, req.second_argument);
-    if(!(fsutils::is_directory(requested_src) || fsutils::is_file(requested_src))) {
-            protocol::Response res {
-                protocol::statuses::ERROR,
-                protocol::codes::PRECONDITION_FAILED,
-                "Incorrect paths.",
-                ""
-            };
-            send_res(res);
-            release_lock();
-            return;
-    }
-    if(fsutils::is_directory(requested_dst) || fsutils::is_file(requested_dst)) {
-            protocol::Response res {
-                protocol::statuses::ERROR,
-                protocol::codes::PRECONDITION_FAILED,
-                "Destination path already exists.",
-                ""
-            };
-            send_res(res);
-            release_lock();
-            return;
-    }
-    if(!fsutils::is_subpath(user_dir_, requested_src) || !fsutils::is_subpath(user_dir_, requested_dst)) {
+    std::optional<std::filesystem::path> src = guard_path(user_dir_, current_dir_, req.first_argument);
+    std::optional<std::filesystem::path> dst = guard_path(user_dir_, current_dir_, req.second_argument);
+    if(!src || !dst) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::FORBIDDEN,
@@ -1390,28 +1565,48 @@ void Session::move(protocol::Request& req) {
             ""
         };
         send_res(res);
-        release_lock();
         return;
     }
-    if(!(fsutils::move_path(requested_src ,requested_dst, false))) {
+    if(!(fsutils::is_directory(*src) || fsutils::is_file(*src))) {
         protocol::Response res {
-                protocol::statuses::ERROR,
-                protocol::codes::INTERNAL_SERVER_ERROR,
-                "Cannot move paths.",
-                ""
-            };
-            send_res(res);
-            release_lock();
-            return;
-    }
-    protocol::Response res {
-            protocol::statuses::OK,
-            protocol::codes::OK,
-            "Path moved.",
+            protocol::statuses::ERROR,
+            protocol::codes::PRECONDITION_FAILED,
+            "Incorrect paths.",
             ""
         };
         send_res(res);
-        release_lock();
+        return;
+    }
+    if(fsutils::is_directory(*dst) || fsutils::is_file(*dst)) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::PRECONDITION_FAILED,
+            "Destination path already exists.",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+    if(!(fsutils::move_path(*src, *dst, false))) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::INTERNAL_SERVER_ERROR,
+            "Cannot move paths.",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+    // The manifest is keyed by path, so a rename has to move the keys with the bytes - including
+    // every key beneath a renamed directory
+    if(dek_ != nullptr) dek_->rename(vault_key_for(*src), vault_key_for(*dst));
+    protocol::Response res {
+        protocol::statuses::OK,
+        protocol::codes::OK,
+        "Path moved.",
+        ""
+    };
+    send_res(res);
 }
 void Session::copy(protocol::Request& req) {
     if(state_ != SessionState::READY) {
@@ -1434,7 +1629,8 @@ void Session::copy(protocol::Request& req) {
             send_res(res);
             return;
     }
-    if(!acquire_lock()) {
+    UserLock lock = acquire_lock();
+    if(!lock) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::SERVICE_UNAVAILABLE,
@@ -1444,31 +1640,9 @@ void Session::copy(protocol::Request& req) {
         send_res(res);
         return;
     }
-    std::filesystem::path requested_src = fsutils::resolve_path(user_dir_, current_dir_, req.first_argument);
-    std::filesystem::path requested_dst = fsutils::resolve_path(user_dir_, current_dir_, req.second_argument);
-    if(!(fsutils::is_directory(requested_src) || fsutils::is_file(requested_src))) {
-            protocol::Response res {
-                protocol::statuses::ERROR,
-                protocol::codes::PRECONDITION_FAILED,
-                "Incorrect paths.",
-                ""
-            };
-            send_res(res);
-            release_lock();
-            return;
-    }
-    if(fsutils::is_directory(requested_dst) || fsutils::is_file(requested_dst)) {
-            protocol::Response res {
-                protocol::statuses::ERROR,
-                protocol::codes::PRECONDITION_FAILED,
-                "Destination path already exists.",
-                ""
-            };
-            send_res(res);
-            release_lock();
-            return;
-    }
-    if(!fsutils::is_subpath(user_dir_, requested_src) || !fsutils::is_subpath(user_dir_, requested_dst)) {
+    std::optional<std::filesystem::path> src = guard_path(user_dir_, current_dir_, req.first_argument);
+    std::optional<std::filesystem::path> dst = guard_path(user_dir_, current_dir_, req.second_argument);
+    if(!src || !dst) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::FORBIDDEN,
@@ -1476,28 +1650,49 @@ void Session::copy(protocol::Request& req) {
             ""
         };
         send_res(res);
-        release_lock();
         return;
     }
-    if(!(fsutils::copy_path(requested_src, requested_dst, false))) {
+    if(!(fsutils::is_directory(*src) || fsutils::is_file(*src))) {
         protocol::Response res {
-                protocol::statuses::ERROR,
-                protocol::codes::INTERNAL_SERVER_ERROR,
-                "Cannot copy paths.",
-                ""
-            };
-            send_res(res);
-            release_lock();
-            return;
-    }
-    protocol::Response res {
-            protocol::statuses::OK,
-            protocol::codes::OK,
-            "Path copied.",
+            protocol::statuses::ERROR,
+            protocol::codes::PRECONDITION_FAILED,
+            "Incorrect paths.",
             ""
         };
         send_res(res);
-        release_lock();
+        return;
+    }
+    if(fsutils::is_directory(*dst) || fsutils::is_file(*dst)) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::PRECONDITION_FAILED,
+            "Destination path already exists.",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+    if(!(fsutils::copy_path(*src, *dst, false))) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::INTERNAL_SERVER_ERROR,
+            "Cannot copy paths.",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+    // The copy is byte-identical ciphertext, so it opens under the very same data key. Reusing it
+    // is not nonce reuse: it is the same plaintext under the same key, which is what makes SYNC's
+    // "copy instead of re-uploading identical bytes" optimization work for vaulted accounts too.
+    if(dek_ != nullptr) dek_->copy(vault_key_for(*src), vault_key_for(*dst));
+    protocol::Response res {
+        protocol::statuses::OK,
+        protocol::codes::OK,
+        "Path copied.",
+        ""
+    };
+    send_res(res);
 }
 
 // SYNC is a stateless listing request: it returns a recursive hash+mtime listing of the requested
@@ -1527,7 +1722,8 @@ void Session::sync(protocol::Request& req) {
         send_res(res);
         return;
     }
-    if(!acquire_lock()) {
+    UserLock lock = acquire_lock();
+    if(!lock) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::SERVICE_UNAVAILABLE,
@@ -1537,8 +1733,8 @@ void Session::sync(protocol::Request& req) {
         send_res(res);
         return;
     }
-    std::filesystem::path requested_dir = fsutils::resolve_path(user_dir_, current_dir_, req.first_argument);
-    if(!fsutils::is_subpath(user_dir_, requested_dir)) {
+    std::optional<std::filesystem::path> guarded = guard_path(user_dir_, current_dir_, req.first_argument);
+    if(!guarded) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::FORBIDDEN,
@@ -1546,9 +1742,9 @@ void Session::sync(protocol::Request& req) {
             ""
         };
         send_res(res);
-        release_lock();
         return;
     }
+    const std::filesystem::path requested_dir = *guarded;
     if(!fsutils::is_directory(requested_dir)) {
         protocol::Response res {
             protocol::statuses::ERROR,
@@ -1557,7 +1753,6 @@ void Session::sync(protocol::Request& req) {
             ""
         };
         send_res(res);
-        release_lock();
         return;
     }
 
@@ -1570,7 +1765,6 @@ void Session::sync(protocol::Request& req) {
             ""
         };
         send_res(res);
-        release_lock();
         return;
     }
 
@@ -1583,17 +1777,34 @@ void Session::sync(protocol::Request& req) {
 
     for(const auto& file : files) {
         bool is_dir = fsutils::is_directory(file.absolute_path);
+
+        // What the client diffs against is its own local plaintext, so the listing has to be in
+        // the plaintext domain too. For a sealed file the server cannot compute that hash - it
+        // reports the one the client recorded at upload time. Independent per-file data keys mean
+        // hashing the ciphertext would give a different answer for identical content, which would
+        // break not just the comparison but move and copy detection with it. A file with no entry
+        // is stored as plain bytes, so its real hash already is its plaintext hash.
+        std::string hash;
+        uint32_t size = file.size;
+        if(!is_dir) {
+            hash = fsutils::hash_to_hex(file.hash);
+            std::optional<DekEntry> entry = dek_ != nullptr ? dek_->get(vault_key_for(file.absolute_path)) : std::nullopt;
+            if(entry && !entry->plaintext_hash.empty()) {
+                hash = entry->plaintext_hash;
+                size = entry->plaintext_size;
+            }
+        }
+
         res.files.push_back(protocol::FileEntry{
             fsutils::relative(requested_dir, file.absolute_path).generic_string(),
-            is_dir ? 0u : file.size,
-            is_dir ? std::string() : fsutils::hash_to_hex(file.hash),
+            is_dir ? 0u : size,
+            is_dir ? std::string() : hash,
             file.last_modified,
             is_dir
         });
     }
 
     send_res(res);
-    release_lock();
 }
 
 void Session::tiers(protocol::Request& req) {
@@ -1709,7 +1920,8 @@ void Session::set_tier(protocol::Request& req) {
 
     // Held across the confirmation so a concurrent upload cannot start under the migration.
     // finish_exit() releases it unconditionally, so a client that never answers cannot brick the user.
-    if(!acquire_lock()) {
+    UserLock lock = acquire_lock();
+    if(!lock) {
         protocol::Response res {
             protocol::statuses::ERROR,
             protocol::codes::SERVICE_UNAVAILABLE,
@@ -1740,11 +1952,17 @@ void Session::set_tier(protocol::Request& req) {
         ""
     };
     send_res(res);
+    // The confirmation round-trip happens between handlers, so the lock is parked until
+    // finish_set_tier() takes it back or need_input()'s "n" branch releases it
+    lock_ = std::move(lock);
     state_ = SessionState::NEED_INPUT_SET_TIER;
 }
 
 void Session::finish_set_tier() {
-    // Reached only from need_input()'s "y" branch, which holds the user lock taken by set_tier()
+    // Reached only from need_input()'s "y" branch. Taking the parked lock back onto the stack means
+    // every return below releases it, including the ones that answer with an error.
+    UserLock lock = std::move(lock_);
+
     std::string target = pending_tier_;
     pending_tier_.clear();
     state_ = SessionState::READY;
@@ -1761,7 +1979,6 @@ void Session::finish_set_tier() {
             ""
         };
         send_res(res);
-        release_lock();
         return;
     }
 
@@ -1778,7 +1995,6 @@ void Session::finish_set_tier() {
             ""
         };
         send_res(res);
-        release_lock();
         return;
     }
 
@@ -1790,13 +2006,11 @@ void Session::finish_set_tier() {
             ""
         };
         send_res(res);
-        release_lock();
         return;
     }
 
     // Re-point user_dir_, current_dir_ and partmeta_ at the new medium
     if(!setup_dir()) {
-        release_lock();
         return; // setup_dir() already answered with the error
     }
 
@@ -1808,7 +2022,276 @@ void Session::finish_set_tier() {
         ""
     };
     send_res(res);
-    release_lock();
+}
+
+// The four vault handlers below share a shape worth stating once: the server validates structure,
+// stores bytes, and returns bytes. It performs no cryptography and holds no key that opens any of
+// what it stores, which is exactly what makes the account zero-knowledge for file contents.
+
+void Session::vault_init(protocol::Request& req) {
+    if(state_ != SessionState::READY) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::SERVICE_UNAVAILABLE,
+            "Session not ready.",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+
+    if(vault_ == nullptr) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::FORBIDDEN,
+            "Public mode has no vault. Log in with a username to use end-to-end encryption.",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+
+    if(vault_->is_initialized()) {
+        // Re-initializing would mint a fresh vault key and orphan every file already sealed under
+        // the old one, with nothing on the server able to recover them.
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::CONFLICT,
+            "This account already has a vault.",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+
+    UserLock lock = acquire_lock();
+    if(!lock) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::SERVICE_UNAVAILABLE,
+            "Server is busy",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+
+    std::string error;
+    if(!vault_->initialize(req.vault, error)) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::BAD_REQUEST,
+            error,
+            ""
+        };
+        send_res(res);
+        return;
+    }
+
+    spdlog::info("[{}] Vault initialized.", username_);
+    protocol::Response res {
+        protocol::statuses::OK,
+        protocol::codes::OK,
+        "Vault created. Files uploaded from now on are encrypted before they leave this machine.",
+        ""
+    };
+    send_res(res);
+}
+
+void Session::enroll_device(protocol::Request& req) {
+    if(state_ != SessionState::READY) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::SERVICE_UNAVAILABLE,
+            "Session not ready.",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+
+    if(vault_ == nullptr || !vault_->is_initialized()) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::PRECONDITION_FAILED,
+            "This account has no vault. Run VAULT_INIT first.",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+
+    const protocol::DeviceInfo& info = req.device;
+    if(info.device_id.empty() || info.x25519_pub.empty() || info.mlkem_pub.empty() || info.wrapped_vk.empty()) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::BAD_REQUEST,
+            "Incomplete device enrollment.",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+
+    VaultDevice device{
+        info.device_id,
+        info.device_name.empty() ? std::string("unnamed device") : info.device_name,
+        info.algorithm.empty() ? std::string("x25519+mlkem768") : info.algorithm,
+        info.x25519_pub,
+        info.mlkem_pub,
+        info.wrapped_vk,
+        static_cast<uint64_t>(std::time(nullptr)),
+        0
+    };
+
+    std::string error;
+    if(!vault_->add_device(device, error)) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::CONFLICT,
+            error,
+            ""
+        };
+        send_res(res);
+        return;
+    }
+
+    spdlog::info("[{}] Enrolled vault device '{}' ({}).", username_, device.device_name, device.algorithm);
+    protocol::Response res {
+        protocol::statuses::OK,
+        protocol::codes::OK,
+        "Device '" + device.device_name + "' enrolled. It can now unlock the vault without re-deriving "
+            "the master key from your password.",
+        ""
+    };
+    send_res(res);
+}
+
+void Session::revoke_device(protocol::Request& req) {
+    if(state_ != SessionState::READY) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::SERVICE_UNAVAILABLE,
+            "Session not ready.",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+
+    if(vault_ == nullptr || !vault_->is_initialized()) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::PRECONDITION_FAILED,
+            "This account has no vault.",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+
+    if(req.first_argument.empty()) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::BAD_REQUEST,
+            "Device id cannot be empty. Use DEVICES to list enrolled devices.",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+
+    std::optional<VaultDevice> device = vault_->get_device(req.first_argument);
+    if(!device) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::NOT_FOUND,
+            "No device with that id is enrolled.",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+
+    pending_device_ = req.first_argument;
+    protocol::Response res {
+        protocol::statuses::NEED_INPUT,
+        protocol::codes::OK,
+        "Revoke device '" + device->device_name + "'? It will no longer be able to unlock the vault, "
+            "but the vault key is not rotated, so a copy it already holds stays valid. (Y/n)",
+        ""
+    };
+    send_res(res);
+    state_ = SessionState::NEED_INPUT_REVOKE_DEVICE;
+}
+
+void Session::finish_revoke_device() {
+    std::string target = pending_device_;
+    pending_device_.clear();
+    state_ = SessionState::READY;
+
+    if(vault_ == nullptr || !vault_->remove_device(target)) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::INTERNAL_SERVER_ERROR,
+            "The device could not be revoked.",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+
+    spdlog::info("[{}] Revoked vault device {}.", username_, target);
+    protocol::Response res {
+        protocol::statuses::OK,
+        protocol::codes::OK,
+        "Device revoked.",
+        ""
+    };
+    send_res(res);
+}
+
+void Session::devices(protocol::Request& req) {
+    (void)req;
+    if(state_ != SessionState::READY) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::SERVICE_UNAVAILABLE,
+            "Session not ready.",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+
+    // Reads the device table only, touches no user files, so it takes no user lock (same as cd())
+    if(vault_ == nullptr || !vault_->is_initialized()) {
+        protocol::Response res {
+            protocol::statuses::ERROR,
+            protocol::codes::PRECONDITION_FAILED,
+            "This account has no vault. Run VAULT_INIT first.",
+            ""
+        };
+        send_res(res);
+        return;
+    }
+
+    protocol::Response res {
+        protocol::statuses::OK,
+        protocol::codes::OK,
+        "Devices enrolled in this vault:",
+        ""
+    };
+
+    for(const auto& device : vault_->get_devices()) {
+        res.devices.push_back(protocol::DeviceInfo{
+            device.device_id, device.device_name, device.algorithm,
+            device.x25519_pub, device.mlkem_pub, device.wrapped_vk,
+            device.created_at, device.last_seen
+        });
+    }
+
+    send_res(res);
 }
 
 bool Session::valid_file(const std::filesystem::path& partial_file, const std::array<uint8_t, crypto_generichash_BYTES>& expected) {
@@ -1841,6 +2324,12 @@ bool Session::upload_init() {
     if(!fsutils::is_file(transfer_.partial_path)) {
         fsutils::create_empty_file(transfer_.partial_path);
     }
+    // Persisted with the rest of the transfer's state, so an upload interrupted halfway can be
+    // resumed and still land in the manifest under the data key its ciphertext was produced with
+    if(!transfer_.wrapped_dek.empty()) {
+        partmeta_->set_vault_info(transfer_.transfer_id, transfer_.wrapped_dek,
+                                  transfer_.plaintext_hash, transfer_.plaintext_size);
+    }
     return true;
 }
 
@@ -1872,6 +2361,13 @@ void Session::uploading(const uint32_t& index, const uint32_t& size, const std::
             upload_abort(false, true, flag);
             return;
         }
+        // Recorded only once the ciphertext is verified and in place. Doing it earlier would leave
+        // a key entry pointing at a file that never arrived; doing it later would acknowledge a
+        // stored file whose key the server had not yet written down.
+        if(!transfer_.wrapped_dek.empty() && dek_ != nullptr) {
+            dek_->put(vault_key_for(transfer_.fmeta.absolute_path),
+                      DekEntry{transfer_.wrapped_dek, transfer_.plaintext_hash, transfer_.plaintext_size});
+        }
     }
     protocol::ChunkHeader ch{
         transfer_.transfer_id,
@@ -1898,8 +2394,11 @@ void Session::upload_done() {
     transfer_.fmeta = fsutils::FileMetadata{};
     transfer_.chunk_state.clear();
     transfer_.chunks.clear();
+    transfer_.wrapped_dek = protocol::WrappedBlob{};
+    transfer_.plaintext_hash.clear();
+    transfer_.plaintext_size = 0;
 
-    release_lock();
+    lock_.release(); // The transfer's lock, parked by upload()/download() or by a resume kickoff
     if(resuming_) { handle_resumes(); } else { state_ = SessionState::READY; }
 }
 
@@ -1915,6 +2414,9 @@ void Session::upload_abort(bool save, bool notify, uint8_t flag) {
         transfer_.fmeta = fsutils::FileMetadata{};
         transfer_.chunk_state.clear();
         transfer_.chunks.clear();
+        transfer_.wrapped_dek = protocol::WrappedBlob{};
+        transfer_.plaintext_hash.clear();
+        transfer_.plaintext_size = 0;
     }
 
     if(notify) {
@@ -1930,7 +2432,7 @@ void Session::upload_abort(bool save, bool notify, uint8_t flag) {
         send_chunk(ch, data);
     }
 
-    release_lock();
+    lock_.release(); // The transfer's lock, parked by upload()/download() or by a resume kickoff
     if(resuming_) { handle_resumes(); } else { state_ = SessionState::READY; }
 }
 
@@ -1946,6 +2448,9 @@ void Session::upload_abort_exit(bool save, bool notify, uint8_t flag) {
         transfer_.fmeta = fsutils::FileMetadata{};
         transfer_.chunk_state.clear();
         transfer_.chunks.clear();
+        transfer_.wrapped_dek = protocol::WrappedBlob{};
+        transfer_.plaintext_hash.clear();
+        transfer_.plaintext_size = 0;
     }
 
     if(notify) {
@@ -2013,8 +2518,11 @@ void Session::download_done() {
     transfer_.fmeta = fsutils::FileMetadata{};
     transfer_.chunk_state.clear();
     transfer_.chunks.clear();
+    transfer_.wrapped_dek = protocol::WrappedBlob{};
+    transfer_.plaintext_hash.clear();
+    transfer_.plaintext_size = 0;
 
-    release_lock();
+    lock_.release(); // The transfer's lock, parked by upload()/download() or by a resume kickoff
     if(resuming_) { handle_resumes(); } else { state_ = SessionState::READY; }
 }
 
@@ -2029,6 +2537,9 @@ void Session::download_abort(bool save, bool notify, uint8_t flag) {
         transfer_.fmeta = fsutils::FileMetadata{};
         transfer_.chunk_state.clear();
         transfer_.chunks.clear();
+        transfer_.wrapped_dek = protocol::WrappedBlob{};
+        transfer_.plaintext_hash.clear();
+        transfer_.plaintext_size = 0;
     }
 
     if(notify) {
@@ -2043,7 +2554,7 @@ void Session::download_abort(bool save, bool notify, uint8_t flag) {
 
         send_chunk(chunk_header, data);
     }
-    release_lock();
+    lock_.release(); // The transfer's lock, parked by upload()/download() or by a resume kickoff
     if(resuming_) { handle_resumes(); } else { state_ = SessionState::READY; }
 }
 
@@ -2058,6 +2569,9 @@ void Session::download_abort_exit(bool save, bool notify, uint8_t flag) {
         transfer_.fmeta = fsutils::FileMetadata{};
         transfer_.chunk_state.clear();
         transfer_.chunks.clear();
+        transfer_.wrapped_dek = protocol::WrappedBlob{};
+        transfer_.plaintext_hash.clear();
+        transfer_.plaintext_size = 0;
     }
 
     if(notify) {

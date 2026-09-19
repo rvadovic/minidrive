@@ -12,7 +12,9 @@
 #include <nlohmann/json.hpp>
 #include "filesystem/utils.hpp"
 #include <functional>
+#include <set>
 #include <sstream>
+#include "crypto/base64.hpp"
 
 using asio::ip::tcp;
 using nlohmann::json;
@@ -42,6 +44,11 @@ Client::Client(const std::string& username, asio::io_context& io_context,
           {"DOWNLOAD_DIR", [this](auto& iss){ cmd_download_dir(iss); }},
           {"TIERS",    [this](auto& iss){ cmd_tiers(iss); }},
           {"SET_TIER", [this](auto& iss){ cmd_set_tier(iss); }},
+          {"VAULT_INIT",    [this](auto& iss){ cmd_vault_init(iss); }},
+          {"VAULT_STATUS",  [this](auto& iss){ cmd_vault_status(iss); }},
+          {"DEVICES",       [this](auto& iss){ cmd_devices(iss); }},
+          {"ENROLL_DEVICE", [this](auto& iss){ cmd_enroll_device(iss); }},
+          {"REVOKE_DEVICE", [this](auto& iss){ cmd_revoke_device(iss); }},
       } {
         is_tty_ = ::isatty(STDIN_FILENO) != 0;
         current_prompt_ = PROMPT;
@@ -56,6 +63,10 @@ Client::~Client() {
 }
 
 void Client::connect(const std::string& host, uint16_t port) {
+    host_ = host;
+    port_ = port;
+    device_keys_ = vault::load_device_keys(device_key_file(), account_key());
+
     tcp::resolver resolver(io_context_);
     // For TLS this also completes the client handshake (and, from rung 3.5 on, chain validation
     // and pinning) before the first byte of protocol is written.
@@ -112,7 +123,45 @@ void Client::setup() {
     if(!fsutils::is_file(root_ / ".partial/partmeta.json")) {
         fsutils::create_empty_file(root_ / ".partial/partmeta.json");
     }
+    if(!fsutils::is_directory(root_ / ".vault-tmp")) {
+        fsutils::mkdir(root_ / ".vault-tmp");
+    }
     partmeta_.emplace(std::filesystem::path(root_ / ".partial/partmeta.json")); // Database for partial metadata
+    clean_vault_temp();
+}
+
+std::string Client::account_key() const {
+    // A device is enrolled with one account on one server, so both have to be in the key
+    return (username_.empty() ? std::string("public") : username_) + "@" + host_ + ":" + std::to_string(port_);
+}
+
+std::filesystem::path Client::device_key_file() const {
+    return root_ / ".vault" / "devices.json";
+}
+
+// A vaulted upload is sent from a ciphertext scratch file, and an upload interrupted with its
+// state saved has to keep that file to be resumable. Anything no surviving entry points at is a
+// leftover from a crash, and holding onto it would leak the plaintext's size indefinitely.
+void Client::clean_vault_temp() {
+    const std::filesystem::path temp_dir = root_ / ".vault-tmp";
+    if(!fsutils::is_directory(temp_dir)) return;
+
+    std::set<std::string> in_use;
+    for(const PartialMetadataEntry& entry : partmeta_->get_entries()) {
+        in_use.insert(entry.absolute_path.string());
+    }
+
+    std::error_code ec;
+    for(const auto& entry : std::filesystem::directory_iterator(temp_dir, ec)) {
+        if(in_use.count(fsutils::absolute(entry.path()).string()) > 0) continue;
+        fsutils::remove_file(entry.path());
+    }
+}
+
+void Client::discard_cipher_temp() {
+    if(upload_cipher_temp_.empty()) return;
+    fsutils::remove_file(upload_cipher_temp_);
+    upload_cipher_temp_.clear();
 }
 
 void Client::read_line() {
@@ -491,6 +540,13 @@ void Client::handle_response(const json& j) {
     protocol::Response res;
     protocol::from_json(j, res); // Parse
 
+    // The server attaches the vault material to whichever response completes authentication - the
+    // plain OK, or the resume question that takes its place - so this is checked before the branch
+    // on status rather than inside one of them.
+    if(res.vault.enabled && !vault_key_) {
+        unlock_vault(res);
+    }
+
     if(res.status == protocol::statuses::AUTH) {
         state_ = ClientState::AUTH;
         print(res.code, res.message, false);
@@ -514,6 +570,14 @@ void Client::handle_response(const json& j) {
         command_finished(false); // Counts as a failed item mid-batch, re-arms stdin otherwise
     } else if(res.status == protocol::statuses::ERROR) {
         bool listing_failed = (state_ == ClientState::SYNC_LISTING);
+        if(state_ == ClientState::VAULT_PENDING) {
+            // The server refused, so the key material generated for it is discarded rather than
+            // kept: a vault key the server never stored would seal files nothing could reopen.
+            vault_pending_ = VaultPending::NONE;
+            pending_vault_key_.reset();
+            pending_device_keys_.reset();
+            pending_vault_info_ = protocol::VaultInfo{};
+        }
         state_ = ClientState::READY;
         if(listing_failed) { // The batch never started, nothing to drain
             batch_mode_ = BatchMode::NONE;
@@ -528,12 +592,21 @@ void Client::handle_response(const json& j) {
             state_ = ClientState::READY;
             handle_tiers_listing(res);
             return;
+        } else if(state_ == ClientState::DEVICES_LISTING) {
+            state_ = ClientState::READY;
+            handle_devices_listing(res);
+            return;
+        } else if(state_ == ClientState::VAULT_PENDING) {
+            state_ = ClientState::READY;
+            commit_vault_pending(); // The server accepted it, so the key material is now real
+            command_finished(true);
+            return;
         } else if(state_ == ClientState::UPLOAD_INIT) {
             state_ = ClientState::UPLOADING;
             upload_init(res.file_hash); // the accepting response carries the server assigned transfer id
             return;
         } else if(state_ == ClientState::DOWNLOAD_INIT) {
-            download_init(res.chunks, res.file_hash);
+            download_init(res);
             return;
         } else {
             state_ = ClientState::READY;
@@ -569,11 +642,40 @@ void Client::handle_response(const json& j) {
 
             if (cmd == protocol::commands::UPLOAD) {
                 transfer_.transfer_id = id;
+                // A resumed vaulted upload reads from the scratch ciphertext the interrupted run
+                // left behind. Recognising it here is what makes the file get cleaned up when the
+                // resumed transfer finally finishes, instead of lingering forever.
+                if(entry->absolute_path.parent_path() == fsutils::absolute(root_ / ".vault-tmp")) {
+                    upload_cipher_temp_ = entry->absolute_path;
+                }
                 state_ = ClientState::UPLOADING;
                 uploading();
             } else if (cmd == protocol::commands::DOWNLOAD) {
                 transfer_.partial_path = partmeta_->get_partial_path(id);
                 transfer_.transfer_id = UINT32_MAX; // left uninitialized so handle_chunk() adopts it from the first chunk header, same as a fresh download
+
+                // The kickoff carries the file's sealed key, because the DOWNLOAD response that
+                // normally would never happens on a resume. Without it the resumed transfer would
+                // finish and leave the server's ciphertext sitting at the destination path.
+                download_encrypted_ = false;
+                download_plaintext_hash_.clear();
+                if (!res.wrapped_dek.empty()) {
+                    if (!vault_key_) {
+                        print(protocol::codes::PRECONDITION_FAILED,
+                              "That transfer is encrypted and this session's vault is locked.");
+                        download_abort(false, true, protocol::flags::ERROR);
+                        return;
+                    }
+                    if (!vault::unwrap_key(res.wrapped_dek, *vault_key_, download_dek_)) {
+                        print(protocol::codes::INTERNAL_SERVER_ERROR,
+                              "That transfer's key did not open with your vault key.");
+                        download_abort(false, true, protocol::flags::ERROR);
+                        return;
+                    }
+                    download_encrypted_ = true;
+                    download_plaintext_hash_ = res.plaintext_hash;
+                }
+
                 state_ = ClientState::DOWNLOADING;
             }
         }
@@ -617,7 +719,10 @@ void Client::handle_request(const std::string& line) {
     } else if(state_ == ClientState::LOGIN) {
         login();
 
-    } else if(state_ == ClientState::PROCESSING || state_ == ClientState::UPLOAD_INIT || state_ == ClientState::DOWNLOAD_INIT) {
+    } else if(state_ == ClientState::PROCESSING || state_ == ClientState::UPLOAD_INIT ||
+              state_ == ClientState::DOWNLOAD_INIT || state_ == ClientState::VAULT_PENDING ||
+              state_ == ClientState::SYNC_LISTING || state_ == ClientState::TIERS_LISTING ||
+              state_ == ClientState::DEVICES_LISTING) {
         print(protocol::codes::SERVICE_UNAVAILABLE, "Server is busy...");
     } else if (state_ == ClientState::EXIT) {
         return;
@@ -706,6 +811,10 @@ void Client::login() {
 }
 
 void Client::auth(const std::string password) {
+    // Kept for the rest of the session so VAULT_INIT can derive a master key from it later. It
+    // never leaves this process except as the AUTH request already on its way, and exit() wipes it.
+    password_ = password;
+
     protocol::Request req{
         protocol::commands::AUTH,
         password,
@@ -773,6 +882,19 @@ void Client::exit() {
 
 void Client::finish_exit() {
     state_ = ClientState::EXIT;
+
+    // The vault key and the password are the two things in this process that can read the user's
+    // files. Neither outlives the session.
+    if(vault_key_) vault::wipe(*vault_key_);
+    vault_key_.reset();
+    if(pending_vault_key_) vault::wipe(*pending_vault_key_);
+    pending_vault_key_.reset();
+    sodium_memzero(download_dek_.data(), download_dek_.size());
+    if(!password_.empty()) {
+        sodium_memzero(password_.data(), password_.size());
+        password_.clear();
+    }
+
     std::error_code ec;
     stream_->cancel(ec);
 
@@ -856,9 +978,56 @@ void Client::do_upload(const std::filesystem::path& local, const std::string& re
         return;
     }
 
+    // With a vault, what goes on the wire is a ciphertext scratch file, and every step after this
+    // point - chunking, hashing, the transfer itself, resume - runs over that file exactly as it
+    // always has. The server verifies and stores the bytes it is given without knowing or caring
+    // that they are sealed; the only things that tell it otherwise are the three fields below,
+    // none of which it can act on.
+    protocol::WrappedBlob wrapped_dek;
+    std::string plaintext_hash;
+    uint32_t plaintext_size = 0;
+    discard_cipher_temp();
+
+    if(vault_key_) {
+        plaintext_hash = fsutils::hash_to_hex(fmeta.hash);
+        plaintext_size = fmeta.size;
+
+        if(vault::ciphertext_size(fmeta.size) > UINT32_MAX) {
+            print(protocol::codes::BAD_REQUEST, "File too large to encrypt: " + local.string(), !batch_active_);
+            command_finished(false);
+            return;
+        }
+
+        vault::Key dek = vault::random_key(); // One data key per file, so chunk nonces can be deterministic
+        // Named by content plus randomness: content so a re-run is recognisable, randomness so a
+        // scratch file kept for a resumable transfer is never overwritten under a different key.
+        const std::filesystem::path cipher = root_ / ".vault-tmp" /
+            (plaintext_hash.substr(0, 16) + "-" + mdcrypto::to_base64(vault::random_bytes(6)) + ".enc");
+
+        std::string error;
+        if(!vault::encrypt_file(local, cipher, dek, error) || !vault::wrap_key(dek, *vault_key_, wrapped_dek)) {
+            vault::wipe(dek);
+            fsutils::remove_file(cipher);
+            print(protocol::codes::INTERNAL_SERVER_ERROR, "Encryption failed: " + error, !batch_active_);
+            command_finished(false);
+            return;
+        }
+        vault::wipe(dek); // Only its sealed copy survives, and only the vault key opens that
+
+        upload_cipher_temp_ = fsutils::absolute(cipher);
+        fmeta = fsutils::scan_file(upload_cipher_temp_);
+        if(fsutils::is_scan_file_error(fmeta)) {
+            discard_cipher_temp();
+            print(protocol::codes::INTERNAL_SERVER_ERROR, "Gathering file metadata failed: " + local.string(), !batch_active_);
+            command_finished(false);
+            return;
+        }
+    }
+
     std::vector<protocol::ChunkInfo> chunks = fsutils::compute_chunks(fmeta);
 
     if(fsutils::is_compute_chunks_error(chunks)) {
+        discard_cipher_temp();
         print(protocol::codes::INTERNAL_SERVER_ERROR, "Generating file chunks failed: " + local.string(), !batch_active_);
         command_finished(false);
         return;
@@ -876,6 +1045,9 @@ void Client::do_upload(const std::filesystem::path& local, const std::string& re
         fsutils::hash_to_hex(fmeta.hash),
         chunks
     };
+    req.wrapped_dek = wrapped_dek;
+    req.plaintext_hash = plaintext_hash;
+    req.plaintext_size = plaintext_size;
 
     json j;
     protocol::to_json(j, req);
@@ -1027,6 +1199,262 @@ void Client::cmd_set_tier(std::istringstream& iss) {
         return;
     }
     do_set_tier(tier);
+}
+
+// Recovers the vault key, either from this machine's device keys or from the password the user
+// just typed. Runs the moment authentication succeeds, so that by the time the first command is
+// accepted the client can already encrypt and decrypt.
+void Client::unlock_vault(const protocol::Response& res) {
+    vault_info_ = res.vault;
+    vault_devices_ = res.devices;
+
+    std::vector<uint8_t> salt;
+    if(!mdcrypto::from_base64(vault_info_.salt, salt)) {
+        print(protocol::codes::INTERNAL_SERVER_ERROR, "The vault material from the server is malformed.", false);
+        return;
+    }
+
+    // The device path first: it is a KEM operation rather than a second of Argon2id, and skipping
+    // the derivation is the only thing an enrolled device actually buys.
+    if(device_keys_) {
+        const protocol::DeviceInfo* mine = nullptr;
+        for(const protocol::DeviceInfo& device : vault_devices_) {
+            if(device.device_id == device_keys_->device_id) mine = &device;
+        }
+
+        if(mine == nullptr) {
+            // Revoked on the server, or enrolled against a vault that no longer exists. The stored
+            // private key can open nothing, so it is dropped rather than kept around.
+            spdlog::info("This device is no longer enrolled; forgetting its stored keys.");
+            vault::forget_device_keys(device_key_file(), account_key());
+            device_keys_.reset();
+        } else if(!mine->wrapped_vk.empty()) {
+            vault::Key key{};
+            std::string error;
+            if(vault::unwrap_vk_with_device(mine->wrapped_vk, *device_keys_, key, error)) {
+                vault_key_ = key;
+                print(protocol::codes::OK, "Vault unlocked with this device's key.", false);
+                return;
+            }
+            spdlog::warn("Device unlock failed ({}); falling back to the password.", error);
+        }
+    }
+
+    if(password_.empty()) {
+        print(protocol::codes::UNAUTHORIZED, "This account has a vault, but no password was given, so it stays locked.", false);
+        return;
+    }
+
+    vault::Argon2Params params{vault_info_.opslimit, vault_info_.memlimit, vault_info_.algorithm};
+    vault::Key master{};
+    if(!vault::derive_master_key(password_, salt, params, master)) {
+        print(protocol::codes::INTERNAL_SERVER_ERROR, "The vault key could not be derived from your password.", false);
+        return;
+    }
+
+    vault::Key key{};
+    const bool ok = vault::unwrap_key(vault_info_.wrapped_vk_password, master, key);
+    vault::wipe(master); // The master key exists only to open the vault key, never any longer
+
+    if(!ok) {
+        print(protocol::codes::INTERNAL_SERVER_ERROR, "The vault did not open. Its stored key material may be damaged.", false);
+        return;
+    }
+
+    vault_key_ = key;
+    print(protocol::codes::OK, "Vault unlocked. Files are encrypted before they leave this machine.", false);
+}
+
+// Called once the server has accepted the command that produced this key material. Until then
+// nothing is committed, so a refusal leaves the client exactly as it was.
+void Client::commit_vault_pending() {
+    switch(vault_pending_) {
+        case VaultPending::INIT:
+            vault_key_ = pending_vault_key_;
+            vault_info_ = pending_vault_info_;
+            vault_info_.enabled = true;
+            break;
+        case VaultPending::ENROLL:
+            if(pending_device_keys_) {
+                // Written only now: a key file for a device the server never recorded would make
+                // every later login try, and fail, a device unlock before falling back.
+                if(!vault::save_device_keys(device_key_file(), account_key(), *pending_device_keys_)) {
+                    print(protocol::codes::INTERNAL_SERVER_ERROR,
+                          "The device was enrolled but its keys could not be saved locally.", false);
+                } else {
+                    device_keys_ = pending_device_keys_;
+                }
+            }
+            break;
+        case VaultPending::NONE:
+            break;
+    }
+
+    vault_pending_ = VaultPending::NONE;
+    pending_vault_key_.reset();
+    pending_device_keys_.reset();
+    pending_vault_info_ = protocol::VaultInfo{};
+}
+
+void Client::cmd_vault_init(std::istringstream& iss) {
+    (void)iss;
+
+    if(vault_key_) {
+        print(protocol::codes::CONFLICT, "This account already has a vault, and it is unlocked.");
+        read_line();
+        return;
+    }
+    if(vault_info_.enabled) {
+        print(protocol::codes::CONFLICT, "This account already has a vault.");
+        read_line();
+        return;
+    }
+    if(password_.empty()) {
+        print(protocol::codes::PRECONDITION_FAILED,
+              "A vault is rooted in your password, so log in with a username first.");
+        read_line();
+        return;
+    }
+
+    std::vector<uint8_t> salt = vault::random_bytes(vault::SALT_BYTES);
+    vault::Argon2Params params;
+
+    // Deliberately slow - this is the one derivation standing between a password and every file.
+    // It blocks this thread for a second or two, which is why it happens here and not per file.
+    std::cout << "Deriving your vault key (this takes a moment)..." << std::endl;
+
+    vault::Key master{};
+    if(!vault::derive_master_key(password_, salt, params, master)) {
+        print(protocol::codes::INTERNAL_SERVER_ERROR, "Key derivation failed.");
+        read_line();
+        return;
+    }
+
+    vault::Key vault_key = vault::random_key();
+    protocol::WrappedBlob wrapped;
+    const bool ok = vault::wrap_key(vault_key, master, wrapped);
+    vault::wipe(master);
+
+    if(!ok) {
+        vault::wipe(vault_key);
+        print(protocol::codes::INTERNAL_SERVER_ERROR, "Sealing the vault key failed.");
+        read_line();
+        return;
+    }
+
+    protocol::VaultInfo info;
+    info.enabled = true;
+    info.salt = mdcrypto::to_base64(salt);
+    info.opslimit = params.opslimit;
+    info.memlimit = params.memlimit;
+    info.algorithm = params.algorithm;
+    info.wrapped_vk_password = wrapped;
+
+    pending_vault_key_ = vault_key;
+    pending_vault_info_ = info;
+    vault_pending_ = VaultPending::INIT;
+
+    protocol::Request req{ protocol::commands::VAULT_INIT, "", "", 0, "" };
+    req.chunks.clear();
+    req.vault = info; // Salt, parameters and the sealed key - nothing that opens it
+    json j;
+    protocol::to_json(j, req);
+    send_json(j);
+    state_ = ClientState::VAULT_PENDING;
+}
+
+void Client::cmd_vault_status(std::istringstream& iss) {
+    (void)iss;
+
+    if(!vault_info_.enabled) {
+        std::cout << "Vault: not set up for this account. Run VAULT_INIT to turn on end-to-end encryption."
+                  << std::endl;
+    } else if(vault_key_) {
+        std::cout << "Vault: unlocked. Uploads are encrypted locally and the server stores only ciphertext."
+                  << std::endl;
+        std::cout << "  Argon2id: opslimit " << vault_info_.opslimit
+                  << ", memlimit " << vault_info_.memlimit << " bytes" << std::endl;
+        if(device_keys_) {
+            std::cout << "  This device is enrolled as '" << device_keys_->device_name << "'." << std::endl;
+        } else {
+            std::cout << "  This device is not enrolled. ENROLL_DEVICE skips the password derivation next time."
+                      << std::endl;
+        }
+    } else {
+        std::cout << "Vault: set up, but locked. Encrypted files cannot be read in this session." << std::endl;
+    }
+
+    print(protocol::codes::OK, "Vault status reported.");
+    read_line();
+}
+
+void Client::cmd_devices(std::istringstream& iss) {
+    (void)iss;
+    protocol::Request req{ protocol::commands::DEVICES, "", "", 0, "" };
+    req.chunks.clear();
+    json j;
+    protocol::to_json(j, req);
+    send_json(j);
+    state_ = ClientState::DEVICES_LISTING; // The device list arrives in res.devices, not in the message
+}
+
+void Client::cmd_enroll_device(std::istringstream& iss) {
+    if(!vault_key_) {
+        print(protocol::codes::PRECONDITION_FAILED,
+              "The vault has to be unlocked before a device can be enrolled.");
+        read_line();
+        return;
+    }
+
+    std::string name;
+    if(!(iss >> name)) {
+        name = "device";
+    }
+
+    vault::DeviceKeys keys;
+    std::string error;
+    if(!vault::generate_device_keys(name, keys, error)) {
+        print(protocol::codes::INTERNAL_SERVER_ERROR, error);
+        read_line();
+        return;
+    }
+
+    protocol::WrappedBlob wrapped;
+    const std::vector<uint8_t> x25519_pub(keys.x25519_pub.begin(), keys.x25519_pub.end());
+    if(!vault::wrap_vk_to_device(*vault_key_, x25519_pub, keys.mlkem_pub, wrapped, error)) {
+        print(protocol::codes::INTERNAL_SERVER_ERROR, error);
+        read_line();
+        return;
+    }
+
+    protocol::DeviceInfo info;
+    info.device_id = keys.device_id;
+    info.device_name = keys.device_name;
+    info.algorithm = "x25519+mlkem768";
+    info.x25519_pub = mdcrypto::to_base64(x25519_pub);
+    info.mlkem_pub = mdcrypto::to_base64(keys.mlkem_pub);
+    info.wrapped_vk = wrapped; // Only the public halves and the sealed key ever leave this machine
+
+    pending_device_keys_ = keys;
+    vault_pending_ = VaultPending::ENROLL;
+
+    protocol::Request req{ protocol::commands::ENROLL_DEVICE, name, "", 0, "" };
+    req.chunks.clear();
+    req.device = info;
+    json j;
+    protocol::to_json(j, req);
+    send_json(j);
+    state_ = ClientState::VAULT_PENDING;
+}
+
+void Client::cmd_revoke_device(std::istringstream& iss) {
+    std::string device_id;
+    if(!(iss >> device_id)) {
+        print(protocol::codes::BAD_REQUEST, "Missing device id. Use DEVICES to list enrolled devices.");
+        read_line();
+        return;
+    }
+    send_command(protocol::commands::REVOKE_DEVICE, device_id, "");
 }
 
 void Client::cmd_rmdir(std::istringstream& iss) {
@@ -1248,6 +1676,25 @@ void Client::handle_tiers_listing(const protocol::Response& res) {
     if(!res.tiers.empty()) {
         std::cout << "Use SET_TIER <name> to move your data to another medium." << std::endl;
     }
+    command_finished(true);
+}
+
+void Client::handle_devices_listing(const protocol::Response& res) {
+    vault_devices_ = res.devices;
+
+    if(res.devices.empty()) {
+        std::cout << "  (no devices enrolled)" << std::endl;
+    }
+    for(const protocol::DeviceInfo& device : res.devices) {
+        const bool is_this_device = device_keys_ && device_keys_->device_id == device.device_id;
+        std::cout << (is_this_device ? "  * " : "    ") << device.device_id
+                  << "  " << device.device_name
+                  << "  [" << device.algorithm << "]";
+        if(is_this_device) std::cout << "  (this device)";
+        std::cout << std::endl;
+    }
+    std::cout << "Use ENROLL_DEVICE <name> to add this machine, or REVOKE_DEVICE <id> to remove one."
+              << std::endl;
     command_finished(true);
 }
 
@@ -1518,6 +1965,7 @@ void Client::uploading() {
 
 void Client::upload_done() {
     partmeta_->delete_partial_metadata(transfer_.transfer_id);
+    discard_cipher_temp(); // The server has the ciphertext now, this copy has no further use
 
     transfer_.transfer_id = UINT32_MAX;
     transfer_.fmeta = fsutils::FileMetadata{};
@@ -1531,8 +1979,13 @@ void Client::upload_done() {
 void Client::upload_abort(bool save, bool notify, uint8_t flag) {
     if(save) {
         partmeta_->save();
+        // The scratch ciphertext is deliberately kept here: the saved entry points at it, and
+        // resuming means sending the remaining chunks of that exact file. Re-encrypting would
+        // produce different bytes under a different key and invalidate everything already sent.
+        upload_cipher_temp_.clear();
     } else {
         partmeta_->delete_partial_metadata(transfer_.transfer_id);
+        discard_cipher_temp();
 
         transfer_.transfer_id = UINT32_MAX;
         transfer_.fmeta = fsutils::FileMetadata{};
@@ -1562,8 +2015,10 @@ void Client::upload_abort(bool save, bool notify, uint8_t flag) {
 void Client::upload_abort_exit(bool save, bool notify, uint8_t flag) {
     if(save) {
         partmeta_->save();
+        upload_cipher_temp_.clear(); // Kept on disk so the saved entry stays resumable
     } else {
         partmeta_->delete_partial_metadata(transfer_.transfer_id);
+        discard_cipher_temp();
 
         transfer_.transfer_id = UINT32_MAX;
         transfer_.fmeta = fsutils::FileMetadata{};
@@ -1599,9 +2054,9 @@ bool Client::valid_chunk(const uint32_t& index, const uint32_t& size, const std:
     return hash == fsutils::hex_to_hash(chunk.chunk_hash) && !fsutils::is_hash_error(hash);
 }
 
-void Client::download_init(const std::vector<protocol::ChunkInfo>& chunks, const std::string& file_hash) {
+void Client::download_init(const protocol::Response& res) {
     uint64_t file_size = 0;
-    for(const protocol::ChunkInfo& chunk : chunks) {
+    for(const protocol::ChunkInfo& chunk : res.chunks) {
         file_size += chunk.size;
     }
 
@@ -1611,11 +2066,34 @@ void Client::download_init(const std::vector<protocol::ChunkInfo>& chunks, const
         return;
     }
 
+    // A sealed file arrives as ciphertext and is written to the .part file exactly as it comes off
+    // the wire, so chunk validation, the whole-file hash and resume all keep working on the bytes
+    // the server actually stores. It is opened once, in download_done(), after the last chunk.
+    download_encrypted_ = false;
+    download_plaintext_hash_.clear();
+
+    if(!res.wrapped_dek.empty()) {
+        if(!vault_key_) {
+            print(protocol::codes::PRECONDITION_FAILED,
+                  "That file is encrypted and this session's vault is locked.", !batch_active_);
+            download_abort(false, true, protocol::flags::ERROR);
+            return;
+        }
+        if(!vault::unwrap_key(res.wrapped_dek, *vault_key_, download_dek_)) {
+            print(protocol::codes::INTERNAL_SERVER_ERROR,
+                  "That file's key did not open with your vault key.", !batch_active_);
+            download_abort(false, true, protocol::flags::ERROR);
+            return;
+        }
+        download_encrypted_ = true;
+        download_plaintext_hash_ = res.plaintext_hash;
+    }
+
     transfer_.transfer_id = UINT32_MAX; // unitialized
     transfer_.fmeta.size = static_cast<uint32_t>(file_size);
-    transfer_.fmeta.hash = fsutils::hex_to_hash(file_hash);
-    transfer_.chunks = chunks;
-    transfer_.chunk_state = std::vector<bool>(chunks.size(), false);
+    transfer_.fmeta.hash = fsutils::hex_to_hash(res.file_hash);
+    transfer_.chunks = res.chunks;
+    transfer_.chunk_state = std::vector<bool>(res.chunks.size(), false);
     state_ = ClientState::DOWNLOADING;
     //read_line();
 }
@@ -1672,17 +2150,48 @@ void Client::downloading(const uint32_t& index, const uint32_t& size, const std:
 }
 
 void Client::download_done() {
-    fsutils::move_path(transfer_.partial_path, transfer_.fmeta.absolute_path, true); // Move downloaded file to destination
+    bool ok = true;
+
+    if(download_encrypted_) {
+        // Opening it here rather than chunk by chunk is what keeps resume untouched: the .part
+        // file is the server's ciphertext until the transfer is provably complete.
+        std::string error;
+        ok = vault::decrypt_file(transfer_.partial_path, transfer_.fmeta.absolute_path, download_dek_, error);
+
+        if(ok && !download_plaintext_hash_.empty()) {
+            // The chunk and whole-file hashes checked during transfer only prove the ciphertext
+            // arrived intact. This is the check that the plaintext is the file that was uploaded.
+            const std::array<uint8_t, crypto_generichash_BYTES> hash =
+                fsutils::hash_file(transfer_.fmeta.absolute_path);
+            if(fsutils::hash_to_hex(hash) != download_plaintext_hash_) {
+                error = "the decrypted file does not match its recorded hash";
+                fsutils::remove_file(transfer_.fmeta.absolute_path);
+                ok = false;
+            }
+        }
+
+        fsutils::remove_file(transfer_.partial_path);
+        sodium_memzero(download_dek_.data(), download_dek_.size());
+        download_encrypted_ = false;
+        download_plaintext_hash_.clear();
+
+        if(!ok) {
+            print(protocol::codes::INTERNAL_SERVER_ERROR, "Decryption failed: " + error, !batch_active_);
+        }
+    } else {
+        fsutils::move_path(transfer_.partial_path, transfer_.fmeta.absolute_path, true); // Move downloaded file to destination
+    }
+
     partmeta_->delete_partial_metadata(transfer_.transfer_id);
 
     transfer_.transfer_id = UINT32_MAX;
     transfer_.fmeta = fsutils::FileMetadata{};
     transfer_.chunk_state.clear();
     transfer_.chunks.clear();
-    
-    print(protocol::codes::OK, "Download successful", !batch_active_);
+
+    if(ok) print(protocol::codes::OK, "Download successful", !batch_active_);
     state_ = ClientState::READY;
-    command_finished(true);
+    command_finished(ok);
 }
 
 void Client::download_abort(bool save, bool notify, uint8_t flag) {

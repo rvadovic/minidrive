@@ -9,6 +9,8 @@
 #include "filesystem/partmeta.hpp"
 #include "storage.hpp"
 #include "database.hpp"
+#include "user_lock.hpp"
+#include "path_guard.hpp"
 
 enum class SessionState {
     AUTH, // Authentification of user - password
@@ -18,6 +20,7 @@ enum class SessionState {
     NEED_INPUT_REGISTER, // Need input: (Y/n) for registration
     NEED_INPUT_RESUME_TREANSFER, //Need input: (Y/n) for resuming uploads/downloads
     NEED_INPUT_SET_TIER, // Need input: (Y/n) for confirming a storage tier change
+    NEED_INPUT_REVOKE_DEVICE, // Need input: (Y/n) for confirming removal of an enrolled device
     BUSY,
     LOGIN, // Logging in with given username
     READY, // Ready to execute commands
@@ -45,6 +48,8 @@ private:
     std::function<void(std::shared_ptr<Session>)> on_exit_; // Removes this session from server list of sessions on exit
     std::shared_ptr<Database> db_; // Handles file-based database of user data
     std::shared_ptr<PartialMetadata> partmeta_; // Handles file-based database of user's partial file data
+    std::shared_ptr<VaultStore> vault_; // End-to-end encryption state, null in public mode
+    std::shared_ptr<DekManifest> dek_; // Per-file wrapped data keys, null in public mode
     std::unordered_map<std::string, std::function<void(protocol::Request&)>> requests_; // Map of commands and their executors
     std::vector<char> buffer_; // Buffer for json read loop
     uint32_t msg_len_; // Message length for json read loop
@@ -58,16 +63,38 @@ private:
     std::queue<PartialMetadataEntry> files_to_be_resumed; // Files to be resumed
     bool resuming_ = false; // True while working through files_to_be_resumed (gates handle_resumes() re-population)
     std::string pending_tier_; // Tier the user asked to move to, held while waiting for their (Y/n)
+    std::string pending_device_; // Device the user asked to revoke, held while waiting for their (Y/n)
+    // Set the moment authentication succeeds so that whichever response actually goes out next -
+    // the plain OK, or the resume question that replaces it - carries the vault material with it.
+    // Exactly one response per request is the invariant this exists to avoid breaking.
+    bool send_vault_info_ = false;
+    // Set by write_response_json(), cleared before each request is dispatched. Lets the exception
+    // net around handle_request() answer a request that has not been answered yet without ever
+    // sending a second response to one that has (the one-response-per-request invariant).
+    bool responded_ = false;
     uint64_t session_id_; // Unique among live sessions, identifies this session as the holder of the per-user lock
+    // The lock of a transfer (or of a tier change waiting on its confirmation), which outlives the
+    // handler that took it. A synchronous handler keeps its UserLock on the stack instead and never
+    // touches this; one that hands its lock to a later state moves it in here on the success path
+    // only, so every error path still releases by simply returning.
+    UserLock lock_;
 
-    // Per user lock, taken and released on behalf of this session only
-    bool acquire_lock();
-    void release_lock();
+    // The only place a UserLock is constructed: it is what supplies session_id_ as the owner, which
+    // is what stops one session of a user releasing another session's lock (bug #11).
+    UserLock acquire_lock();
 
     // Read loop and write using json protocol for communication
     void read_header_json(); // read header of json message using async_read, call read_body_json()
     void read_body_json(); // read message of json message using async_read, call handle_response(), then read_next()
     void write_response_json(const nlohmann::json& j); // send json message using async_write
+    // Last-resort handling for an exception escaping a request or chunk handler, so one session's
+    // unexpected failure cannot terminate the process for every other session. state_before is the
+    // state the handler was entered in; a request that neither answered nor moved the state gets a
+    // 500 and the session carries on, anything else ends this session only.
+    void recover_from_exception(const char* where, const std::exception& e, SessionState state_before);
+    // Answers 500 and closes the session when users.json cannot be read. True if it is usable.
+    bool require_database();
+    void refuse_database(); // The 500-and-close half of require_database()
 
     // Special write which calls finish_exit()
     void write_response_json_exit(const nlohmann::json& j);
@@ -117,6 +144,17 @@ private:
     void tiers(protocol::Request& req); // List storage media configured on the server, no lock needed
     void set_tier(protocol::Request& req); // Check arguments, acquire per user lock, ask for confirmation
     void finish_set_tier(); // Runs the migration after the user confirmed, releases per user lock
+
+    // Vault. The server stores and returns sealed blobs it cannot open; none of these handlers
+    // performs any cryptography, which is the whole point of the design.
+    void vault_init(protocol::Request& req); // Record the salt, parameters and wrapped vault key, once
+    void enroll_device(protocol::Request& req); // Add a device that can unlock the vault
+    void revoke_device(protocol::Request& req); // Ask for confirmation before removing one
+    void finish_revoke_device(); // Removes the device after the user confirmed
+    void devices(protocol::Request& req); // List enrolled devices, no lock needed (same as tiers())
+
+    // Path relative to the user's root, in the form the DEK manifest is keyed by
+    std::string vault_key_for(const std::filesystem::path& absolute_path) const;
 
     // Upload - simular to clients download
     bool valid_file(const std::filesystem::path& partial_file, const std::array<uint8_t, crypto_generichash_BYTES>& expected);

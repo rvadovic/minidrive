@@ -17,7 +17,7 @@ public:
     // is a startup failure rather than a per-connection one.
     Server(asio::io_context& io_context, std::uint16_t port, StorageConfig config,
            std::shared_ptr<transport::StreamFactory> streams);
-    void start(); // Start accepting
+    bool start(); // Prepare storage and start accepting; false if storage could not be set up
     void exit_all_sessions(); // Exit all sessions, triggered by signal
 
 private:

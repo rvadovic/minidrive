@@ -11,6 +11,7 @@ inline constexpr const int FORBIDDEN = 403;
 inline constexpr const int NOT_FOUND = 404;
 inline constexpr const int CONFLICT = 409;
 inline constexpr const int PRECONDITION_FAILED = 412;
+inline constexpr const int TOO_MANY_REQUESTS = 429; // Auth lockout; maps 1:1 onto the REST code if that ever ships
 
 inline constexpr const int INTERNAL_SERVER_ERROR = 500;
 inline constexpr const int SERVICE_UNAVAILABLE = 503;

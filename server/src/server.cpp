@@ -18,9 +18,10 @@ Server::Server(asio::io_context& io_context, std::uint16_t port, StorageConfig c
     : acceptor_(io_context, tcp::endpoint(tcp::v4(), port)), streams_(std::move(streams)) {
     storage_ = std::make_shared<Storage>(std::move(config));
 }
-void Server::start(){
-    storage_->setup();
+bool Server::start(){
+    if(!storage_->setup()) return false;
     accept();
+    return true;
 }
 
 void Server::exit_all_sessions() {

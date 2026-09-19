@@ -28,14 +28,20 @@ constexpr auto TRANSFER_TIMEOUT = std::chrono::hours(1); // Transfer is deleted 
 
 // Partial metadata for file sufficient for resumed transfer
 struct PartialMetadataEntry {
-    uint32_t id; // Id of transfer
-    std::filesystem::path absolute_path; // Absolute destination path
-    uint32_t size; // Final size
-    std::array<uint8_t, crypto_generichash_BYTES> file_hash; //Final file hash
-    TransferType type; // Download/ Upload
-    std::vector<protocol::ChunkInfo> chunks; // Chunks, their indexes, sizes, hashes
-    std::vector<bool> chunk_state; // bitmap of transferred chunks
-    std::chrono::system_clock::time_point last_activity; // last update of data
+    uint32_t id = 0; // Id of transfer
+    std::filesystem::path absolute_path{}; // Absolute destination path
+    uint32_t size = 0; // Final size
+    std::array<uint8_t, crypto_generichash_BYTES> file_hash{}; //Final file hash
+    TransferType type = TransferType::UPLOAD; // Download/ Upload
+    std::vector<protocol::ChunkInfo> chunks{}; // Chunks, their indexes, sizes, hashes
+    std::vector<bool> chunk_state{}; // bitmap of transferred chunks
+    std::chrono::system_clock::time_point last_activity{}; // last update of data
+    // Vault bookkeeping, empty for a plain transfer. An interrupted upload into a vaulted account
+    // has to remember which data key its ciphertext was produced under, otherwise resuming it
+    // would store bytes nobody can ever open again.
+    protocol::WrappedBlob wrapped_dek{};
+    std::string plaintext_hash{};
+    uint32_t plaintext_size = 0;
 };
 
 // File-based JSON database of partial file metadata for resuming unfinished transfers
@@ -50,7 +56,9 @@ public:
     uint32_t add_partial_metadata(TransferType type, fsutils::FileMetadata fmeta, std::vector<protocol::ChunkInfo> chunks, uint32_t id);
     void delete_partial_metadata(uint32_t id); // Delete entry
     void mark_chunk_received(uint32_t id, uint32_t chunk_index); // Mark chunk at index was sucesfully transfered
-    void save(); // save entries_ to file, triggered manually, mostly during exit
+    // Attach the vault bookkeeping of a transfer into an end-to-end encrypted account
+    void set_vault_info(uint32_t id, const protocol::WrappedBlob& wrapped_dek, const std::string& plaintext_hash, uint32_t plaintext_size);
+    bool save(); // save entries_ to file, triggered manually, mostly during exit. Never throws; false on failure
     std::vector<PartialMetadataEntry> get_entries(); // get all entries
     std::optional<PartialMetadataEntry> get_entry(uint32_t id); // get single entry by id, for resume
 

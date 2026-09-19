@@ -11,6 +11,10 @@ lab/certs/
 *.pin
 *.srl
 
+# Vault device private keys. The client writes these under data/ (already ignored below), but the
+# rule is deliberately broader: a device's private half must never reach the repository.
+devices.json
+
 # Local runtime data (sample server/client roots, test fixtures)
 data/
 

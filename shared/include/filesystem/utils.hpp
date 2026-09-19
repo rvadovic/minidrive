@@ -49,6 +49,11 @@ namespace fsutils {
     // File operations
     bool create_empty_file(const fs::path& path);
     bool remove_file(const fs::path& path);
+    // Crash-safe, race-safe file replace: write to a uniquely named temp in the same directory,
+    // then rename over the target. Never throws - a filesystem_error escaping into an asio handler
+    // calls std::terminate. owner_only restricts the temp file to 0600 before anything is written,
+    // so secret contents are never readable by other accounts, not even briefly.
+    bool atomic_write_file(const fs::path& path, const std::string& contents, bool owner_only = false);
 
     // Copy and move
     bool copy_path(const fs::path& src, const fs::path& dest, bool overwrite = false); // Create parent directories too

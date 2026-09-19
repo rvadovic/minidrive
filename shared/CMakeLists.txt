@@ -2,6 +2,7 @@ add_library(minidrive_shared STATIC
     src/version.cpp
     src/minidrive/logging.cpp
     src/protocol/message.cpp
+    src/crypto/base64.cpp
     src/filesystem/utils.cpp
     src/filesystem/partmeta.cpp
     src/transport/stream.cpp

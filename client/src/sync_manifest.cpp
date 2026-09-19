@@ -2,6 +2,7 @@
 
 #include <fstream>
 #include <nlohmann/json.hpp>
+#include "filesystem/utils.hpp"
 
 using nlohmann::json;
 
@@ -102,17 +103,5 @@ bool SyncManifest::save() {
         });
     }
 
-    std::filesystem::path tmp = manifest_file_;
-    tmp += ".tmp";
-
-    {
-        std::ofstream f(tmp);
-        if(!f) return false;
-        f << j.dump(4);
-        if(!f) return false;
-    }
-
-    std::error_code ec;
-    std::filesystem::rename(tmp, manifest_file_, ec);
-    return !ec;
+    return fsutils::atomic_write_file(manifest_file_, j.dump(4));
 }

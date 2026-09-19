@@ -57,6 +57,67 @@ void from_json(const json& j, TierInfo& ti) {
     };
 }
 
+// Optional sub-objects are omitted entirely when empty rather than sent as nulls, matching the
+// existing chunks/files/tiers convention: a peer that predates the vault sees the same messages.
+void to_json(json& j, const WrappedBlob& wb) {
+    j = json::object();
+    j["ciphertext"] = wb.ciphertext;
+    j["nonce"] = wb.nonce;
+    if(!wb.kem_ct.empty()) j["kem_ct"] = wb.kem_ct;
+    if(!wb.eph_pub.empty()) j["eph_pub"] = wb.eph_pub;
+}
+
+void from_json(const json& j, WrappedBlob& wb) {
+    wb.ciphertext = j.value("ciphertext", std::string());
+    wb.nonce = j.value("nonce", std::string());
+    wb.kem_ct = j.value("kem_ct", std::string());
+    wb.eph_pub = j.value("eph_pub", std::string());
+}
+
+void to_json(json& j, const DeviceInfo& di) {
+    j = {
+        {"device_id", di.device_id},
+        {"device_name", di.device_name},
+        {"algorithm", di.algorithm},
+        {"x25519_pub", di.x25519_pub},
+        {"mlkem_pub", di.mlkem_pub},
+        {"created_at", di.created_at},
+        {"last_seen", di.last_seen}
+    };
+    if(!di.wrapped_vk.empty()) j["wrapped_vk"] = di.wrapped_vk;
+}
+
+void from_json(const json& j, DeviceInfo& di) {
+    di.device_id = j.value("device_id", std::string());
+    di.device_name = j.value("device_name", std::string());
+    di.algorithm = j.value("algorithm", std::string());
+    di.x25519_pub = j.value("x25519_pub", std::string());
+    di.mlkem_pub = j.value("mlkem_pub", std::string());
+    di.created_at = j.value("created_at", uint64_t{0});
+    di.last_seen = j.value("last_seen", uint64_t{0});
+    if(j.contains("wrapped_vk")) from_json(j.at("wrapped_vk"), di.wrapped_vk);
+}
+
+void to_json(json& j, const VaultInfo& vi) {
+    j = {
+        {"enabled", vi.enabled},
+        {"salt", vi.salt},
+        {"opslimit", vi.opslimit},
+        {"memlimit", vi.memlimit},
+        {"algorithm", vi.algorithm}
+    };
+    if(!vi.wrapped_vk_password.empty()) j["wrapped_vk_password"] = vi.wrapped_vk_password;
+}
+
+void from_json(const json& j, VaultInfo& vi) {
+    vi.enabled = j.value("enabled", false);
+    vi.salt = j.value("salt", std::string());
+    vi.opslimit = j.value("opslimit", uint64_t{0});
+    vi.memlimit = j.value("memlimit", uint64_t{0});
+    vi.algorithm = j.value("algorithm", 0);
+    if(j.contains("wrapped_vk_password")) from_json(j.at("wrapped_vk_password"), vi.wrapped_vk_password);
+}
+
 void to_json(json& j, const Request& req) {
     j = {
         {"cmd", req.cmd},
@@ -68,6 +129,20 @@ void to_json(json& j, const Request& req) {
 
     if(!req.chunks.empty()) {
         j["chunks"] = req.chunks;
+    }
+
+    if(req.vault.enabled) {
+        j["vault"] = req.vault;
+    }
+
+    if(!req.device.x25519_pub.empty()) {
+        j["device"] = req.device;
+    }
+
+    if(!req.wrapped_dek.empty()) {
+        j["wrapped_dek"] = req.wrapped_dek;
+        j["plaintext_hash"] = req.plaintext_hash;
+        j["plaintext_size"] = req.plaintext_size;
     }
 }
 
@@ -90,6 +165,19 @@ void to_json(json& j, const Response& res) {
     if(!res.tiers.empty()) {
         j["tiers"] = res.tiers;
     }
+
+    if(res.vault.enabled) {
+        j["vault"] = res.vault;
+    }
+
+    if(!res.devices.empty()) {
+        j["devices"] = res.devices;
+    }
+
+    if(!res.wrapped_dek.empty()) {
+        j["wrapped_dek"] = res.wrapped_dek;
+        j["plaintext_hash"] = res.plaintext_hash;
+    }
 }
 
 void from_json(const json& j, Request& req) {
@@ -103,6 +191,19 @@ void from_json(const json& j, Request& req) {
         req.chunks = j.at("chunks").get<std::vector<ChunkInfo>>();
     }
 
+    if(j.contains("vault")) {
+        from_json(j.at("vault"), req.vault);
+    }
+
+    if(j.contains("device")) {
+        from_json(j.at("device"), req.device);
+    }
+
+    if(j.contains("wrapped_dek")) {
+        from_json(j.at("wrapped_dek"), req.wrapped_dek);
+        req.plaintext_hash = j.value("plaintext_hash", std::string());
+        req.plaintext_size = j.value("plaintext_size", uint32_t{0});
+    }
 }
 
 void from_json(const json& j, Response& res) {
@@ -121,6 +222,19 @@ void from_json(const json& j, Response& res) {
 
     if(j.contains("tiers")) {
         res.tiers = j.at("tiers").get<std::vector<TierInfo>>();
+    }
+
+    if(j.contains("vault")) {
+        from_json(j.at("vault"), res.vault);
+    }
+
+    if(j.contains("devices")) {
+        res.devices = j.at("devices").get<std::vector<DeviceInfo>>();
+    }
+
+    if(j.contains("wrapped_dek")) {
+        from_json(j.at("wrapped_dek"), res.wrapped_dek);
+        res.plaintext_hash = j.value("plaintext_hash", std::string());
     }
 }
 

@@ -11,6 +11,7 @@
 #include "filesystem/utils.hpp"
 #include "transport/tls.hpp"
 #include <filesystem>
+#include <optional>
 #include <sodium.h>
 #include <sys/stat.h>
 
@@ -323,16 +324,36 @@ int main(int argc, char* argv[]) {
     spdlog::info("Transport: {}", streams->describe());
 
     asio::io_context io_context;
-    Server server(io_context, port, StorageConfig{root, tiers, default_tier}, streams);
+    std::optional<Server> server;
+    try {
+        server.emplace(io_context, port, StorageConfig{root, tiers, default_tier}, streams);
+    } catch(const std::system_error& e) {
+        // The acceptor binds in Server's constructor. Uncaught, this aborted with rc=134 and a raw
+        // "terminate called" after the startup banner - so a leftover server from a previous run
+        // kept serving and the failure looked like a healthy start.
+        spdlog::critical("Cannot listen on port {}: {}", port, e.code().message());
+        std::cerr << "Cannot listen on port " << port << ": " << e.code().message()
+                  << "\nIs another server already running on this port?" << std::endl;
+        return 1;
+    }
 
     asio::signal_set signals(io_context, SIGINT, SIGTERM);
     signals.async_wait([&](const std::error_code& ec, int) {
         spdlog::info("Signal received, shutting down...");
-        server.exit_all_sessions();
+        server->exit_all_sessions();
     });
 
     spdlog::info("Starting async server (version {}) on port {}", minidrive::resolved_version(), port);
-    server.start();
+    bool started = false;
+    try {
+        started = server->start();
+    } catch(const std::exception& e) {
+        spdlog::critical("Server setup failed: {}", e.what());
+    }
+    if(!started) {
+        std::cerr << "Server setup failed; see the log for details." << std::endl;
+        return 1;
+    }
 
     const unsigned int thread_count =  std::max(1u, std::thread::hardware_concurrency());
 
