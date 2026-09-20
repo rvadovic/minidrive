@@ -436,6 +436,30 @@ def test_device_enrollment_and_revocation(env, results):
 
     stdout, _ = env.run_user("dave", "pw_dave", ["ENROLL_DEVICE laptop", "DEVICES"], "enroll", cwd=home)
 
+    # Device keys are hybrid X25519+ML-KEM-768, and ML-KEM needs OpenSSL 3.5+. Against an older
+    # library the client refuses to enroll rather than quietly handing back a classical-only key,
+    # so - like the tls suite's hybrid-group test - this asserts whichever of the two applies.
+    refused = "ML-KEM-768" in (stdout or "") or "no OpenSSL" in (stdout or "")
+    if refused:
+        with open(env.vault_json("dave")) as f:
+            if json.load(f).get("devices"):
+                results.fail("Enrollment refused without ML-KEM",
+                             "the client refused but a device was still enrolled on the server")
+                return
+        results.ok("Enrollment refused, not downgraded, where OpenSSL has no ML-KEM-768")
+
+        # The password path is the one that must keep working on such a build
+        local = make_local(env, "dave.txt", "password unlocked this")
+        env.run_user("dave", "pw_dave", f"UPLOAD {local} dave.txt", "no_mlkem_upload", cwd=home)
+        stdout, _ = env.run_user("dave", "pw_dave", "DOWNLOAD dave.txt dave_back.txt",
+                                 "no_mlkem_download", cwd=home)
+        back = os.path.join(home, "dave_back.txt")
+        if not os.path.exists(back) or open(back).read().strip() != "password unlocked this":
+            results.fail("Password unlock works without ML-KEM", f"transcript: {stdout!r}")
+            return
+        results.ok("Password unlock works without ML-KEM")
+        return
+
     if "enrolled" not in (stdout or "").lower():
         results.fail("A device can be enrolled", f"transcript: {stdout!r}")
         return
