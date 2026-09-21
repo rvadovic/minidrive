@@ -92,7 +92,10 @@ class TlsEnv(TestEnvironment):
     def run_client(self, commands, address=None, client_args=None, cwd=None, timeout=30):
         """Run one client to completion. client_args, when given, replaces the suite defaults."""
         address = address or f"127.0.0.1:{self.port}"
-        args = ["stdbuf", "-o0", "-e0", CLIENT_EXE, address]
+        # stdbuf only where it exists, as in test_utils: Alpine (the static-client CI job) and macOS
+        # have none, and the output is read after the client exits, so it is not needed for that.
+        args = ["stdbuf", "-o0", "-e0"] if shutil.which("stdbuf") else []
+        args += [CLIENT_EXE, address]
         args.extend(self.extra_client_args if client_args is None else client_args)
 
         proc = subprocess.Popen(
