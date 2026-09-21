@@ -3,7 +3,6 @@
 #include <vector>
 #include <spdlog/spdlog.h>
 #include "client.hpp"
-#include "terminalNoEcho.hpp"
 #include "protocol/message.hpp"
 #include "protocol/commands.hpp"
 #include "protocol/codes.hpp"
@@ -21,12 +20,13 @@ using nlohmann::json;
 
 Client::Client(const std::string& username, asio::io_context& io_context,
                std::shared_ptr<asio::executor_work_guard<asio::io_context::executor_type>> guard,
-               std::shared_ptr<transport::StreamFactory> streams)
+               std::shared_ptr<transport::StreamFactory> streams,
+               std::unique_ptr<clientio::IClientIo> io)
     : username_(username),
       io_context_(io_context),
       stream_(streams->create(tcp::socket(io_context))),
       secure_(streams->is_tls()),
-      input_(io_context_, ::dup(STDIN_FILENO)),
+      io_(std::move(io)),
       guard_(std::move(guard)),
       commands_{
           {"LIST",     [this](auto& iss){ cmd_list(iss); }},
@@ -50,11 +50,15 @@ Client::Client(const std::string& username, asio::io_context& io_context,
           {"ENROLL_DEVICE", [this](auto& iss){ cmd_enroll_device(iss); }},
           {"REVOKE_DEVICE", [this](auto& iss){ cmd_revoke_device(iss); }},
       } {
-        is_tty_ = ::isatty(STDIN_FILENO) != 0;
-        current_prompt_ = PROMPT;
-        if(is_tty_) {
-            raw_guard_ = std::make_unique<TerminalRaw>();
-        }
+        // A line arriving is the one place reading_line_ is cleared: the channel hands over
+        // exactly one line per read_line(), and the client is free to arm the next read from
+        // anywhere once it has it (see Known Bug #1 round 2).
+        io_->set_handlers(
+            [this](std::string line) {
+                reading_line_ = false;
+                handle_request(line);
+            },
+            [this]() { exit(); }); // input channel closed: stdin EOF, or the host went away
         setup();
     }
 
@@ -99,14 +103,11 @@ void Client::connect(const std::string& host, uint16_t port) {
 }
 
 void Client::print(int code, const std::string& message, bool prompt) {
-    if(code == protocol::codes::OK) {
-        std::cout << "OK" << ": " << message << std::endl;
-    } else {
-        std::cout << "ERROR" << ": " << "<" << code << ">" << " " << message << std::endl;
-    }
-    if(prompt) {
-        std::cout << current_prompt_ << std::flush;
-    }
+    io_->result(code, message, prompt);
+}
+
+void Client::info(const std::string& text) {
+    io_->info(text);
 }
 
 void Client::setup() {
@@ -168,189 +169,52 @@ void Client::read_line() {
     if(exiting_ || reading_line_) return;
 
     reading_line_ = true;
+    io_->read_line(prompt_kind());
+}
 
-    if(is_tty_) {
-        read_char();
-        return;
+// Derived from state_ rather than set at each call site, so a new command that arms input cannot
+// forget to declare what it is asking for. The terminal ignores it; the IPC channel turns it into
+// the PROMPT frame that tells a GUI whether to show a command box, a password field or Yes/No.
+clientio::PromptKind Client::prompt_kind() const {
+    switch(state_) {
+        case ClientState::AUTH:
+            return clientio::PromptKind::Password;
+        case ClientState::NEED_INPUT:
+        case ClientState::NEED_INPUT_RESUME_TRANSFER:
+            return clientio::PromptKind::Confirm;
+        default:
+            return clientio::PromptKind::Command;
+    }
+}
+
+// Transfer progress, for whoever is driving this client. A terminal drops these; the IPC channel
+// forwards them so a GUI has something to draw without polling. Throttled because a 500 MB file is
+// ~2,000 chunks, but the first and last of a transfer always go out so a progress bar starts at 0
+// and ends at 100 rather than wherever the throttle happened to land.
+void Client::emit_progress(const char* direction, bool force) {
+    const size_t total_chunks = transfer_.chunk_state.size();
+    if(total_chunks == 0) return;
+
+    const auto now = std::chrono::steady_clock::now();
+    if(!force && (now - last_progress_) < PROGRESS_INTERVAL) return;
+    last_progress_ = now;
+
+    size_t done = 0;
+    for(size_t i = 0; i < total_chunks; ++i) {
+        if(transfer_.chunk_state[i]) done++;
     }
 
-    asio::async_read_until(input_, asio::dynamic_buffer(input_buffer_), '\n',[this](std::error_code ec, std::size_t length) {
-        reading_line_ = false;
-        if(!ec) {
-            std::string line = input_buffer_.substr(0, length - 1); // remove '\n'
-            input_buffer_.erase(0, length);
-
-            asio::post(io_context_, [this, line = std::move(line)] {
-                handle_request(line);
-            });
-
-
-        } else if(ec != asio::error::operation_aborted) {
-            std::cerr << "Input error: " << ec.message() << "\n";
-            exit();
-        }
+    io_->event(nlohmann::json{
+        {"event", "transfer_progress"},
+        {"direction", direction},
+        {"path", transfer_.fmeta.absolute_path.string()},
+        {"transfer_id", transfer_.transfer_id},
+        {"chunks_done", done},
+        {"chunks_total", total_chunks},
+        {"bytes_total", transfer_.fmeta.size}
     });
 }
 
-void Client::read_char() {
-    asio::async_read(input_, asio::buffer(&char_buf_, 1), [this](std::error_code ec, std::size_t /*length*/) {
-        if(ec) {
-            reading_line_ = false;
-            if(ec != asio::error::operation_aborted) {
-                std::cerr << "Input error: " << ec.message() << "\n";
-                exit();
-            }
-            return;
-        }
-        process_char(char_buf_);
-    });
-}
-
-void Client::refresh_line() {
-    std::string out = "\r\x1b[K" + current_prompt_;
-    if(!masked_) {
-        out += line_buffer_;
-        size_t back = line_buffer_.size() - cursor_;
-        if(back > 0) {
-            out += "\x1b[" + std::to_string(back) + "D";
-        }
-    }
-    std::cout << out << std::flush;
-}
-
-void Client::history_prev() {
-    if(masked_ || history_.empty()) return;
-    if(history_pos_ == history_.size()) {
-        history_saved_ = line_buffer_;
-    }
-    if(history_pos_ > 0) {
-        history_pos_--;
-        line_buffer_ = history_[history_pos_];
-        cursor_ = line_buffer_.size();
-        refresh_line();
-    }
-}
-
-void Client::history_next() {
-    if(masked_ || history_pos_ >= history_.size()) return;
-    history_pos_++;
-    line_buffer_ = (history_pos_ == history_.size()) ? history_saved_ : history_[history_pos_];
-    cursor_ = line_buffer_.size();
-    refresh_line();
-}
-
-void Client::handle_csi_final(const std::string& params, char final_byte) {
-    if(!params.empty() && params.front() == 'O') { // ESC O <letter> (Home/End on some terminals)
-        if(final_byte == 'H') { cursor_ = 0; refresh_line(); }
-        else if(final_byte == 'F') { cursor_ = line_buffer_.size(); refresh_line(); }
-        return;
-    }
-
-    switch(final_byte) {
-        case 'A': history_prev(); break;
-        case 'B': history_next(); break;
-        case 'C': if(cursor_ < line_buffer_.size()) { cursor_++; refresh_line(); } break;
-        case 'D': if(cursor_ > 0) { cursor_--; refresh_line(); } break;
-        case 'H': cursor_ = 0; refresh_line(); break;
-        case 'F': cursor_ = line_buffer_.size(); refresh_line(); break;
-        case '~':
-            if(params == "3" && cursor_ < line_buffer_.size()) { // Delete
-                line_buffer_.erase(cursor_, 1);
-                refresh_line();
-            } else if(params == "1") { // Home
-                cursor_ = 0;
-                refresh_line();
-            } else if(params == "4") { // End
-                cursor_ = line_buffer_.size();
-                refresh_line();
-            }
-            break;
-        default: break;
-    }
-}
-
-void Client::process_char(char c) {
-    unsigned char uc = static_cast<unsigned char>(c);
-
-    if(esc_state_ == EscState::ESC) {
-        if(uc == '[') {
-            esc_state_ = EscState::CSI;
-            csi_params_.clear();
-        } else if(uc == 'O') {
-            esc_state_ = EscState::CSI;
-            csi_params_ = "O";
-        } else {
-            esc_state_ = EscState::NONE; // unrecognized escape, drop
-        }
-        read_char();
-        return;
-    }
-
-    if(esc_state_ == EscState::CSI) {
-        if(((uc >= '0' && uc <= '9') || uc == ';') && csi_params_.size() < 8) {
-            csi_params_ += static_cast<char>(uc);
-            read_char();
-            return;
-        }
-        handle_csi_final(csi_params_, static_cast<char>(uc));
-        esc_state_ = EscState::NONE;
-        csi_params_.clear();
-        read_char();
-        return;
-    }
-
-    if(uc == '\x1b') {
-        esc_state_ = EscState::ESC;
-        read_char();
-        return;
-    }
-
-    if(uc == '\r' || uc == '\n') {
-        std::cout << "\r\n";
-        std::string line = line_buffer_;
-        if(!masked_ && !line.empty() && (history_.empty() || history_.back() != line)) {
-            history_.push_back(line);
-        }
-        history_pos_ = history_.size();
-        history_saved_.clear();
-        line_buffer_.clear();
-        cursor_ = 0;
-        reading_line_ = false;
-        asio::post(io_context_, [this, line = std::move(line)] {
-            handle_request(line);
-        });
-        return;
-    }
-
-    if(uc == 127 || uc == 8) { // Backspace
-        if(cursor_ > 0) {
-            line_buffer_.erase(cursor_ - 1, 1);
-            cursor_--;
-            refresh_line();
-        }
-        read_char();
-        return;
-    }
-
-    if(uc == 4) { // Ctrl-D
-        if(line_buffer_.empty()) {
-            std::cout << "\r\n";
-            reading_line_ = false;
-            exit();
-            return;
-        }
-        read_char();
-        return;
-    }
-
-    if(uc >= 32 && uc < 127) { // Printable
-        line_buffer_.insert(line_buffer_.begin() + static_cast<std::string::difference_type>(cursor_), static_cast<char>(uc));
-        cursor_++;
-        refresh_line();
-    }
-
-    read_char();
-}
 
 // Never log a password in plaintext: AUTH requests carry it as first_argument. The wire itself is
 // still plaintext until transport encryption lands, but the log file at least shouldn't be a
@@ -509,19 +373,6 @@ void Client::read_next() {
     }
 }
 
-void Client::on_password_required() {
-    if(is_tty_) {
-        masked_ = true;
-        current_prompt_ = "Password for " + username_ + ": ";
-        line_buffer_.clear();
-        cursor_ = 0;
-        std::cout << current_prompt_ << std::flush;
-    } else {
-        password_guard_ = std::make_unique<TerminalNoEcho>();
-        std::cout << "Password for " << username_ << ": " << std::flush;
-    }
-}
-
 void Client::handle_error(const std::error_code& ec) {
     spdlog::warn("Network error: {} ({})", ec.message(), ec.value());
     if(ec.value() != 125) {
@@ -550,7 +401,7 @@ void Client::handle_response(const json& j) {
     if(res.status == protocol::statuses::AUTH) {
         state_ = ClientState::AUTH;
         print(res.code, res.message, false);
-        on_password_required();
+        io_->begin_password("Password for " + username_ + ": ");
         read_line();
         return;
     } else if (res.status == protocol::statuses::EXIT) {
@@ -689,13 +540,7 @@ void Client::handle_request(const std::string& line) {
     }
 
     if(state_ == ClientState::AUTH) {
-        if(is_tty_) {
-            masked_ = false;
-            current_prompt_ = PROMPT;
-        } else {
-            password_guard_.reset();
-            std::cout << std::endl;
-        }
+        io_->end_password();
         auth(line);
 
     } else if(state_ == ClientState::READY) {
@@ -747,6 +592,7 @@ void Client::handle_chunk(const protocol::ChunkHeader& ch, const std::vector<uin
             uploading();
         } else if (ch.flags == protocol::flags::DONE) {
             transfer_.chunk_state[ch.index] = true;
+            emit_progress("upload", /*force=*/true); // last reading, before upload_done() clears transfer_
             print(protocol::codes::OK, "Upload successful", !batch_active_);
             upload_done();
             return;
@@ -856,7 +702,7 @@ void Client::exit() {
 
     if(!exiting_.compare_exchange_strong(expected, true)) return; // Prevent multiple running exit() 
 
-    input_.cancel();
+    io_->cancel();
 
     bool socket_opened = stream_->is_open();
 
@@ -908,7 +754,7 @@ void Client::finish_exit() {
 
 void Client::cmd_help(std::istringstream& iss) {
     for (const auto& [key, value] : commands_) {
-        std:: cout << key << std::endl;
+        info(key);
     }
     print(protocol::codes::OK, "The syntax of filesystem commands is: \"Command\" \"what\" \"where\"");
     read_line();
@@ -1321,7 +1167,7 @@ void Client::cmd_vault_init(std::istringstream& iss) {
 
     // Deliberately slow - this is the one derivation standing between a password and every file.
     // It blocks this thread for a second or two, which is why it happens here and not per file.
-    std::cout << "Deriving your vault key (this takes a moment)..." << std::endl;
+    info("Deriving your vault key (this takes a moment)...");
 
     vault::Key master{};
     if(!vault::derive_master_key(password_, salt, params, master)) {
@@ -1367,21 +1213,18 @@ void Client::cmd_vault_status(std::istringstream& iss) {
     (void)iss;
 
     if(!vault_info_.enabled) {
-        std::cout << "Vault: not set up for this account. Run VAULT_INIT to turn on end-to-end encryption."
-                  << std::endl;
+        info("Vault: not set up for this account. Run VAULT_INIT to turn on end-to-end encryption.");
     } else if(vault_key_) {
-        std::cout << "Vault: unlocked. Uploads are encrypted locally and the server stores only ciphertext."
-                  << std::endl;
-        std::cout << "  Argon2id: opslimit " << vault_info_.opslimit
-                  << ", memlimit " << vault_info_.memlimit << " bytes" << std::endl;
+        info("Vault: unlocked. Uploads are encrypted locally and the server stores only ciphertext.");
+        info("  Argon2id: opslimit " + std::to_string(vault_info_.opslimit) +
+             ", memlimit " + std::to_string(vault_info_.memlimit) + " bytes");
         if(device_keys_) {
-            std::cout << "  This device is enrolled as '" << device_keys_->device_name << "'." << std::endl;
+            info("  This device is enrolled as '" + device_keys_->device_name + "'.");
         } else {
-            std::cout << "  This device is not enrolled. ENROLL_DEVICE skips the password derivation next time."
-                      << std::endl;
+            info("  This device is not enrolled. ENROLL_DEVICE skips the password derivation next time.");
         }
     } else {
-        std::cout << "Vault: set up, but locked. Encrypted files cannot be read in this session." << std::endl;
+        info("Vault: set up, but locked. Encrypted files cannot be read in this session.");
     }
 
     print(protocol::codes::OK, "Vault status reported.");
@@ -1664,17 +1507,17 @@ bool Client::scan_local_tree(const std::filesystem::path& dir, std::map<std::str
 void Client::handle_tiers_listing(const protocol::Response& res) {
     // The server only ever sends names and descriptions here, never its filesystem paths
     for(const auto& tier : res.tiers) {
-        std::cout << (tier.is_current ? "  * " : "    ") << tier.name;
+        std::string line = (tier.is_current ? "  * " : "    ") + tier.name;
         if(!tier.description.empty()) {
-            std::cout << "  -  " << tier.description;
+            line += "  -  " + tier.description;
         }
         if(tier.is_current) {
-            std::cout << "  (current)";
+            line += "  (current)";
         }
-        std::cout << std::endl;
+        info(line);
     }
     if(!res.tiers.empty()) {
-        std::cout << "Use SET_TIER <name> to move your data to another medium." << std::endl;
+        info("Use SET_TIER <name> to move your data to another medium.");
     }
     command_finished(true);
 }
@@ -1683,18 +1526,17 @@ void Client::handle_devices_listing(const protocol::Response& res) {
     vault_devices_ = res.devices;
 
     if(res.devices.empty()) {
-        std::cout << "  (no devices enrolled)" << std::endl;
+        info("  (no devices enrolled)");
     }
     for(const protocol::DeviceInfo& device : res.devices) {
         const bool is_this_device = device_keys_ && device_keys_->device_id == device.device_id;
-        std::cout << (is_this_device ? "  * " : "    ") << device.device_id
-                  << "  " << device.device_name
-                  << "  [" << device.algorithm << "]";
-        if(is_this_device) std::cout << "  (this device)";
-        std::cout << std::endl;
+        std::string line = (is_this_device ? "  * " : "    ") + device.device_id +
+                           "  " + device.device_name +
+                           "  [" + device.algorithm + "]";
+        if(is_this_device) line += "  (this device)";
+        info(line);
     }
-    std::cout << "Use ENROLL_DEVICE <name> to add this machine, or REVOKE_DEVICE <id> to remove one."
-              << std::endl;
+    info("Use ENROLL_DEVICE <name> to add this machine, or REVOKE_DEVICE <id> to remove one.");
     command_finished(true);
 }
 
@@ -1888,7 +1730,7 @@ void Client::finish_batch() {
     }
 
     for(const std::string& conflict : batch_conflicts_) {
-        std::cout << "CONFLICT: " << conflict << std::endl;
+        info("CONFLICT: " + conflict);
     }
 
     std::ostringstream summary;
@@ -1960,6 +1802,9 @@ void Client::uploading() {
     if(data.empty()) {
         return;
     }
+    // Forced on the first chunk so a progress bar starts from a real reading rather than from
+    // whenever the throttle first lets one through.
+    emit_progress("upload", /*force=*/index == 0);
     send_chunk(chunk_header, data);
 }
 
@@ -2141,6 +1986,8 @@ void Client::downloading(const uint32_t& index, const uint32_t& size, const std:
     };
 
     std::vector<uint8_t> response_data;
+
+    emit_progress("download", /*force=*/flag == protocol::flags::DONE);
 
     send_chunk(ch, response_data);
 

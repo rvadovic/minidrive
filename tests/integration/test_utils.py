@@ -201,19 +201,29 @@ class TestEnvironment:
             # Default to False if check fails to be safe
             return False
 
-    def start_client_process(self, address, log_file=None, cwd=None, text=True, bufsize=-1):
+    def start_client_process(self, address, log_file=None, cwd=None, text=True, bufsize=-1,
+                             extra_args=None):
         """
         Start the client process with appropriate arguments.
         Handles logging support check automatically.
+
+        extra_args are appended for this one client only, unlike self.extra_client_args which the
+        whole suite shares. The ipc suite uses it to give each client its own --ipc socket.
         """
         if self.supports_logging is None:
             self.supports_logging = self._check_logging_support()
-            
-        # Use stdbuf to force unbuffered output for interactive tests
-        args = ["stdbuf", "-o0", "-e0", CLIENT_EXE, address]
+
+        # Use stdbuf to force unbuffered output for interactive tests. macOS has no stdbuf, so it
+        # is used only where it exists - the IPC suite does not need it (its output is framed, not
+        # line-buffered text) and that is the only suite expected to run off Linux.
+        args = []
+        if shutil.which("stdbuf"):
+            args = ["stdbuf", "-o0", "-e0"]
+        args += [CLIENT_EXE, address]
         if self.supports_logging and log_file:
             args.extend(["--log", log_file])
         args.extend(self.extra_client_args)
+        args.extend(extra_args or [])
 
 
         return subprocess.Popen(

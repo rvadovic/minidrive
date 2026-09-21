@@ -1,13 +1,13 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <deque>
 #include <map>
 #include <asio/io_context.hpp>
 #include <asio/ip/tcp.hpp>
 #include <nlohmann/json.hpp>
-#include "terminalNoEcho.hpp"
-#include "terminalRaw.hpp"
+#include "client_io.hpp"
 #include "protocol/message.hpp"
 #include "transport/stream.hpp"
 #include "transport/tls.hpp"
@@ -67,9 +67,12 @@ class Client {
 public:
     // `streams` fixes the security posture for this client: rung 0 wraps a bare socket, rung 3.5
     // wraps one whose async_connect also runs the TLS handshake, chain validation and pin check.
+    // `io` fixes where commands come from and where results go - a terminal, or the IPC channel a
+    // GUI drives this binary through. Neither choice is visible to any command handler.
     Client(const std::string& username, asio::io_context& io_context,
            std::shared_ptr<asio::executor_work_guard<asio::io_context::executor_type>> guard,
-           std::shared_ptr<transport::StreamFactory> streams);
+           std::shared_ptr<transport::StreamFactory> streams,
+           std::unique_ptr<clientio::IClientIo> io);
     ~Client();
 
     // Connect and start listening loop
@@ -85,36 +88,24 @@ private:
     // signal handler and stdin reads - are already serialized.
     std::shared_ptr<transport::IStream> stream_;
     bool secure_; // Whether the transport is TLS, i.e. worth reporting what it negotiated
-    asio::posix::stream_descriptor input_;
+    // Where commands arrive from and where output goes. The only place in this class that knows
+    // whether it is driving a terminal or a GUI's socket.
+    std::unique_ptr<clientio::IClientIo> io_;
     std::shared_ptr<asio::executor_work_guard<asio::io_context::executor_type>> guard_;
     std::unordered_map<std::string, std::function<void(std::istringstream&)>> commands_; // Map of commands and their functions
-    std::thread input_thread_; // Input loop runs in this thread
     uint32_t msg_len_; // Message lenght for json read loop
-    std::string input_buffer_;
     std::vector<char> buffer_; // Buffer for json read loop
     protocol::ChunkHeader ch_; // Chunk header for binary read loop
     std::atomic<ClientState> state_ = ClientState::LOGIN; // State of client
-    std::unique_ptr<TerminalNoEcho> password_guard_; // Turns off echo in cmd (non-tty / piped input path)
     std::atomic<bool> exiting_{false}; // Indicates exit has been called
-    std::atomic<bool> reading_line_{false}; // The input is being read from the terminal (only one read at a time)
+    std::atomic<bool> reading_line_{false}; // An input line is already being awaited (only one read at a time)
 
-    // Interactive line editor (only used when stdin is a real terminal; piped input, e.g. in
-    // integration tests, keeps using the plain async_read_until('\n') path unchanged below)
-    static constexpr const char* PROMPT = "> ";
-    bool is_tty_{false}; // Whether stdin is an interactive terminal
-    std::unique_ptr<TerminalRaw> raw_guard_; // Puts the terminal in raw mode for the whole session (tty only)
-    bool masked_{false}; // True while the current line shouldn't be echoed/recalled (password entry)
-    std::string current_prompt_; // Prompt text refresh_line() redraws ("> ", or "Password for X: " during auth)
-    std::string line_buffer_; // Current in-progress line (tty mode)
-    size_t cursor_{0}; // Cursor position within line_buffer_
-    char char_buf_{}; // Scratch buffer for one-byte-at-a-time async reads (tty mode)
-    std::vector<std::string> history_; // Previously submitted commands (tty mode, in-memory only)
-    size_t history_pos_{0}; // Position while browsing history_ (== history_.size() means "not browsing")
-    std::string history_saved_; // In-progress line stashed while browsing, restored by History-down past the end
-
-    enum class EscState { NONE, ESC, CSI };
-    EscState esc_state_{EscState::NONE}; // Parser state for ANSI escape sequences (arrow/home/end/delete keys)
-    std::string csi_params_; // Accumulated parameter bytes of the CSI sequence currently being parsed
+    // Transfer progress push notifications. Only the IPC channel does anything with these, and
+    // emitting one per chunk would be ~2,000 frames for a 500 MB file, so they are throttled to a
+    // steady trickle - with the first and last of a transfer always sent, so a GUI's progress bar
+    // reliably starts at 0 and finishes at 100.
+    static constexpr std::chrono::milliseconds PROGRESS_INTERVAL{150};
+    std::chrono::steady_clock::time_point last_progress_{};
     ActiveTransfer transfer_{UINT32_MAX, fsutils::FileMetadata{}, std::filesystem::path(""), {}, {}}; // Current active transfer info
     std::filesystem::path root_; // Client root
     std::optional<PartialMetadata> partmeta_; // Database for partial file metadata
@@ -164,23 +155,24 @@ private:
     size_t batch_failed_ = 0;
     std::vector<std::string> batch_conflicts_;
 
-    // Print to stdout
+    // The OK:/ERROR: result of a command
     void print(int code, const std::string& message, bool prompt = true);
+
+    // Free-form output that is not an OK/ERROR line (listings, vault status, conflict notices)
+    void info(const std::string& text);
 
     // Prepare the client root directory (./data/client_root)
     void setup();
 
-    // Input loop runs in input_thread, calls handle_request()
+    // Arm the input channel for exactly one line, which arrives back at handle_request()
     void read_line();
-    void input_loop();
 
-    // Interactive line editor (tty mode only, see members above)
-    void read_char(); // Reads a single byte from stdin, feeds it to process_char()
-    void process_char(char c); // Line-editing state machine: printable chars, backspace, escape sequences
-    void handle_csi_final(const std::string& params, char final_byte); // Dispatches a completed CSI escape sequence
-    void refresh_line(); // Redraws current_prompt_ + line_buffer_ in place
-    void history_prev(); // Up arrow: recall older history entry
-    void history_next(); // Down arrow: recall newer history entry / return to in-progress line
+    // What kind of answer the client is waiting for right now, derived from state_ so no command
+    // handler has to remember to say. Only the IPC channel uses it; a terminal prompts as it always did.
+    clientio::PromptKind prompt_kind() const;
+
+    // Transfer progress, for whoever is driving this client. Throttled - see PROGRESS_INTERVAL.
+    void emit_progress(const char* direction, bool force);
 
     // Read loop and write using json protocol for communication
     void read_header_json(); // read header of json message using async_read, call read_body_json()
@@ -288,7 +280,4 @@ private:
     void download_done(); // Delete partial metadata from database partmeta_ (client_root/.partial/partmeta.json)
     void download_abort(bool save, bool notify, uint8_t flag); // Delete or save partial file metadata, delete .part file, notify server with protocol::flag
     void download_abort_exit(bool save, bool notify, uint8_t flag); // calls finish_exit()
-
-    // Set cmd for password entry
-    void on_password_required();
 };

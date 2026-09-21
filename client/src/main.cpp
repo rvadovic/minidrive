@@ -1,8 +1,8 @@
 #include <iostream>
+#include <memory>
 #include <string>
 #include <cstring>
 #include <cerrno>
-#include <unistd.h>
 #include <asio.hpp>
 #include <sodium.h>
 #include <spdlog/spdlog.h>
@@ -10,6 +10,7 @@
 #include "minidrive/version.hpp"
 #include "minidrive/logging.hpp"
 #include "client.hpp"
+#include "client_io.hpp"
 #include "transport/tls.hpp"
 
 struct UserHostPort {
@@ -50,10 +51,14 @@ static bool parse_host_port(const std::string& input, UserHostPort& out) {
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " [username@]<host>:<port> [--log <log_file>] [--log-level <level>]"
+        std::cerr << "Usage: " << argv[0] << " [username@]<host>:<port> [--ipc <socket>]"
+                  << " [--log <log_file>] [--log-level <level>]"
                   << " [--rung <0|3.5>] [--tls-verify <none|ca|pinned>] [--ca-file <pem>]"
                   << " [--pin <sha256:hex>] [--tls-servername <name>] [--tls-min-version <1.2|1.3>]"
                   << " [--tls-ciphers <list>] [--tls-groups <list>] [--tls-require-pq]" << std::endl;
+#ifndef MINIDRIVE_INTERACTIVE_CLI
+        std::cerr << "\nThis is a headless build: --ipc <socket> is required." << std::endl;
+#endif
         return 1;
     }
 
@@ -64,6 +69,7 @@ int main(int argc, char* argv[]) {
     }
 
     std::string log_file;
+    std::string ipc_endpoint;
     std::string log_level_str = "info";
     transport::Rung rung = transport::Rung::Plain;
     transport::TlsClientConfig tls;
@@ -77,6 +83,12 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             log_file = argv[++i];
+        } else if (arg == "--ipc") {
+            if (i + 1 >= argc) {
+                std::cerr << "--ipc requires a socket path (named pipe name on Windows)\n";
+                return 1;
+            }
+            ipc_endpoint = argv[++i];
         } else if (arg == "--log-level") {
             if (i + 1 >= argc) {
                 std::cerr << "--log-level requires a value (trace|debug|info|warn|error|critical|off)\n";
@@ -205,7 +217,32 @@ int main(int argc, char* argv[]) {
     asio::io_context io_context;
     auto work_guard = std::make_shared<asio::executor_work_guard<asio::io_context::executor_type>>(asio::make_work_guard(io_context));
 
-    Client client(hp.username, io_context, work_guard, streams);
+    // Where commands come from. --ipc is the portable path and the one the desktop GUI drives the
+    // client through; the terminal path only exists where there is a terminal to drive.
+    std::unique_ptr<clientio::IClientIo> client_io;
+    if (!ipc_endpoint.empty()) {
+        client_io = clientio::make_ipc_io(io_context, ipc_endpoint);
+    } else {
+#ifdef MINIDRIVE_INTERACTIVE_CLI
+        client_io = clientio::make_terminal_io(io_context);
+#else
+        std::cerr << "This is a headless build with no interactive CLI. Pass --ipc <socket>."
+                  << std::endl;
+        return 1;
+#endif
+    }
+
+    // Failing to open the channel is a startup failure, not something that can be reported through
+    // the channel - so it is said on stderr and the process stops, rather than running blind.
+    std::string io_error;
+    if (!client_io->start(io_error)) {
+        spdlog::critical("Input channel unavailable: {}", io_error);
+        std::cerr << "Cannot start: " << io_error << std::endl;
+        return 1;
+    }
+    spdlog::info("Console: {}", client_io->describe());
+
+    Client client(hp.username, io_context, work_guard, streams, std::move(client_io));
     client.connect(hp.host, hp.port);
 
     // handle SIGINT, SIGTERM

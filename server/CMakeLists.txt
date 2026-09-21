@@ -25,7 +25,8 @@ target_link_libraries(minidrive_server
 
 set_target_properties(minidrive_server PROPERTIES OUTPUT_NAME server)
 
-if(MINIDRIVE_STATIC_RUNTIME AND NOT MSVC)
+# See the note in client/CMakeLists.txt: Apple's clang has no static libc++ to link against.
+if(MINIDRIVE_STATIC_RUNTIME AND NOT MSVC AND NOT APPLE)
     target_link_options(minidrive_server PRIVATE -static-libgcc -static-libstdc++)
 endif()
 

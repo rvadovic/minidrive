@@ -45,6 +45,10 @@ roadmap — see [docs/requirements.md](docs/requirements.md) for the full featur
   ML-KEM-768, so a recorded session stays secret even against a future quantum attacker — falling
   back to a classical group, with a warning, on an OpenSSL older than 3.5. Certificates come from
   `lab/gen-certs.sh`; see [docs/tls.md](docs/tls.md).
+- **Headless mode** — `client --ipc <socket>` swaps the terminal for a Unix domain socket (named
+  pipe on Windows) carrying length-prefixed JSON: commands in, results and transfer-progress events
+  out. The state machine, wire protocol, sync/batch/resume engines and vault crypto are unchanged,
+  so a GUI can drive the real client instead of reimplementing it. See [docs/ipc.md](docs/ipc.md).
 - **Structured logging** — both `server` and `client` can log to a rotating file via spdlog
   (`--log-file`/`--log` respectively, plus `--log-level`). The client's log is file-only by
   design; its stdout is a stable, scriptable `OK`/`ERROR` protocol (see
@@ -76,9 +80,13 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j"$(nproc)"
 ```
 
-Binaries land at `build/server/server` and `build/client/client`. MiniDrive currently targets
-Linux (POSIX terminal handling, `asio::posix::stream_descriptor`); a cross-platform GUI is on the
-roadmap instead of porting the CLI (see [docs/architecture.md](docs/architecture.md)).
+Binaries land at `build/server/server` and `build/client/client`.
+
+The **server** targets Linux. The **client** has two consoles: the interactive terminal UI is
+POSIX-only, and a headless build (`-DMINIDRIVE_INTERACTIVE_CLI=OFF`, the default on Windows) leaves
+it out entirely and is driven over a socket with `--ipc` instead — same protocol, same sync and
+resume engines, same encryption. That headless build is what makes a Windows/macOS client possible,
+and what the desktop GUI on the roadmap drives as a sidecar. See [docs/ipc.md](docs/ipc.md).
 
 ## Running
 
@@ -111,6 +119,9 @@ roadmap instead of porting the CLI (see [docs/architecture.md](docs/architecture
 
 ./build/client/client alice@localhost:9000 --rung 3.5 \
   --ca-file lab/certs/ca.crt --pin "$(cat lab/certs/server.pin)"
+
+# Headless: the host creates the socket first, then drives the client over it (docs/ipc.md)
+./build/client/client alice@127.0.0.1:9000 --ipc /run/user/1000/minidrive.sock
 ```
 
 Once connected, type `HELP` at the `>` prompt for the full command list. See

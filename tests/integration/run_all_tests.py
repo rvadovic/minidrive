@@ -32,6 +32,7 @@ TEST_SUITES = [
     ("vault", "End-to-End Encryption", "test_vault.py"),
     ("err", "Error Handling", "test_error_handling.py"),
     ("robust", "Robustness", "test_robustness.py"),
+    ("ipc", "Headless IPC Mode", "test_ipc.py"),
     ("resume", "Resume Transfers", "test_resume.py"),
     ("log", "Client Logging", "test_logging.py"),
     ("multi", "Multiple Sessions", "test_multiple_sessions.py"),

@@ -85,7 +85,7 @@ jobs:
         # conc/multi/resume are deliberately run separately below, non-blocking - see that
         # step for why.
         run: |
-          for suite in basic core folder auth sync batch tiers sec tls vault err robust log; do
+          for suite in basic core folder auth sync batch tiers sec tls vault err robust ipc log; do
             echo "::group::suite: $suite"
             python3 tests/integration/run_all_tests.py --suite "$suite"
             echo "::endgroup::"
@@ -117,3 +117,92 @@ jobs:
             timeout 320 python3 tests/integration/run_all_tests.py --suite "$suite" || true
             echo "::endgroup::"
           done
+
+  headless-client:
+    # Turns "the client is portable in principle" into a verified claim.
+    #
+    # The only unportable part of the client is the interactive terminal UI (termios,
+    # asio::posix::stream_descriptor, dup(stdin)), and a headless build does not compile it -
+    # there is no platform abstraction to maintain, the file is simply left out. What remains is
+    # the whole client: same state machine, same wire protocol, same SYNC/batch/resume engines,
+    # same vault crypto, driven over --ipc instead of a terminal. That is exactly what the desktop
+    # GUI drives as a sidecar, so this job is what makes a Windows/macOS GUI possible.
+    #
+    # The server stays Linux-only by design and is only built on the Linux leg.
+    name: headless client (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install OpenSSL (macOS)
+        # Homebrew's openssl@3 is keg-only, so CMake needs to be pointed at it explicitly or the
+        # build silently falls back to rung 0 and this job stops covering the TLS code at all.
+        if: runner.os == 'macOS'
+        run: |
+          brew install openssl@3
+          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+
+      - name: Cache FetchContent dependencies
+        uses: actions/cache@v4
+        with:
+          path: build-headless/_deps
+          key: headless-${{ matrix.os }}-${{ hashFiles('cmake/Dependencies.cmake') }}
+          restore-keys: |
+            headless-${{ matrix.os }}-
+
+      - name: Configure
+        run: cmake -S . -B build-headless -DCMAKE_BUILD_TYPE=Release -DMINIDRIVE_INTERACTIVE_CLI=OFF -DMINIDRIVE_BUILD_TESTS=OFF
+
+      - name: Build the headless client
+        run: cmake --build build-headless --target minidrive_client --config Release -j 2
+
+      - name: Smoke test the binary
+        # Needs no server and no socket: it proves the binary links, starts, and refuses the mode
+        # it was not built for. Without this the job would only prove that the code compiles.
+        shell: bash
+        run: |
+          CLIENT=build-headless/client/client
+          [ -x "$CLIENT" ] || CLIENT=build-headless/client/Release/client.exe
+          echo "Using $CLIENT"
+
+          # No arguments: usage, and a non-zero exit.
+          set +e
+          "$CLIENT" > out.txt 2>&1
+          rc=$?
+          set -e
+          cat out.txt
+          [ "$rc" -ne 0 ] || { echo "expected a non-zero exit with no arguments"; exit 1; }
+          grep -q -- "--ipc" out.txt || { echo "usage does not mention --ipc"; exit 1; }
+
+          # An endpoint but no --ipc: a headless build has no terminal mode to fall back to.
+          set +e
+          "$CLIENT" 127.0.0.1:9999 < /dev/null > out2.txt 2>&1
+          rc=$?
+          set -e
+          cat out2.txt
+          [ "$rc" -eq 1 ] || { echo "expected rc=1 without --ipc, got $rc"; exit 1; }
+          grep -qi "headless" out2.txt || { echo "no explanation of headless mode"; exit 1; }
+
+      - name: Build the server and run the ipc suite (POSIX only)
+        # The suite's host side speaks AF_UNIX, which is what the client uses on POSIX. On Windows
+        # the client connects to a named pipe instead, and the process driving that pipe is the
+        # GUI's Rust core - so Windows gets build + smoke coverage here, and the pipe path is
+        # exercised by the GUI's own tests when that lands.
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cmake --build build-headless --target minidrive_server -j 2
+          MINIDRIVE_BUILD_DIR="$PWD/build-headless" python3 tests/integration/run_all_tests.py --suite ipc
+
+      - name: Upload test logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: headless-logs-${{ matrix.os }}
+          path: test_logs/
+          retention-days: 7
