@@ -60,14 +60,26 @@ roadmap — see [docs/requirements.md](docs/requirements.md) for the full featur
 
 ### Option 1: download a release
 
-Prebuilt, statically-linked Linux binaries (`server` + `client`) are published on the
-[Releases page](https://github.com/rvadovic/minidrive/releases) as a `.tar.gz` (any distro) and a
-`.deb` (Debian/Ubuntu). No runtime dependencies beyond glibc.
+The [Releases page](https://github.com/rvadovic/minidrive/releases) has separate server and client
+downloads:
+
+- **Server**: `minidrive-server-<version>-debian13-amd64.deb` for Debian 13, or
+  `minidrive-server-<version>-src.tar.gz` to build it yourself (see `BUILD-SERVER.md` inside it;
+  the dev container is included). The server uses the system OpenSSL, so Debian's security updates
+  keep its TLS stack patched.
+- **Client**: one self-contained binary per platform, with OpenSSL 3.5 embedded, so every client
+  supports post-quantum key exchange. The Linux build (`linux-x86_64`) is fully static and runs on
+  any x86_64 distribution. The **Windows and macOS builds are headless**: they run only with
+  `--ipc` (see [docs/ipc.md](docs/ipc.md)) and have no interactive command line.
+
+`SHA256SUMS` lists checksums for every asset.
 
 ```sh
-tar xzf minidrive-*.tar.gz
-./usr/bin/server --port 9000 --root ./data
-./usr/bin/client 127.0.0.1:9000
+sudo apt install ./minidrive-server-*-debian13-amd64.deb
+server --port 9000 --root ./data
+
+tar xzf minidrive-client-*-linux-x86_64.tar.gz
+./minidrive-client-*-linux-x86_64/bin/client 127.0.0.1:9000
 ```
 
 ### Option 2: build from source

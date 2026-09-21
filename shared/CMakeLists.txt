@@ -35,6 +35,17 @@ if(MINIDRIVE_ENABLE_TLS)
     # (empty on platforms where dlsym lives in libc).
     target_link_libraries(minidrive_shared PUBLIC OpenSSL::SSL OpenSSL::Crypto ${CMAKE_DL_LIBS})
     target_compile_definitions(minidrive_shared PUBLIC MINIDRIVE_ENABLE_TLS)
+    if(OPENSSL_USE_STATIC_LIBS)
+        # With OpenSSL linked in, the dlsym route above finds nothing (there is no libssl to search)
+        # and the connection report would silently lose its group name again. stream.cpp calls the
+        # accessor directly instead - safe, because the library it resolves against is the one
+        # embedded at link time.
+        target_compile_definitions(minidrive_shared PRIVATE MINIDRIVE_OPENSSL_STATIC)
+        if(WIN32)
+            # What a static OpenSSL needs from Windows (NOTES-WINDOWS.md); ws2_32 is added below.
+            target_link_libraries(minidrive_shared PUBLIC crypt32 user32 advapi32)
+        endif()
+    endif()
 endif()
 
 # Windows (the headless client only - the server is Linux-only). PUBLIC so every translation unit

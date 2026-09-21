@@ -20,7 +20,11 @@
 #ifdef MINIDRIVE_ENABLE_TLS
 #include <openssl/objects.h>
 #include <openssl/ssl.h>
-#ifndef _WIN32
+// Direct call when the accessor is known to be linkable: OpenSSL is embedded (static build), or
+// there is no dlsym to reach it with (Windows). Otherwise resolve it at runtime - see below.
+#if OPENSSL_VERSION_NUMBER >= 0x30200000L && (defined(MINIDRIVE_OPENSSL_STATIC) || defined(_WIN32))
+#define MINIDRIVE_DIRECT_GROUP_NAME 1
+#elif !defined(_WIN32)
 #include <dlfcn.h> // to resolve accessors newer than the OpenSSL headers this was built against
 #endif
 #endif
@@ -45,7 +49,14 @@ namespace {
 // compile-time #if would leave that deployment unable to name the group it just used, and
 // X25519MLKEM768 has no NID for the older accessor to fall back on. Verified by running
 // 3.0-built binaries against a 3.5 libssl.
+//
+// A statically linked OpenSSL inverts that: dlsym has no libssl to search and returns null, which
+// would reintroduce the vanished-group bug by a different route. There the version is fixed at link
+// time, so the accessor is called directly (MINIDRIVE_DIRECT_GROUP_NAME).
 const char* negotiated_group_name(SSL* ssl) {
+#if defined(MINIDRIVE_DIRECT_GROUP_NAME)
+    return SSL_get0_group_name(ssl);
+#else
 #ifndef _WIN32
     using GroupNameFn = const char* (*)(SSL*);
     static GroupNameFn get0_group_name =
@@ -56,6 +67,7 @@ const char* negotiated_group_name(SSL* ssl) {
 #endif
     const int nid = SSL_get_negotiated_group(ssl);
     return nid == NID_undef ? nullptr : OBJ_nid2sn(nid);
+#endif
 }
 
 } // namespace

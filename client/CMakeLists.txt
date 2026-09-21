@@ -48,10 +48,15 @@ target_link_libraries(minidrive_client
 
 set_target_properties(minidrive_client PROPERTIES OUTPUT_NAME client)
 
-# Not on Apple: clang there has no static libc++ to link against, and passing these makes the link
-# fail rather than producing a more self-contained binary.
-if(MINIDRIVE_STATIC_RUNTIME AND NOT MSVC AND NOT APPLE)
-    target_link_options(minidrive_client PRIVATE -static-libgcc -static-libstdc++)
-endif()
+minidrive_static_link(minidrive_client)
 
-install(TARGETS minidrive_client RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+# Component "client": the release packages it on its own (see cmake/Packaging.cmake), separately
+# from the server, because the two are deployed in opposite ways.
+install(TARGETS minidrive_client RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT client)
+install(FILES
+        ${PROJECT_SOURCE_DIR}/README.md
+        ${PROJECT_SOURCE_DIR}/docs/tls.md
+        ${PROJECT_SOURCE_DIR}/docs/vault.md
+        ${PROJECT_SOURCE_DIR}/docs/ipc.md
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/minidrive-client
+    COMPONENT client)

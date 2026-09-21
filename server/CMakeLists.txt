@@ -25,10 +25,17 @@ target_link_libraries(minidrive_server
 
 set_target_properties(minidrive_server PROPERTIES OUTPUT_NAME server)
 
-# See the note in client/CMakeLists.txt: Apple's clang has no static libc++ to link against.
-if(MINIDRIVE_STATIC_RUNTIME AND NOT MSVC AND NOT APPLE)
-    target_link_options(minidrive_server PRIVATE -static-libgcc -static-libstdc++)
-endif()
+minidrive_static_link(minidrive_server)
 
-install(TARGETS minidrive_server RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS minidrive_server RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT server)
+install(FILES
+        ${PROJECT_SOURCE_DIR}/README.md
+        ${PROJECT_SOURCE_DIR}/docs/tls.md
+        ${PROJECT_SOURCE_DIR}/docs/vault.md
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/minidrive-server
+    COMPONENT server)
+# The operator needs a CA and a server certificate before --rung 3.5 can start at all.
+install(PROGRAMS ${PROJECT_SOURCE_DIR}/lab/gen-certs.sh
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/minidrive
+    COMPONENT server)
 

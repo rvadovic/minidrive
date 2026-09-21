@@ -12,7 +12,8 @@ jobs:
     # deployment targets:
     #   - Ubuntu 24.04 has OpenSSL 3.0, which cannot do ML-KEM. The tls suite must show the hybrid
     #     group being dropped with a warning and the handshake falling back to a classical group.
-    #     This is also what the release artifacts are currently built on.
+    #     Releases no longer build here (the server .deb is built on Debian 13, the client embeds
+    #     OpenSSL 3.5), but this leg still guards anyone building from source on a pre-3.5 distro.
     #   - Debian 13 has OpenSSL 3.5, so the same suite must show X25519MLKEM768 actually
     #     negotiated. Without this leg, nothing in CI ever exercises the post-quantum path.
     # The tls suite asserts whichever of the two applies, so one suite gates both behaviours.
@@ -204,5 +205,63 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: headless-logs-${{ matrix.os }}
+          path: test_logs/
+          retention-days: 7
+
+  static-client:
+    # The release's fully static Linux client (musl + the pinned OpenSSL from packaging/openssl.pin),
+    # built on every push so a break in MINIDRIVE_FULLY_STATIC shows up here rather than on a tag.
+    # Then the tls and ipc suites run against it with a normally built server: the tls suite must
+    # take its hybrid branch, since the embedded OpenSSL is 3.5 whatever the runner has.
+    name: static client (alpine, musl)
+    runs-on: ubuntu-latest
+    container: 'alpine:3.22'
+    steps:
+      - name: Install build dependencies
+        run: apk add --no-cache bash build-base cmake perl linux-headers git curl file tar python3 openssl openssl-dev
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Cache the pinned OpenSSL
+        id: openssl-cache
+        uses: actions/cache@v4
+        with:
+          path: /opt/openssl
+          key: openssl-alpine-${{ hashFiles('packaging/openssl.pin', 'packaging/build-openssl.sh') }}
+
+      - name: Build the pinned OpenSSL
+        if: steps.openssl-cache.outputs.cache-hit != 'true'
+        run: packaging/build-openssl.sh /opt/openssl
+
+      - name: Build the static client
+        run: |
+          cmake -S . -B build-static -DCMAKE_BUILD_TYPE=Release \
+            -DMINIDRIVE_FULLY_STATIC=ON -DMINIDRIVE_BUILD_SERVER=OFF -DMINIDRIVE_BUILD_TESTS=OFF \
+            -DOPENSSL_ROOT_DIR=/opt/openssl
+          cmake --build build-static --target minidrive_client -j"$(nproc)"
+          file build-static/client/client | grep -q "statically linked"
+
+      - name: Build a server to test against (system OpenSSL, dynamic)
+        run: |
+          cmake -S . -B build-server -DCMAKE_BUILD_TYPE=Release \
+            -DMINIDRIVE_BUILD_CLIENT=OFF -DMINIDRIVE_BUILD_TESTS=OFF
+          cmake --build build-server --target minidrive_server -j"$(nproc)"
+          mkdir -p build-static/server
+          cp build-server/server/server build-static/server/server
+
+      - name: tls and ipc suites against the static client
+        shell: bash
+        run: |
+          export MINIDRIVE_BUILD_DIR="$PWD/build-static"
+          python3 tests/integration/run_all_tests.py --suite ipc
+          python3 tests/integration/run_all_tests.py --suite tls | tee tls.txt
+          grep -q "Hybrid post-quantum key exchange negotiated" tls.txt
+
+      - name: Upload test logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: static-client-logs
           path: test_logs/
           retention-days: 7

@@ -1,0 +1,62 @@
+name: OpenSSL watch
+
+# The released client embeds a pinned OpenSSL (packaging/openssl.pin) instead of using the system
+# one, so no distribution will patch it. This is the replacement: once a week, compare the pin with
+# the newest 3.5.x release and open an issue when it has fallen behind. The fix is to bump the pin
+# (version + the published SHA-256) and cut a new release.
+
+on:
+  schedule:
+    - cron: '17 6 * * 1' # Mondays 06:17 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Compare the pin with the latest OpenSSL 3.5.x
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          source packaging/openssl.pin
+          latest=$(gh api 'repos/openssl/openssl/releases?per_page=100' --paginate \
+                     --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' \
+                   | sed -n 's/^openssl-\(3\.5\.[0-9]*\)$/\1/p' | sort -V | tail -1)
+          [ -n "$latest" ] || { echo "could not determine the latest OpenSSL 3.5.x"; exit 1; }
+          echo "pinned: $OPENSSL_VERSION  latest 3.5.x: $latest"
+
+          if [ "$(printf '%s\n%s\n' "$OPENSSL_VERSION" "$latest" | sort -V | tail -1)" = "$OPENSSL_VERSION" ]; then
+            echo "Pin is current."
+            exit 0
+          fi
+
+          title="Embedded OpenSSL is behind: ${OPENSSL_VERSION} -> ${latest}"
+          if gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$title\"" \
+               --json title --jq '.[].title' | grep -Fxq "$title"; then
+            echo "Issue already open."
+            exit 0
+          fi
+
+          sha=$(curl -fsSL "https://github.com/openssl/openssl/releases/download/openssl-${latest}/openssl-${latest}.tar.gz.sha256" | cut -d' ' -f1)
+          {
+            echo "OpenSSL ${latest} is out. The released clients embed ${OPENSSL_VERSION} (static link), so they do not get this fix until a new client release ships."
+            echo
+            echo "Release notes: https://github.com/openssl/openssl/releases/tag/openssl-${latest}"
+            echo
+            echo "To update, edit \`packaging/openssl.pin\`:"
+            echo
+            echo '```'
+            echo "OPENSSL_VERSION=${latest}"
+            echo "OPENSSL_SHA256=${sha}"
+            echo '```'
+            echo
+            echo "Then tag a release. The server is unaffected because it uses Debian's libssl, which apt keeps patched."
+          } > body.md
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file body.md

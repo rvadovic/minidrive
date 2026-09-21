@@ -1,5 +1,17 @@
 name: Release
 
+# Split release assets (see packaging/release-notes.md for what each one is):
+#   server - minidrive-server-<ver>-src.tar.gz (source + dev container + BUILD-SERVER.md)
+#            minidrive-server-<ver>-debian13-amd64.deb (dynamic libssl, patched by apt)
+#   client - minidrive-client-<ver>-{linux-x86_64,macos-arm64,macos-x86_64}.tar.gz,
+#            minidrive-client-<ver>-windows-x86_64.zip (fully static, OpenSSL 3.5 embedded)
+#   SHA256SUMS
+#
+# gate -> package jobs (each smoke-tests its own artifact) -> server-deb-verify (clean debian:13:
+# installs the .deb and runs the gating suites against it, driven by the static Linux client) ->
+# publish. A tag push publishes; workflow_dispatch is a dry run that stops before publishing and
+# leaves the assets as workflow artifacts.
+
 on:
   push:
     tags:
@@ -7,16 +19,42 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  GATING_SUITES: basic core folder auth sync batch tiers sec tls vault err robust ipc log
 
 jobs:
-  build-and-release:
+  gate:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0 # full history/tags, so `git describe` resolves to this tag
+
+      - name: Resolve the release version
+        # A tag must name the version the code says it is, or every asset would carry the
+        # project() version under a tag that says something else. vX.Y.Z and vX.Y.Z-suffix
+        # (pre-release) are accepted; the suffix is carried into the asset names.
+        id: version
+        run: |
+          proj=$(sed -n 's/^project(MiniDrive VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+          [ -n "$proj" ] || { echo "cannot read project() version from CMakeLists.txt"; exit 1; }
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            ver="${GITHUB_REF_NAME#v}"
+            case "$ver" in
+              "$proj"|"$proj"-*) ;;
+              *) echo "::error::tag $GITHUB_REF_NAME does not match project(MiniDrive VERSION $proj) - bump CMakeLists.txt first"
+                 exit 1 ;;
+            esac
+          else
+            ver="${proj}-dev.$(git rev-parse --short HEAD)"
+          fi
+          echo "Release version: $ver"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
 
       - name: Install build dependencies
         run: |
@@ -34,7 +72,7 @@ jobs:
 
       - name: Integration test suites (gating - a broken build must not be published)
         run: |
-          for suite in basic core folder auth sync batch tiers sec tls vault err robust ipc log; do
+          for suite in $GATING_SUITES; do
             echo "::group::suite: $suite"
             python3 tests/integration/run_all_tests.py --suite "$suite"
             echo "::endgroup::"
@@ -44,19 +82,427 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-logs-release
+          name: test-logs-gate
           path: test_logs/
           retention-days: 7
 
-      - name: "Package (CPack: .tar.gz + .deb)"
+  # --- server --------------------------------------------------------------------------------
+
+  server-src:
+    # The source release, and proof that it builds: unpacked into a clean Debian 13 and built by
+    # running BUILD-SERVER.md's ```sh blocks verbatim, so the instructions cannot drift from reality.
+    needs: gate
+    runs-on: ubuntu-latest
+    container: 'debian:13'
+    env:
+      VERSION: ${{ needs.gate.outputs.version }}
+    steps:
+      - name: Install git
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create the source tarball
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          name="minidrive-server-${VERSION}-src"
+          mkdir -p dist
+          # Server-relevant paths only - no client/. The top-level CMakeLists builds the client
+          # only when client/ exists, so this configures as a server-only tree.
+          git archive --format=tar.gz --prefix="$name/" \
+            --add-file=packaging/BUILD-SERVER.md \
+            -o "dist/$name.tar.gz" HEAD \
+            server shared cmake CMakeLists.txt .devcontainer lab/gen-certs.sh docs tests README.md
+          tar tzf "dist/$name.tar.gz" | head -20
+
+      - name: Build it by following BUILD-SERVER.md
+        run: |
+          # sudo, because the document is written for a normal user; root runs it unprompted.
+          apt-get install -y --no-install-recommends sudo
+          mkdir -p /tmp/verify
+          tar xzf dist/minidrive-server-*-src.tar.gz -C /tmp/verify
+          cd /tmp/verify/minidrive-server-*-src
+          [ ! -e client ] || { echo "client/ must not be in the server source release"; exit 1; }
+          awk '/^```sh$/{f=1;next} /^```$/{f=0} f' BUILD-SERVER.md > /tmp/steps.sh
+          cat /tmp/steps.sh
+          bash -euxo pipefail /tmp/steps.sh
+          test -x /usr/local/bin/server
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-server-src
+          path: dist/*
+          if-no-files-found: error
+
+  server-deb:
+    # Built on the deployment target itself, against its OpenSSL 3.5. libssl stays dynamic here, so
+    # Depends: is derived by dpkg-shlibdeps and names trixie's libssl3t64.
+    needs: gate
+    runs-on: ubuntu-latest
+    container: 'debian:13'
+    env:
+      VERSION: ${{ needs.gate.outputs.version }}
+    steps:
+      - name: Install build dependencies
+        # file + dpkg-dev: CPack's DEB generator needs both for CPACK_DEBIAN_PACKAGE_SHLIBDEPS.
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git ca-certificates build-essential cmake libssl-dev file dpkg-dev
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure (server only)
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DMINIDRIVE_BUILD_CLIENT=OFF -DMINIDRIVE_BUILD_TESTS=OFF \
+            -DMINIDRIVE_PACKAGE_VERSION="$VERSION" -DMINIDRIVE_PACKAGE_PLATFORM=debian13-amd64
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Package
         working-directory: build
-        run: cpack
+        run: |
+          cpack -G DEB
+          deb=$(ls minidrive-server-*.deb)
+          dpkg-deb -I "$deb"
+          dpkg-deb -c "$deb"
+          dpkg-deb -f "$deb" Depends | grep -q libssl3t64 \
+            || { echo "Depends: does not name libssl3t64"; exit 1; }
+          mkdir -p ../dist && mv "$deb" ../dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-server-deb
+          path: dist/*
+          if-no-files-found: error
+
+  # --- client --------------------------------------------------------------------------------
+
+  client-linux:
+    # musl, not glibc: a static glibc still dlopen()s NSS modules for getaddrinfo at runtime, so it
+    # is only "static" on the machine that built it. musl has no NSS; this binary runs on any
+    # x86_64 Linux. Includes the interactive CLI.
+    needs: gate
+    runs-on: ubuntu-latest
+    container: 'alpine:3.22'
+    env:
+      VERSION: ${{ needs.gate.outputs.version }}
+    steps:
+      - name: Install build dependencies
+        run: apk add --no-cache bash build-base cmake perl linux-headers git curl file tar
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Cache the pinned OpenSSL
+        id: openssl-cache
+        uses: actions/cache@v4
+        with:
+          path: /opt/openssl
+          key: openssl-alpine-${{ hashFiles('packaging/openssl.pin', 'packaging/build-openssl.sh') }}
+
+      - name: Build the pinned OpenSSL
+        if: steps.openssl-cache.outputs.cache-hit != 'true'
+        run: packaging/build-openssl.sh /opt/openssl
+
+      - name: Configure
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DMINIDRIVE_FULLY_STATIC=ON -DMINIDRIVE_BUILD_SERVER=OFF -DMINIDRIVE_BUILD_TESTS=OFF \
+            -DOPENSSL_ROOT_DIR=/opt/openssl \
+            -DMINIDRIVE_PACKAGE_VERSION="$VERSION" -DMINIDRIVE_PACKAGE_PLATFORM=linux-x86_64
+
+      - name: Build
+        run: cmake --build build --target minidrive_client -j"$(nproc)"
+
+      - name: Check the binary is fully static
+        run: |
+          file build/client/client
+          file build/client/client | grep -q "statically linked" \
+            || { echo "client is not statically linked"; exit 1; }
+          if readelf -d build/client/client 2>/dev/null | grep -q NEEDED; then
+            echo "client has shared-library dependencies:"; readelf -d build/client/client; exit 1
+          fi
+          strings build/client/client | grep -m1 "^OpenSSL 3\.5\."
+
+      - name: Smoke test
+        run: |
+          set +e; build/client/client > out.txt 2>&1; rc=$?; set -e
+          cat out.txt
+          [ "$rc" -ne 0 ] && grep -q -- "--ipc" out.txt
+
+      - name: Package
+        working-directory: build
+        run: |
+          cpack -G TGZ
+          mkdir -p ../dist && mv minidrive-client-*.tar.gz ../dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-client-linux-x86_64
+          path: dist/*
+          if-no-files-found: error
+
+  client-macos:
+    # Headless (--ipc) only: the interactive CLI is Linux-only by design. OpenSSL and libsodium are
+    # static; libSystem and libc++ stay dynamic, which is unavoidable on macOS and ABI-stable.
+    needs: gate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ needs.gate.outputs.version }}
+      MACOSX_DEPLOYMENT_TARGET: '11.0' # honoured by both the OpenSSL build and CMake
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Cache the pinned OpenSSL
+        id: openssl-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/openssl
+          key: openssl-macos-${{ matrix.arch }}-${{ hashFiles('packaging/openssl.pin', 'packaging/build-openssl.sh') }}
+
+      - name: Build the pinned OpenSSL
+        if: steps.openssl-cache.outputs.cache-hit != 'true'
+        run: packaging/build-openssl.sh "$RUNNER_TEMP/openssl"
+
+      - name: Configure
+        # OPENSSL_ROOT_DIR points at the pinned build, not Homebrew's openssl@3 that the runner
+        # image may also carry.
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DMINIDRIVE_FULLY_STATIC=ON -DMINIDRIVE_INTERACTIVE_CLI=OFF \
+            -DMINIDRIVE_BUILD_SERVER=OFF -DMINIDRIVE_BUILD_TESTS=OFF \
+            -DOPENSSL_ROOT_DIR="$RUNNER_TEMP/openssl" \
+            -DMINIDRIVE_PACKAGE_VERSION="$VERSION" -DMINIDRIVE_PACKAGE_PLATFORM=macos-${{ matrix.arch }}
+
+      - name: Build
+        run: cmake --build build --target minidrive_client -j 3
+
+      - name: Check no OpenSSL or libsodium dylib is linked
+        run: |
+          otool -L build/client/client
+          if otool -L build/client/client | tail -n +2 | grep -Eiv '/usr/lib/libSystem|/usr/lib/libc\+\+'; then
+            echo "unexpected dynamic dependency"; exit 1
+          fi
+          lipo -archs build/client/client | grep -q '${{ matrix.arch }}'
+
+      - name: Smoke test
+        run: |
+          set +e; build/client/client > out.txt 2>&1; rc=$?
+          build/client/client 127.0.0.1:9999 < /dev/null > out2.txt 2>&1; rc2=$?; set -e
+          cat out.txt out2.txt
+          [ "$rc" -ne 0 ] && grep -q -- "--ipc" out.txt
+          [ "$rc2" -eq 1 ] && grep -qi "headless" out2.txt
+
+      - name: Package
+        working-directory: build
+        run: |
+          cpack -G TGZ
+          mkdir -p ../dist && mv minidrive-client-*.tar.gz ../dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-client-macos-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  client-windows:
+    # Headless (--ipc) only. Static CRT (/MT) and static OpenSSL: client.exe needs no
+    # redistributable and no OpenSSL DLL - Windows has no system OpenSSL to rely on anyway.
+    needs: gate
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.gate.outputs.version }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up MSVC (nmake, dumpbin)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Set up NASM (OpenSSL assembly)
+        uses: ilammy/setup-nasm@v1
+
+      - name: Cache the pinned OpenSSL
+        id: openssl-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\openssl
+          key: openssl-windows-${{ hashFiles('packaging/openssl.pin', 'packaging/build-openssl.sh') }}
+
+      - name: Fetch and verify the pinned OpenSSL source
+        if: steps.openssl-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: packaging/build-openssl.sh --fetch-only "$RUNNER_TEMP/openssl-src"
+
+      - name: Build the pinned OpenSSL
+        # Strawberry Perl, not Git's MSYS perl, which OpenSSL's VC build does not support. no-shared
+        # builds with /MT /Zl, so the libraries link into the /MT client without a CRT mismatch.
+        if: steps.openssl-cache.outputs.cache-hit != 'true'
+        shell: cmd
+        run: |
+          cd /d "%RUNNER_TEMP%\openssl-src"
+          C:\Strawberry\perl\bin\perl.exe Configure VC-WIN64A no-shared no-module no-tests --prefix=C:\openssl --openssldir=C:\openssl\ssl || exit /b 1
+          nmake build_libs || exit /b 1
+          nmake install_dev || exit /b 1
+
+      - name: Configure
+        shell: bash
+        run: |
+          cmake -S . -B build -A x64 \
+            -DMINIDRIVE_FULLY_STATIC=ON -DMINIDRIVE_BUILD_SERVER=OFF -DMINIDRIVE_BUILD_TESTS=OFF \
+            -DOPENSSL_ROOT_DIR='C:/openssl' \
+            -DMINIDRIVE_PACKAGE_VERSION="$VERSION" -DMINIDRIVE_PACKAGE_PLATFORM=windows-x86_64
+
+      - name: Build
+        run: cmake --build build --target minidrive_client --config Release -j 2
+
+      - name: Check no OpenSSL DLL or dynamic CRT is imported
+        shell: bash
+        run: |
+          dumpbin //dependents build/client/Release/client.exe | tee deps.txt
+          if grep -Ei 'libssl|libcrypto|vcruntime|msvcp|ucrtbase|api-ms-win-crt' deps.txt; then
+            echo "client.exe depends on a DLL it should have embedded"; exit 1
+          fi
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          CLIENT=build/client/Release/client.exe
+          set +e; "$CLIENT" > out.txt 2>&1; rc=$?
+          "$CLIENT" 127.0.0.1:9999 < /dev/null > out2.txt 2>&1; rc2=$?; set -e
+          cat out.txt out2.txt
+          [ "$rc" -ne 0 ] && grep -q -- "--ipc" out.txt
+          [ "$rc2" -eq 1 ] && grep -qi "headless" out2.txt
+
+      - name: Package
+        shell: bash
+        working-directory: build
+        run: |
+          cpack -G ZIP -C Release
+          mkdir -p ../dist && mv minidrive-client-*.zip ../dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-client-windows-x86_64
+          path: dist/*
+          if-no-files-found: error
+
+  # --- verification of the published artifacts together --------------------------------------
+
+  server-deb-verify:
+    # The .deb on a clean Debian 13 (apt resolves Depends: itself), driven by the static musl
+    # client on a glibc host. Runs the gating suites against the *installed* server and the
+    # *released* client, so this is the check that the two downloads work with each other.
+    needs: [server-deb, client-linux]
+    runs-on: ubuntu-latest
+    container: 'debian:13'
+    steps:
+      - name: Install test dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates python3 openssl
+
+      - name: Check out repository (test suites)
+        uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-{server-deb,client-linux-x86_64}
+          path: dist
+          merge-multiple: true
+
+      - name: Install the server package
+        run: |
+          apt-get install -y ./dist/minidrive-server-*.deb
+          dpkg-query -W -f='${Depends}\n' minidrive-server | grep -q libssl3t64
+          test -x /usr/bin/server
+
+      - name: Assemble a build-tree layout from the release artifacts
+        run: |
+          mkdir -p release-tree/server release-tree/client unpack
+          ln -s /usr/bin/server release-tree/server/server
+          tar xzf dist/minidrive-client-*-linux-x86_64.tar.gz -C unpack
+          cp unpack/minidrive-client-*/bin/client release-tree/client/client
+
+      - name: Gating suites against the released binaries
+        shell: bash # explicit, for pipefail: without it the tee below would hide a failing suite
+        run: |
+          export MINIDRIVE_BUILD_DIR="$PWD/release-tree"
+          for suite in $GATING_SUITES; do
+            echo "::group::suite: $suite"
+            python3 tests/integration/run_all_tests.py --suite "$suite" | tee "suite-$suite.txt"
+            echo "::endgroup::"
+          done
+          # The tls suite passes on a classical fallback too. The client embeds OpenSSL 3.5, so here
+          # it must have taken the hybrid branch - which parses the group out of the client's own
+          # connection report, so this also proves the static build still names the group.
+          grep -q "Hybrid post-quantum key exchange negotiated" suite-tls.txt \
+            || { echo "the released client did not negotiate X25519MLKEM768"; exit 1; }
+
+      - name: Upload test logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-release-verify
+          path: test_logs/
+          retention-days: 7
+
+  publish:
+    needs: [gate, server-src, server-deb, server-deb-verify, client-linux, client-macos, client-windows]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository (release notes)
+        uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            build/minidrive-*.tar.gz
-            build/minidrive-*.deb
+          files: dist/*
+          body_path: packaging/release-notes.md
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}

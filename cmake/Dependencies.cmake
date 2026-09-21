@@ -54,9 +54,26 @@ endif()
 # no liboqs); anything older still builds and gives TLS 1.3 without that group.
 option(MINIDRIVE_ENABLE_TLS "Build the TLS transport (requires OpenSSL)" ON)
 
+if(MINIDRIVE_FULLY_STATIC AND NOT MINIDRIVE_ENABLE_TLS)
+    message(FATAL_ERROR "MINIDRIVE_FULLY_STATIC embeds OpenSSL; it cannot be combined with "
+                        "MINIDRIVE_ENABLE_TLS=OFF")
+endif()
+
 if(MINIDRIVE_ENABLE_TLS)
     find_package(OpenSSL)
-    if(NOT OpenSSL_FOUND)
+    if(MINIDRIVE_FULLY_STATIC)
+        # A self-contained client that quietly came out rung-0-only, or without the hybrid group,
+        # would be published as if it were the real thing. Refuse instead of degrading: every
+        # client download is meant to negotiate X25519MLKEM768 and to support ENROLL_DEVICE.
+        if(NOT OpenSSL_FOUND)
+            message(FATAL_ERROR "MINIDRIVE_FULLY_STATIC: no static OpenSSL found (set OPENSSL_ROOT_DIR "
+                                "to a no-shared OpenSSL 3.5+ install)")
+        elseif(OPENSSL_VERSION VERSION_LESS 3.5.0)
+            message(FATAL_ERROR "MINIDRIVE_FULLY_STATIC: found OpenSSL ${OPENSSL_VERSION}, need 3.5+ "
+                                "(ML-KEM for the hybrid group and for vault device enrollment)")
+        endif()
+        message(STATUS "OpenSSL ${OPENSSL_VERSION} (static: ${OPENSSL_SSL_LIBRARY}) - embedded")
+    elseif(NOT OpenSSL_FOUND)
         message(STATUS "OpenSSL not found - building without the TLS transport (rung 0 only)")
         set(MINIDRIVE_ENABLE_TLS OFF)
     elseif(OPENSSL_VERSION VERSION_LESS 3.5.0)
@@ -66,6 +83,24 @@ if(MINIDRIVE_ENABLE_TLS)
         message(STATUS "OpenSSL ${OPENSSL_VERSION} found - TLS transport enabled")
     endif()
 endif()
+
+# Shared by both executables' CMakeLists: link a fully static client (Linux) or keep only the C++
+# runtime static (MINIDRIVE_STATIC_RUNTIME, the server's setting). Apple is excluded from both -
+# there is no static libc++ or libSystem to link, and passing these makes the link fail.
+function(minidrive_static_link target)
+    if(MSVC OR APPLE)
+        return()
+    endif()
+    if(MINIDRIVE_FULLY_STATIC)
+        # Only portable against musl: a static glibc still dlopen()s NSS modules for getaddrinfo at
+        # runtime, so the binary would break on a host with a different glibc. The release builds
+        # this on Alpine for exactly that reason; a glibc -static build links (with warnings) and
+        # is fine for testing on the machine that built it.
+        target_link_options(${target} PRIVATE -static)
+    elseif(MINIDRIVE_STATIC_RUNTIME)
+        target_link_options(${target} PRIVATE -static-libgcc -static-libstdc++)
+    endif()
+endfunction()
 
 # Helper interface library for shared warning flags
 add_library(minidrive_warnings INTERFACE)
