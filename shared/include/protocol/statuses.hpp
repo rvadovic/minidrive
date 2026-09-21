@@ -1,5 +1,7 @@
 #pragma once
 
+#include "protocol/win32_macros.hpp" // DELETE/ERROR are Windows macros
+
 namespace protocol::statuses {
 
 inline constexpr const char* OK = "OK";

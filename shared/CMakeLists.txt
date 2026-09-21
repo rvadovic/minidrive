@@ -37,4 +37,18 @@ if(MINIDRIVE_ENABLE_TLS)
     target_compile_definitions(minidrive_shared PUBLIC MINIDRIVE_ENABLE_TLS)
 endif()
 
+# Windows (the headless client only - the server is Linux-only). PUBLIC so every translation unit
+# that includes a shared header sees the same <windows.h> configuration:
+#   NOMINMAX            - otherwise min/max are macros and std::numeric_limits<T>::max() breaks
+#   WIN32_LEAN_AND_MEAN - keeps winsock.h out, which would otherwise fight asio's winsock2.h
+#   NOGDI               - wingdi.h defines ERROR, which collides with protocol::statuses/flags::ERROR
+#   _WIN32_WINNT        - asio otherwise assumes Windows 7 and warns in every translation unit
+# DELETE (winnt.h) cannot be switched off this way; protocol/win32_macros.hpp removes it.
+# ws2_32/mswsock: asio's socket layer. MSVC auto-links them through #pragma comment, MinGW does not.
+if(WIN32)
+    target_compile_definitions(minidrive_shared PUBLIC
+        NOMINMAX WIN32_LEAN_AND_MEAN NOGDI _WIN32_WINNT=0x0A00)
+    target_link_libraries(minidrive_shared PUBLIC ws2_32 mswsock)
+endif()
+
 set_target_properties(minidrive_shared PROPERTIES EXPORT_NAME shared)
