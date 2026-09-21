@@ -209,7 +209,7 @@ jobs:
           retention-days: 7
 
   static-client:
-    # The release's fully static Linux client (musl + the pinned OpenSSL from packaging/openssl.pin),
+    # The release's fully static Linux client (musl + the pinned OpenSSL from packaging/openssl-version.env),
     # built on every push so a break in MINIDRIVE_FULLY_STATIC shows up here rather than on a tag.
     # Then the tls and ipc suites run against it with a normally built server: the tls suite must
     # take its hybrid branch, since the embedded OpenSSL is 3.5 whatever the runner has.
@@ -228,7 +228,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /opt/openssl
-          key: openssl-alpine-${{ hashFiles('packaging/openssl.pin', 'packaging/build-openssl.sh') }}
+          key: openssl-alpine-${{ hashFiles('packaging/openssl-version.env', 'packaging/build-openssl.sh') }}
 
       - name: Build the pinned OpenSSL
         if: steps.openssl-cache.outputs.cache-hit != 'true'

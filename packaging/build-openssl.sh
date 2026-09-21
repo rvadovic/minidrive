@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Builds the pinned OpenSSL (packaging/openssl.pin) as static libraries, for the fully static
+# Builds the pinned OpenSSL (packaging/openssl-version.env) as static libraries, for the fully static
 # client (-DMINIDRIVE_FULLY_STATIC=ON -DOPENSSL_ROOT_DIR=<prefix>).
 #
 # Usage:
@@ -19,8 +19,8 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=openssl.pin
-source "$here/openssl.pin"
+# shellcheck source=openssl-version.env
+source "$here/openssl-version.env"
 
 fetch_only=0
 if [[ "${1:-}" == "--fetch-only" ]]; then

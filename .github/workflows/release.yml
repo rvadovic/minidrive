@@ -212,7 +212,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /opt/openssl
-          key: openssl-alpine-${{ hashFiles('packaging/openssl.pin', 'packaging/build-openssl.sh') }}
+          key: openssl-alpine-${{ hashFiles('packaging/openssl-version.env', 'packaging/build-openssl.sh') }}
 
       - name: Build the pinned OpenSSL
         if: steps.openssl-cache.outputs.cache-hit != 'true'
@@ -284,7 +284,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/openssl
-          key: openssl-macos-${{ matrix.arch }}-${{ hashFiles('packaging/openssl.pin', 'packaging/build-openssl.sh') }}
+          key: openssl-macos-${{ matrix.arch }}-${{ hashFiles('packaging/openssl-version.env', 'packaging/build-openssl.sh') }}
 
       - name: Build the pinned OpenSSL
         if: steps.openssl-cache.outputs.cache-hit != 'true'
@@ -357,7 +357,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: C:\openssl
-          key: openssl-windows-${{ hashFiles('packaging/openssl.pin', 'packaging/build-openssl.sh') }}
+          key: openssl-windows-${{ hashFiles('packaging/openssl-version.env', 'packaging/build-openssl.sh') }}
 
       - name: Fetch and verify the pinned OpenSSL source
         if: steps.openssl-cache.outputs.cache-hit != 'true'

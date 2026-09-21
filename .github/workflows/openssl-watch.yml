@@ -1,6 +1,6 @@
 name: OpenSSL watch
 
-# The released client embeds a pinned OpenSSL (packaging/openssl.pin) instead of using the system
+# The released client embeds a pinned OpenSSL (packaging/openssl-version.env) instead of using the system
 # one, so no distribution will patch it. This is the replacement: once a week, compare the pin with
 # the newest 3.5.x release and open an issue when it has fallen behind. The fix is to bump the pin
 # (version + the published SHA-256) and cut a new release.
@@ -25,7 +25,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          source packaging/openssl.pin
+          source packaging/openssl-version.env
           latest=$(gh api 'repos/openssl/openssl/releases?per_page=100' --paginate \
                      --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' \
                    | sed -n 's/^openssl-\(3\.5\.[0-9]*\)$/\1/p' | sort -V | tail -1)
@@ -50,7 +50,7 @@ jobs:
             echo
             echo "Release notes: https://github.com/openssl/openssl/releases/tag/openssl-${latest}"
             echo
-            echo "To update, edit \`packaging/openssl.pin\`:"
+            echo "To update, edit \`packaging/openssl-version.env\`:"
             echo
             echo '```'
             echo "OPENSSL_VERSION=${latest}"
