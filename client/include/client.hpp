@@ -41,6 +41,7 @@ enum class ClientState {
     SYNC_LISTING, // SYNC listing request sent, waiting for the server's recursive file listing
     TIERS_LISTING, // TIERS request sent, waiting for the server's list of storage media
     DEVICES_LISTING, // DEVICES request sent, waiting for the server's list of enrolled devices
+    LISTING, // LIST request sent, waiting for the directory listing (its entries arrive in res.files)
     VAULT_PENDING // A vault command is in flight whose key material is only committed once it succeeds
 };
 
@@ -69,10 +70,14 @@ public:
     // wraps one whose async_connect also runs the TLS handshake, chain validation and pin check.
     // `io` fixes where commands come from and where results go - a terminal, or the IPC channel a
     // GUI drives this binary through. Neither choice is visible to any command handler.
+    // `state_dir` holds this client's own bookkeeping - partial transfers, vault scratch files and
+    // this machine's device keys. Two clients sharing one lose each other's resume state, which is
+    // why the GUI gives every account its own.
     Client(const std::string& username, asio::io_context& io_context,
            std::shared_ptr<asio::executor_work_guard<asio::io_context::executor_type>> guard,
            std::shared_ptr<transport::StreamFactory> streams,
-           std::unique_ptr<clientio::IClientIo> io);
+           std::unique_ptr<clientio::IClientIo> io,
+           std::filesystem::path state_dir = std::filesystem::path("./data/client_cwd"));
     ~Client();
 
     // Connect and start listening loop
@@ -107,6 +112,12 @@ private:
     static constexpr std::chrono::milliseconds PROGRESS_INTERVAL{150};
     std::chrono::steady_clock::time_point last_progress_{};
     ActiveTransfer transfer_{UINT32_MAX, fsutils::FileMetadata{}, std::filesystem::path(""), {}, {}}; // Current active transfer info
+    // What the current transfer is, in the user's terms, for progress events: the file the user
+    // named and the remote path it goes to or comes from. transfer_.fmeta.absolute_path is not
+    // enough on its own - for a vaulted upload it is the ciphertext scratch file.
+    std::filesystem::path transfer_local_{};
+    std::string transfer_remote_{};
+    std::string listing_path_{}; // Directory the LIST in flight asked for, echoed in the listing event
     std::filesystem::path root_; // Client root
     std::optional<PartialMetadata> partmeta_; // Database for partial file metadata
 
@@ -154,6 +165,8 @@ private:
     size_t batch_skipped_ = 0;
     size_t batch_failed_ = 0;
     std::vector<std::string> batch_conflicts_;
+    size_t batch_total_ = 0; // Ops queued when the batch started, for "item 3 of 12" events
+    size_t batch_index_ = 0; // Ops dispatched so far
 
     // The OK:/ERROR: result of a command
     void print(int code, const std::string& message, bool prompt = true);
@@ -161,8 +174,8 @@ private:
     // Free-form output that is not an OK/ERROR line (listings, vault status, conflict notices)
     void info(const std::string& text);
 
-    // Prepare the client root directory (./data/client_root)
-    void setup();
+    // Prepare the client state directory (./data/client_cwd unless --state-dir says otherwise)
+    void setup(const std::filesystem::path& state_dir);
 
     // Arm the input channel for exactly one line, which arrives back at handle_request()
     void read_line();
@@ -254,6 +267,7 @@ private:
     void handle_sync_listing(const protocol::Response& res); // Turn a recursive listing into a queue of ops
     void handle_tiers_listing(const protocol::Response& res); // Print the storage media the server offers
     void handle_devices_listing(const protocol::Response& res); // Print the devices enrolled in the vault
+    void handle_listing(const protocol::Response& res); // Hand a LIST result's structured entries to the console
 
     // Vault helpers
     void unlock_vault(const protocol::Response& res); // Recover VK from a device key, or from the password

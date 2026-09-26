@@ -156,6 +156,10 @@ private:
     // Path relative to the user's root, in the form the DEK manifest is keyed by
     std::string vault_key_for(const std::filesystem::path& absolute_path) const;
 
+    // One directory's entries for a LIST response: names, types, sizes and times, no hashes.
+    std::vector<protocol::FileEntry> list_entries(const std::filesystem::path& dir,
+                                                  const std::vector<fsutils::FileMetadata>& files) const;
+
     // Upload - simular to clients download
     bool valid_file(const std::filesystem::path& partial_file, const std::array<uint8_t, crypto_generichash_BYTES>& expected);
     bool valid_chunk(const uint32_t& index, const uint32_t& size, const std::vector<uint8_t>& data);

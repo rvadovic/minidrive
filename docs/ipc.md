@@ -13,8 +13,13 @@ It is also why the client builds on Windows and macOS at all. The only unportabl
 client is the interactive terminal UI; a headless build does not compile it.
 
 ```
-client [username@]<host>:<port> --ipc /run/user/1000/minidrive.sock
+client [username@]<host>:<port> --ipc /run/user/1000/minidrive.sock [--state-dir <dir>]
 ```
+
+`--state-dir` moves the client's own bookkeeping (partial-transfer records, vault scratch files, this
+machine's device keys) out of `./data/client_cwd`. Two clients sharing one state directory lose
+each other's resume state, so a host running several sessions should give each account its own.
+The desktop app uses `<app data>/accounts/<user>@<host>_<port>/`.
 
 ## Who owns the endpoint
 
@@ -54,8 +59,14 @@ One message type. `line` is exactly the command line the interactive CLI would a
 what keeps every command handler unaware of which console it is running under.
 
 ```json
-{"type": "COMMAND", "line": "UPLOAD report.pdf reports/2026.pdf"}
+{"type": "COMMAND", "line": "UPLOAD \"/home/alice/Q3 report.pdf\" \"/reports/Q3 report.pdf\""}
 ```
+
+**Quote every path.** Arguments are split on whitespace unless double-quoted; inside quotes `\"`
+and `\\` are the only escapes (the client reads them with `std::quoted`). An unquoted argument
+parses exactly as it always did. A Windows path must have its backslashes escaped
+(`"C:\\Users\\alice\\f.txt"`). A leading `/` on a remote path means the user's root, so a host
+that always sends absolute paths never depends on the server-side `CD` state.
 
 Frames that are not JSON objects, or whose `type` is unknown, are logged and ignored.
 
@@ -94,27 +105,51 @@ signal as well as a statement of what kind of answer is wanted.
 {"type": "PROMPT", "kind": "confirm",  "text": ""}
 ```
 
-| `kind` | Expected reply |
-|---|---|
-| `command` | A command line |
-| `password` | The account password. Reply with the password alone; it is never echoed back |
-| `confirm` | `y` or `n` — the server asked a question (register this user? migrate this tier? revoke this device?) |
+| `kind` | `text` | Expected reply |
+|---|---|---|
+| `command` | empty | A command line |
+| `password` | `Password for alice: ` | The account password. Reply with the password alone; it is never echoed back |
+| `confirm` | the server's question, e.g. `User does not exist. Do you want to register? (Y/n)` | `y` or `n` |
 
-### `EVENT` — push notifications
+A `confirm` prompt repeats the question it answers (register this user? resume this transfer?
+migrate this tier? revoke this device?), and keeps it when the client re-asks after an answer that
+was not `y` or `n`, so a dialog built from the prompt alone is complete. The question also arrived
+as the preceding `RESULT`; note that the server sends questions with a non-200 code (401), so
+`ok: false` on a `RESULT` directly before a `confirm` or `password` prompt is not a failure.
 
-Transfer progress, so a host does not have to poll. Throttled to roughly one per 150 ms, with the
+### `EVENT` — push notifications and structured results
+
+A terminal drops these, which is why adding them changed no CLI output. Each carries an `event`
+name.
+
+**`transfer_progress`**: progress, so a host does not have to poll. Throttled to roughly one per 150 ms, with the
 first and last reading of each transfer always sent, so a progress bar starts at 0 and finishes at
 100 rather than wherever the throttle landed.
 
 ```json
 {"type": "EVENT", "event": "transfer_progress", "direction": "upload",
- "path": "/home/alice/report.pdf", "transfer_id": 7,
+ "path": "/home/alice/report.pdf", "local_path": "/home/alice/report.pdf",
+ "remote_path": "/reports/report.pdf", "transfer_id": 7,
  "chunks_done": 12, "chunks_total": 40, "bytes_total": 10485760}
 ```
 
-`direction` is `upload` or `download`. For a vaulted upload, `path` is the ciphertext scratch file
-the transfer actually reads from, and `bytes_total` is its size — slightly larger than the
+`direction` is `upload` or `download`. `local_path` and `remote_path` name the transfer in the
+user's terms. `path` is the file the transfer actually reads or writes. For a vaulted upload that
+is the ciphertext scratch file, and `bytes_total` is its size, which is slightly larger than the
 plaintext, by one authentication tag per chunk.
+
+The remaining events carry what the CLI prints as text, in a form a GUI can draw without parsing
+it. Each arrives in the same exchange as the command's `RESULT`, before the next `PROMPT`. Do not
+rely on its order relative to the `RESULT`, which differs between commands.
+
+| `event` | Sent by | Fields |
+|---|---|---|
+| `listing` | `LIST` | `path` (as requested), `entries`: `[{name, is_directory, size, last_modified}]`. Sizes of vault-sealed files are their plaintext sizes; times are Unix seconds |
+| `tiers` | `TIERS` | `tiers`: `[{name, description, current}]` |
+| `devices` | `DEVICES` | `devices`: `[{device_id, device_name, algorithm, this_device}]` |
+| `vault_status` | `VAULT_STATUS` | `enabled`, `unlocked`, `device_enrolled`, `device_name` |
+| `batch_item` | every op of `SYNC`, `UPLOAD_DIR`, `DOWNLOAD_DIR`, multi-path `DELETE`/`MOVE`/`COPY` | `label`, `index` (from 1), `total`, `op` (`upload`, `download`, `mkdir`, `delete`, `rmdir`, `move`, `copy`, `conflict_download`), `remote_path`, `remote_path_from`, `local_path` |
+| `batch_summary` | the end of any batch | `label`, `uploaded`, `downloaded`, `deleted`, `moved`, `copied`, `directories_created`, `skipped`, `failed`, `conflicts` (list) |
 
 ## A session, end to end
 

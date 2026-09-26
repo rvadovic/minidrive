@@ -956,7 +956,7 @@ void Session::list(protocol::Request& req) {
     }
 
     if(req.first_argument.empty()) {
-        std::vector<fsutils::FileMetadata> files = fsutils::scan_directory(current_dir_, false);
+        std::vector<fsutils::FileMetadata> files = fsutils::scan_directory(current_dir_, false, /*with_hashes=*/false);
         if(fsutils::is_scan_dir_error(files)) {
             protocol::Response res {
                 protocol::statuses::ERROR,
@@ -979,6 +979,7 @@ void Session::list(protocol::Request& req) {
             file_list,
             ""
         };
+        res.files = list_entries(current_dir_, files);
         send_res(res);
         return;
     }else {
@@ -1005,7 +1006,7 @@ void Session::list(protocol::Request& req) {
             send_res(res);
             return;
         }
-        std::vector<fsutils::FileMetadata> files = fsutils::scan_directory(*requested_dir, false);
+        std::vector<fsutils::FileMetadata> files = fsutils::scan_directory(*requested_dir, false, /*with_hashes=*/false);
         if(fsutils::is_scan_dir_error(files)) {
             protocol::Response res {
                 protocol::statuses::ERROR,
@@ -1027,9 +1028,34 @@ void Session::list(protocol::Request& req) {
             file_list,
             ""
         };
+        res.files = list_entries(*requested_dir, files);
         send_res(res);
         return;
     }
+}
+
+// The text in the message is what a terminal prints; these entries are what a GUI draws. Old
+// clients ignore the field. A sealed file is reported at the plaintext size its owner stored -
+// the ciphertext on disk is larger by one tag per chunk, which is nobody's business but the server's.
+std::vector<protocol::FileEntry> Session::list_entries(const std::filesystem::path& dir,
+                                                       const std::vector<fsutils::FileMetadata>& files) const {
+    std::vector<protocol::FileEntry> entries;
+    entries.reserve(files.size());
+    for(const auto& file : files) {
+        const bool is_dir = fsutils::is_directory(file.absolute_path);
+        uint32_t size = is_dir ? 0u : file.size;
+        if(!is_dir && dek_ != nullptr) {
+            std::optional<DekEntry> entry = dek_->get(vault_key_for(file.absolute_path));
+            if(entry && !entry->plaintext_hash.empty()) size = entry->plaintext_size;
+        }
+        protocol::FileEntry fe;
+        fe.relative_path = fsutils::relative(dir, file.absolute_path).generic_string();
+        fe.size = size;
+        fe.last_modified = file.last_modified;
+        fe.is_directory = is_dir;
+        entries.push_back(std::move(fe));
+    }
+    return entries;
 }
 
 void Session::delete_file(protocol::Request& req) {

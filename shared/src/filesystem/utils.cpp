@@ -115,7 +115,13 @@ uint64_t get_last_write_time(const fs::path& path) {
     if(ec) {
         return TIME_ERRROR;
     }
-    return std::chrono::duration_cast<std::chrono::seconds>(ftime.time_since_epoch()).count(); // Returns time in seconds
+    // Unix seconds. file_time_type's epoch is implementation-defined - libstdc++ counts from
+    // 2174-01-01, so every real file is *negative* against it, and reading time_since_epoch()
+    // straight into a uint64_t wrapped to ~1.8e19. Re-basing onto the system clock is portable
+    // (clock_cast is cleaner but not available everywhere this builds).
+    const auto system_time = ftime - fs::file_time_type::clock::now() + std::chrono::system_clock::now();
+    const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(system_time.time_since_epoch()).count();
+    return seconds < 0 ? 0 : static_cast<uint64_t>(seconds);
 }
 
 bool mkdir(const fs::path& path) {
@@ -399,7 +405,7 @@ FileMetadata scan_file(const fs::path& path) {
     };
 }
 
-std::vector<FileMetadata> scan_directory(const fs::path& dir, bool recursive) {
+std::vector<FileMetadata> scan_directory(const fs::path& dir, bool recursive, bool with_hashes) {
     std::vector<FileMetadata> files;
     fs::directory_options options = fs::directory_options::skip_permission_denied; // Skips hidden files
 
@@ -420,11 +426,15 @@ std::vector<FileMetadata> scan_directory(const fs::path& dir, bool recursive) {
             }
 
             metadata.size = static_cast<uint32_t>(size);
-            metadata.hash = hash_file(entry.path());
+            if(!with_hashes) {
+                metadata.hash = {};
+            } else {
+                metadata.hash = hash_file(entry.path());
 
-            if(is_hash_error(metadata.hash)) { // Error in hash_file()
-                error = true;
-                return;
+                if(is_hash_error(metadata.hash)) { // Error in hash_file()
+                    error = true;
+                    return;
+                }
             }
         } else {
             metadata.size = 0; // Directory has no size

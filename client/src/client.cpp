@@ -13,6 +13,7 @@
 #include <functional>
 #include <set>
 #include <sstream>
+#include <iomanip>
 #include "crypto/base64.hpp"
 
 using asio::ip::tcp;
@@ -21,7 +22,8 @@ using nlohmann::json;
 Client::Client(const std::string& username, asio::io_context& io_context,
                std::shared_ptr<asio::executor_work_guard<asio::io_context::executor_type>> guard,
                std::shared_ptr<transport::StreamFactory> streams,
-               std::unique_ptr<clientio::IClientIo> io)
+               std::unique_ptr<clientio::IClientIo> io,
+               std::filesystem::path state_dir)
     : username_(username),
       io_context_(io_context),
       stream_(streams->create(tcp::socket(io_context))),
@@ -59,7 +61,7 @@ Client::Client(const std::string& username, asio::io_context& io_context,
                 handle_request(line);
             },
             [this]() { exit(); }); // input channel closed: stdin EOF, or the host went away
-        setup();
+        setup(state_dir);
     }
 
 Client::~Client() {
@@ -110,10 +112,11 @@ void Client::info(const std::string& text) {
     io_->info(text);
 }
 
-void Client::setup() {
-    root_ = std::filesystem::path("./data/client_cwd");
+void Client::setup(const std::filesystem::path& state_dir) {
+    root_ = state_dir;
     if(!fsutils::is_directory(root_)) {
-        fsutils::mkdir(root_);
+        std::error_code ec;
+        std::filesystem::create_directories(root_, ec); // a --state-dir may be several levels deep
     }
     if(!fsutils::is_directory(root_ / "files")) {
         fsutils::mkdir(root_ / "files");
@@ -208,6 +211,8 @@ void Client::emit_progress(const char* direction, bool force) {
         {"event", "transfer_progress"},
         {"direction", direction},
         {"path", transfer_.fmeta.absolute_path.string()},
+        {"local_path", transfer_local_.string()},
+        {"remote_path", transfer_remote_},
         {"transfer_id", transfer_.transfer_id},
         {"chunks_done", done},
         {"chunks_total", total_chunks},
@@ -216,10 +221,33 @@ void Client::emit_progress(const char* direction, bool force) {
 }
 
 
+namespace {
+// One command argument. std::quoted reads an unquoted word exactly as a plain >> does, so every
+// command line that parsed before still parses the same way - but a double-quoted argument may now
+// contain spaces ("My Report.pdf"), with \" and \\ as the only escapes. The GUI quotes every
+// path it sends; a terminal user only has to when a name actually contains a space.
+bool next_arg(std::istringstream& iss, std::string& out) {
+    return static_cast<bool>(iss >> std::quoted(out));
+}
+
+// Batch op type as named in batch_item events.
+const char* op_name(SyncOpType type) {
+    switch(type) {
+        case SyncOpType::MKDIR_REMOTE:      return "mkdir";
+        case SyncOpType::RMDIR_REMOTE:      return "rmdir";
+        case SyncOpType::DELETE_REMOTE:     return "delete";
+        case SyncOpType::MOVE_REMOTE:       return "move";
+        case SyncOpType::COPY_REMOTE:       return "copy";
+        case SyncOpType::UPLOAD:            return "upload";
+        case SyncOpType::DOWNLOAD:          return "download";
+        case SyncOpType::CONFLICT_DOWNLOAD: return "conflict_download";
+    }
+    return "unknown";
+}
+
 // Never log a password in plaintext: AUTH requests carry it as first_argument. The wire itself is
 // still plaintext until transport encryption lands, but the log file at least shouldn't be a
 // second place it leaks.
-namespace {
 json redact_for_log(const json& request_json) {
     json redacted = request_json;
     if(redacted.value("cmd", std::string()) == protocol::commands::AUTH) {
@@ -416,6 +444,7 @@ void Client::handle_response(const json& j) {
 
     if(res.status == protocol::statuses::NEED_INPUT) {
         state_ = ClientState::NEED_INPUT;
+        io_->set_question(res.message);
         read_line();
     } else if(res.status == protocol::statuses::BUSY) {
         command_finished(false); // Counts as a failed item mid-batch, re-arms stdin otherwise
@@ -447,6 +476,10 @@ void Client::handle_response(const json& j) {
             state_ = ClientState::READY;
             handle_devices_listing(res);
             return;
+        } else if(state_ == ClientState::LISTING) {
+            state_ = ClientState::READY;
+            handle_listing(res);
+            return;
         } else if(state_ == ClientState::VAULT_PENDING) {
             state_ = ClientState::READY;
             commit_vault_pending(); // The server accepted it, so the key material is now real
@@ -466,6 +499,7 @@ void Client::handle_response(const json& j) {
     } else if (res.status == protocol::statuses::RESUME) {
         if (res.file_hash.empty()) { // question: "Do you want to resume X of Y? (y/n)"
             state_ = ClientState::NEED_INPUT_RESUME_TRANSFER;
+            io_->set_question(res.message);
             read_line();
         } else { // kickoff: message is "UPLOAD <path>" / "DOWNLOAD <path>", file_hash carries the transfer id
             uint32_t id = static_cast<uint32_t>(std::stoul(res.file_hash));
@@ -486,6 +520,8 @@ void Client::handle_response(const json& j) {
             }
 
             transfer_.fmeta.absolute_path = entry->absolute_path;
+            transfer_local_ = entry->absolute_path;
+            std::getline(iss >> std::ws, transfer_remote_); // the rest of "UPLOAD <path>" is the path
             transfer_.fmeta.size = entry->size;
             transfer_.fmeta.hash = entry->file_hash;
             transfer_.chunks = entry->chunks;
@@ -567,7 +603,7 @@ void Client::handle_request(const std::string& line) {
     } else if(state_ == ClientState::PROCESSING || state_ == ClientState::UPLOAD_INIT ||
               state_ == ClientState::DOWNLOAD_INIT || state_ == ClientState::VAULT_PENDING ||
               state_ == ClientState::SYNC_LISTING || state_ == ClientState::TIERS_LISTING ||
-              state_ == ClientState::DEVICES_LISTING) {
+              state_ == ClientState::DEVICES_LISTING || state_ == ClientState::LISTING) {
         print(protocol::codes::SERVICE_UNAVAILABLE, "Server is busy...");
     } else if (state_ == ClientState::EXIT) {
         return;
@@ -777,6 +813,8 @@ void Client::send_command(const std::string& cmd, const std::string& first, cons
 
 void Client::do_list(const std::string& remote) {
     send_command(protocol::commands::LIST, remote, "");
+    listing_path_ = remote;
+    state_ = ClientState::LISTING; // The entries arrive in res.files; the message is the text listing
 }
 
 void Client::do_delete(const std::string& remote) {
@@ -809,6 +847,9 @@ void Client::do_upload(const std::filesystem::path& local, const std::string& re
         command_finished(false);
         return;
     }
+
+    transfer_local_ = fsutils::absolute(local);
+    transfer_remote_ = remote;
 
     fsutils::FileMetadata fmeta = fsutils::scan_file(local);
 
@@ -920,6 +961,8 @@ void Client::do_download(const std::string& remote, const std::filesystem::path&
         0,
         {}
     };
+    transfer_local_ = fsutils::absolute(local);
+    transfer_remote_ = remote;
 
     protocol::Request req{
         protocol::commands::DOWNLOAD,
@@ -937,7 +980,7 @@ void Client::do_download(const std::string& remote, const std::filesystem::path&
 
 void Client::cmd_list(std::istringstream& iss) {
     std::string path;
-    if(!(iss >> path)) {
+    if(!next_arg(iss, path)) {
         path.clear();
     }
     do_list(path);
@@ -946,7 +989,7 @@ void Client::cmd_list(std::istringstream& iss) {
 void Client::cmd_upload(std::istringstream& iss) {
     std::string local_path;
     std::string remote_path;
-    if(!(iss >> local_path)) {
+    if(!next_arg(iss, local_path)) {
         print(protocol::codes::BAD_REQUEST, "Missing local path argument.");
         read_line();
         return;
@@ -954,7 +997,7 @@ void Client::cmd_upload(std::istringstream& iss) {
 
     std::filesystem::path local(local_path);
 
-    if(!(iss >> remote_path)) {
+    if(!next_arg(iss, remote_path)) {
         remote_path = local.filename().string();
     }
 
@@ -964,14 +1007,14 @@ void Client::cmd_upload(std::istringstream& iss) {
 void Client::cmd_download(std::istringstream& iss) {
     std::string local_path;
     std::string remote_path;
-    if(!(iss >> remote_path)) {
+    if(!next_arg(iss, remote_path)) {
         print(protocol::codes::BAD_REQUEST, "Missing remote path argument.");
         read_line();
         return;
     }
 
     std::filesystem::path local;
-    if(iss >> local_path) {
+    if(next_arg(iss, local_path)) {
         local = std::filesystem::path(local_path);
     } else {
         local = std::filesystem::current_path() / std::filesystem::path(remote_path).filename();
@@ -983,7 +1026,7 @@ void Client::cmd_download(std::istringstream& iss) {
 void Client::cmd_delete(std::istringstream& iss) {
     std::vector<std::string> paths;
     std::string path;
-    while(iss >> path) paths.push_back(path);
+    while(next_arg(iss, path)) paths.push_back(path);
 
     if(paths.empty()) {
         print(protocol::codes::BAD_REQUEST, "Missing path argument.");
@@ -1009,7 +1052,7 @@ void Client::cmd_delete(std::istringstream& iss) {
 
 void Client::cmd_cd(std::istringstream& iss) {
     std::string path;
-    if(!(iss >> path)) {
+    if(!next_arg(iss, path)) {
         print(protocol::codes::BAD_REQUEST, "Missing path argument.");
         read_line();
         return;
@@ -1019,7 +1062,7 @@ void Client::cmd_cd(std::istringstream& iss) {
 
 void Client::cmd_mkdir(std::istringstream& iss) {
     std::string path;
-    if(!(iss >> path)) {
+    if(!next_arg(iss, path)) {
         print(protocol::codes::BAD_REQUEST, "Missing path argument.");
         read_line();
         return;
@@ -1039,7 +1082,7 @@ void Client::cmd_tiers(std::istringstream& iss) {
 
 void Client::cmd_set_tier(std::istringstream& iss) {
     std::string tier;
-    if(!(iss >> tier)) {
+    if(!next_arg(iss, tier)) {
         print(protocol::codes::BAD_REQUEST, "Missing tier name. Use TIERS to see available media.");
         read_line();
         return;
@@ -1212,6 +1255,14 @@ void Client::cmd_vault_init(std::istringstream& iss) {
 void Client::cmd_vault_status(std::istringstream& iss) {
     (void)iss;
 
+    io_->event(nlohmann::json{
+        {"event", "vault_status"},
+        {"enabled", vault_info_.enabled},
+        {"unlocked", vault_key_.has_value()},
+        {"device_enrolled", device_keys_.has_value()},
+        {"device_name", device_keys_ ? device_keys_->device_name : std::string()}
+    });
+
     if(!vault_info_.enabled) {
         info("Vault: not set up for this account. Run VAULT_INIT to turn on end-to-end encryption.");
     } else if(vault_key_) {
@@ -1250,7 +1301,7 @@ void Client::cmd_enroll_device(std::istringstream& iss) {
     }
 
     std::string name;
-    if(!(iss >> name)) {
+    if(!next_arg(iss, name)) {
         name = "device";
     }
 
@@ -1292,7 +1343,7 @@ void Client::cmd_enroll_device(std::istringstream& iss) {
 
 void Client::cmd_revoke_device(std::istringstream& iss) {
     std::string device_id;
-    if(!(iss >> device_id)) {
+    if(!next_arg(iss, device_id)) {
         print(protocol::codes::BAD_REQUEST, "Missing device id. Use DEVICES to list enrolled devices.");
         read_line();
         return;
@@ -1302,7 +1353,7 @@ void Client::cmd_revoke_device(std::istringstream& iss) {
 
 void Client::cmd_rmdir(std::istringstream& iss) {
     std::string path;
-    if(!(iss >> path)) {
+    if(!next_arg(iss, path)) {
         print(protocol::codes::BAD_REQUEST, "Missing path argument.");
         read_line();
         return;
@@ -1319,7 +1370,7 @@ void Client::batch_move_or_copy(std::istringstream& iss, bool is_move) {
 
     std::vector<std::string> args;
     std::string arg;
-    while(iss >> arg) args.push_back(arg);
+    while(next_arg(iss, arg)) args.push_back(arg);
 
     if(args.size() < 2) {
         print(protocol::codes::BAD_REQUEST, "Missing source or destination path argument.");
@@ -1363,7 +1414,7 @@ void Client::cmd_copy(std::istringstream& iss) {
 void Client::cmd_sync(std::istringstream& iss) {
     std::string local_path;
     std::string remote_path;
-    if(!(iss >> local_path >> remote_path)) {
+    if(!(next_arg(iss, local_path) && next_arg(iss, remote_path))) {
         print(protocol::codes::BAD_REQUEST, "Missing source or destination path argument.");
         read_line();
         return;
@@ -1399,7 +1450,7 @@ void Client::cmd_sync(std::istringstream& iss) {
 void Client::cmd_upload_dir(std::istringstream& iss) {
     std::string local_path;
     std::string remote_path;
-    if(!(iss >> local_path)) {
+    if(!next_arg(iss, local_path)) {
         print(protocol::codes::BAD_REQUEST, "Missing local directory argument.");
         read_line();
         return;
@@ -1412,7 +1463,7 @@ void Client::cmd_upload_dir(std::istringstream& iss) {
         return;
     }
 
-    if(!(iss >> remote_path)) {
+    if(!next_arg(iss, remote_path)) {
         remote_path = local.filename().string();
     }
 
@@ -1454,13 +1505,13 @@ void Client::cmd_upload_dir(std::istringstream& iss) {
 void Client::cmd_download_dir(std::istringstream& iss) {
     std::string remote_path;
     std::string local_path;
-    if(!(iss >> remote_path)) {
+    if(!next_arg(iss, remote_path)) {
         print(protocol::codes::BAD_REQUEST, "Missing remote directory argument.");
         read_line();
         return;
     }
 
-    if(iss >> local_path) {
+    if(next_arg(iss, local_path)) {
         sync_local_dir_ = fsutils::absolute(local_path);
     } else {
         sync_local_dir_ = fsutils::absolute(std::filesystem::current_path() / std::filesystem::path(remote_path).filename());
@@ -1504,7 +1555,39 @@ bool Client::scan_local_tree(const std::filesystem::path& dir, std::map<std::str
     return true;
 }
 
+// The text listing has already been printed from res.message, exactly as it always was. The
+// entries are for a console that can draw them - a terminal drops events, so its output is
+// unchanged. Sizes are what the user stored: for a sealed file the server reports the plaintext
+// size it recorded at upload, not the ciphertext it holds.
+void Client::handle_listing(const protocol::Response& res) {
+    nlohmann::json entries = nlohmann::json::array();
+    for(const protocol::FileEntry& file : res.files) {
+        entries.push_back(nlohmann::json{
+            {"name", file.relative_path},
+            {"is_directory", file.is_directory},
+            {"size", file.size},
+            {"last_modified", file.last_modified}
+        });
+    }
+    io_->event(nlohmann::json{
+        {"event", "listing"},
+        {"path", listing_path_},
+        {"entries", std::move(entries)}
+    });
+    command_finished(true);
+}
+
 void Client::handle_tiers_listing(const protocol::Response& res) {
+    nlohmann::json tiers = nlohmann::json::array();
+    for(const auto& tier : res.tiers) {
+        tiers.push_back(nlohmann::json{
+            {"name", tier.name},
+            {"description", tier.description},
+            {"current", tier.is_current}
+        });
+    }
+    io_->event(nlohmann::json{{"event", "tiers"}, {"tiers", std::move(tiers)}});
+
     // The server only ever sends names and descriptions here, never its filesystem paths
     for(const auto& tier : res.tiers) {
         std::string line = (tier.is_current ? "  * " : "    ") + tier.name;
@@ -1524,6 +1607,18 @@ void Client::handle_tiers_listing(const protocol::Response& res) {
 
 void Client::handle_devices_listing(const protocol::Response& res) {
     vault_devices_ = res.devices;
+
+    // Public halves and ids only - nothing here can open anything, which is why it may be shown
+    nlohmann::json devices = nlohmann::json::array();
+    for(const protocol::DeviceInfo& device : res.devices) {
+        devices.push_back(nlohmann::json{
+            {"device_id", device.device_id},
+            {"device_name", device.device_name},
+            {"algorithm", device.algorithm},
+            {"this_device", device_keys_ && device_keys_->device_id == device.device_id}
+        });
+    }
+    io_->event(nlohmann::json{{"event", "devices"}, {"devices", std::move(devices)}});
 
     if(res.devices.empty()) {
         info("  (no devices enrolled)");
@@ -1634,6 +1729,8 @@ void Client::begin_batch(BatchMode mode, const std::string& label, std::vector<S
     batch_skipped_ = 0;
     batch_failed_ = 0;
     batch_conflicts_.clear();
+    batch_total_ = batch_queue_.size();
+    batch_index_ = 0;
 }
 
 // Dispatches one op at a time. An op that fails before it ever reaches the wire (a missing local
@@ -1659,6 +1756,18 @@ void Client::advance_batch_queue() {
         current_op_ = batch_queue_.front();
         batch_queue_.pop_front();
         const SyncOp& op = *current_op_;
+
+        batch_index_++;
+        io_->event(nlohmann::json{
+            {"event", "batch_item"},
+            {"label", batch_label_},
+            {"index", batch_index_},
+            {"total", batch_total_},
+            {"op", op_name(op.type)},
+            {"remote_path", op.remote_path},
+            {"remote_path_from", op.remote_path_from},
+            {"local_path", op.local_path.string()}
+        });
 
         switch(op.type) {
             case SyncOpType::MKDIR_REMOTE:      do_mkdir(op.remote_path); break;
@@ -1744,6 +1853,20 @@ void Client::finish_batch() {
             << ", Skipped (unchanged): " << batch_skipped_
             << ", Failed: " << batch_failed_
             << ", Conflicts: " << batch_conflicts_.size() << ".";
+
+    io_->event(nlohmann::json{
+        {"event", "batch_summary"},
+        {"label", batch_label_},
+        {"uploaded", batch_uploaded_},
+        {"downloaded", batch_downloaded_},
+        {"deleted", batch_deleted_},
+        {"moved", batch_moved_},
+        {"copied", batch_copied_},
+        {"directories_created", batch_dirs_},
+        {"skipped", batch_skipped_},
+        {"failed", batch_failed_},
+        {"conflicts", batch_conflicts_}
+    });
 
     batch_conflicts_.clear();
     state_ = ClientState::READY;

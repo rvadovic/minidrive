@@ -61,7 +61,7 @@ struct ChunkHeader {
   "message": "Starting upload",
   "file_hash": "",
   "chunks": [],     // present only when non-empty (e.g. DOWNLOAD's chunk plan)
-  "files": [],      // present only when non-empty (SYNC's directory listing)
+  "files": [],      // present only when non-empty (SYNC's and LIST's directory listings)
   "tiers": []       // present only when non-empty (TIERS' storage medium listing)
 }
 ```
@@ -73,7 +73,7 @@ struct ChunkHeader {
 | `message` | string | Human-readable text; for `NEED_INPUT` responses this doubles as a machine-parsed hint (see below). |
 | `file_hash` | string | Whole-file hash for `DOWNLOAD`; also carries a resume transfer id (as a decimal string) during resume negotiation. |
 | `chunks` | array of `ChunkInfo` | `DOWNLOAD`'s chunk plan. |
-| `files` | array of `FileEntry` | `SYNC`'s recursive listing of the requested remote directory. |
+| `files` | array of `FileEntry` | `SYNC`'s recursive listing of the requested remote directory (with hashes), or `LIST`'s entries for one directory (no hashes). |
 | `tiers` | array of `TierInfo` | `TIERS`' list of configured storage media. |
 
 ### Supporting types
@@ -85,11 +85,11 @@ struct ChunkInfo {
     std::string chunk_hash;   // hex-encoded BLAKE2b of this chunk's bytes
 };
 
-struct FileEntry {             // one entry of a SYNC directory listing
+struct FileEntry {             // one entry of a SYNC or LIST directory listing
     std::string relative_path; // '/'-separated, relative to the listed directory
-    uint32_t size;             // 0 for directories
-    std::string file_hash;     // hex-encoded whole-file hash, empty for directories
-    uint64_t last_modified;    // seconds since epoch
+    uint32_t size;             // 0 for directories; for a vault-sealed file, its plaintext size
+    std::string file_hash;     // hex-encoded whole-file hash (SYNC only), empty for directories
+    uint64_t last_modified;    // Unix seconds (servers up to v0.7.0 sent a wrapped, meaningless value)
     bool is_directory;
 };
 
@@ -154,7 +154,7 @@ Defined in `shared/include/protocol/codes.hpp`, HTTP-shaped for familiarity:
 | `LOGIN` | username (empty for public mode) | — | Sent automatically on connect. |
 | `AUTH` | password | — | Sent in response to an `AUTH`-status reply. |
 | `NEED_INPUT` | `"y"` or `"n"` | — | Answers a registration/resume/`SET_TIER` prompt. |
-| `LIST` | path (optional) | — | Current directory if omitted. |
+| `LIST` | path (optional) | — | Current directory if omitted. `message` is the text listing a terminal prints; `files` carries the same entries with type, size and time. A leading `/` is the user's root. |
 | `UPLOAD` | local-relative destination path | — | Plus `size`/`file_hash`/`chunks`, see "Request". |
 | `DOWNLOAD` | remote path | — | Response carries `file_hash` + `chunks` (the plan), then switches to the binary channel with the server sending. |
 | `DELETE` | path | — | One call per path; the client loops for multi-path `DELETE`. |
@@ -174,9 +174,10 @@ Request:
 ```json
 {"cmd": "LIST", "first_argument": "", "second_argument": "", "size": 0, "file_hash": ""}
 ```
-Response:
+Response (for a directory holding one file; `files` is omitted when the directory is empty):
 ```json
-{"status": "OK", "code": 200, "message": "Current directory: .\n", "file_hash": ""}
+{"status": "OK", "code": 200, "message": "Current directory: .\nnotes.txt\n", "file_hash": "",
+ "files": [{"relative_path": "notes.txt", "size": 1024, "file_hash": "", "last_modified": 1790000000, "is_directory": false}]}
 ```
 
 ### Example: login → auth → ready

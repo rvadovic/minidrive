@@ -122,6 +122,9 @@ public:
         }
     }
 
+    // The question was already printed as the result line before the prompt
+    void set_question(const std::string& /*question*/) override {}
+
     std::string describe() const override {
         return is_tty_ ? "terminal (interactive)" : "terminal (piped stdin)";
     }

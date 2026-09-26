@@ -22,6 +22,13 @@ What is asserted, and why each one is here rather than just "IPC connects":
 - A bogus frame length is refused rather than turned into an allocation.
 - Pointing --ipc at nothing is a startup failure with a message, not a silent hang.
 
+Added with the desktop GUI (step 11), which renders these rather than parsing terminal text:
+- LIST, TIERS, DEVICES, VAULT_STATUS and batches emit structured EVENTs, and a sealed file is
+  listed at the size its owner stored, not the ciphertext's.
+- Quoted arguments carry paths with spaces through every command a file manager issues.
+- A confirm PROMPT carries the question it answers, and keeps it across a re-ask.
+- --state-dir moves the client's bookkeeping out of the working directory.
+
 Usage:
     python3 tests/integration/test_ipc.py
 """
@@ -63,7 +70,7 @@ class IpcClient:
     sidecar uses: socket lifetime and cleanup stay with the supervising process.
     """
 
-    def __init__(self, env, label, endpoint="127.0.0.1", timeout=20):
+    def __init__(self, env, label, endpoint="127.0.0.1", timeout=20, extra_args=None):
         self.env = env
         self.label = label
         self.frames = []
@@ -83,7 +90,7 @@ class IpcClient:
             endpoint if ":" in endpoint else f"{endpoint}:{env.port}",
             os.path.join(env.log_dir, f"{label}_client.log"),
             cwd=self.cwd,
-            extra_args=["--ipc", self.sock_path],
+            extra_args=["--ipc", self.sock_path] + (extra_args or []),
         )
 
         self.conn, _ = self.listener.accept()
@@ -130,10 +137,15 @@ class IpcClient:
         with self.frames_lock:
             return list(self.frames)
 
-    def wait_for(self, predicate, timeout=20):
+    def mark(self):
+        """Position in the transcript, so a later wait only considers frames after it."""
+        with self.frames_lock:
+            return len(self.frames)
+
+    def wait_for(self, predicate, timeout=20, since=0):
         """Waits for a frame matching `predicate`. Returns it, or None on timeout."""
         deadline = time.time() + timeout
-        seen = 0
+        seen = since
         while time.time() < deadline:
             frames = self.snapshot()
             for frame in frames[seen:]:
@@ -151,6 +163,22 @@ class IpcClient:
 
     def prompts(self):
         return [f for f in self.snapshot() if f.get("type") == "PROMPT"]
+
+    def event_named(self, name, predicate=lambda e: True, timeout=20):
+        return self.wait_for(
+            lambda f: f.get("type") == "EVENT" and f.get("event") == name and predicate(f), timeout)
+
+    def result_containing(self, text, timeout=20):
+        return self.wait_for(lambda f: f.get("type") == "RESULT" and text in f.get("message", ""), timeout)
+
+    def login(self, password, register=False):
+        """Answers the registration question if asked, then the password prompt."""
+        if register:
+            self.wait_for(lambda f: f.get("type") == "PROMPT" and f.get("kind") == "confirm")
+            self.send_line("y")
+        self.wait_for(lambda f: f.get("type") == "PROMPT" and f.get("kind") == "password")
+        self.send_line(password)
+        return self.wait_for(lambda f: f.get("type") == "PROMPT" and f.get("kind") == "command", timeout=30)
 
     def transcript(self):
         return "\n".join(json.dumps(f) for f in self.snapshot())
@@ -517,6 +545,200 @@ def test_batch_summary_reaches_the_host(env, results):
         client.cleanup()
 
 
+def test_listing_is_structured_and_quoted_paths_work(env, results):
+    """The GUI draws LIST from the listing event, and addresses everything by quoted path."""
+    name = "LIST emits structured entries; quoted paths with spaces work"
+    client = IpcClient(env, "listing")
+    try:
+        client.wait_for(lambda f: f.get("type") == "PROMPT")
+
+        source = os.path.join(client.cwd, "My Source.bin")
+        with open(source, "wb") as f:
+            f.write(os.urandom(300 * 1024 + 7))
+
+        client.send_line('MKDIR "/struct dir"')
+        client.result_containing("Directory created")
+        client.send_line(f'UPLOAD "{source}" "/struct dir/My File.bin"')
+        uploaded = client.result_containing("Upload successful", timeout=40)
+
+        client.send_line('LIST "/struct dir"')
+        inner = client.event_named("listing", lambda e: e.get("path") == "/struct dir")
+        client.send_line('LIST "/"')
+        outer = client.event_named("listing", lambda e: e.get("path") == "/")
+
+        fetched = os.path.join(client.cwd, "fetched back.bin")
+        client.send_line(f'DOWNLOAD "/struct dir/My File.bin" "{fetched}"')
+        downloaded = client.result_containing("Download successful", timeout=40)
+        client.send_line("EXIT")
+        client.wait_exit()
+
+        up_progress = [e for e in client.events()
+                       if e.get("event") == "transfer_progress" and e.get("direction") == "upload"]
+        inner_entries = {e["name"]: e for e in (inner or {}).get("entries", [])}
+        outer_entries = {e["name"]: e for e in (outer or {}).get("entries", [])}
+
+        if uploaded is None:
+            results.fail(name, f"quoted UPLOAD did not complete: {client.transcript()[-600:]}")
+        elif inner is None or outer is None:
+            results.fail(name, f"no listing event: {client.transcript()[-600:]}")
+        elif "My File.bin" not in inner_entries:
+            results.fail(name, f"entry missing from listing: {inner}")
+        elif inner_entries["My File.bin"].get("is_directory") is not False \
+                or inner_entries["My File.bin"].get("size") != 300 * 1024 + 7:
+            results.fail(name, f"entry has the wrong type or size: {inner_entries['My File.bin']}")
+        elif abs(inner_entries["My File.bin"].get("last_modified", 0) - time.time()) > 24 * 3600:
+            # Unix seconds. Before the fix this was the file clock's raw count, which libstdc++
+            # measures from 2174 - negative for any real file, wrapped to ~1.8e19.
+            results.fail(name, f"modification time is not a recent Unix time: {inner_entries['My File.bin'].get('last_modified')}")
+        elif outer_entries.get("struct dir", {}).get("is_directory") is not True:
+            results.fail(name, f"directory not listed as one: {outer}")
+        elif not up_progress or up_progress[-1].get("remote_path") != "/struct dir/My File.bin" \
+                or up_progress[-1].get("local_path") != os.path.abspath(source):
+            results.fail(name, f"progress does not name the transfer: {up_progress[-1:] }")
+        elif downloaded is None or not os.path.exists(fetched) or md5(fetched) != md5(source):
+            results.fail(name, "quoted DOWNLOAD did not return the same bytes")
+        else:
+            results.ok(name)
+    finally:
+        client.cleanup()
+
+
+def test_confirm_prompt_carries_question(env, results):
+    name = "Confirm PROMPT carries its question, across a re-ask"
+    client = IpcClient(env, "question", endpoint=f"ipcquestion@127.0.0.1:{env.port}")
+    try:
+        first = client.wait_for(lambda f: f.get("type") == "PROMPT" and f.get("kind") == "confirm")
+        mark = client.mark()
+        client.send_line("maybe")  # not y/n: the client re-asks
+        again = client.wait_for(
+            lambda f: f.get("type") == "PROMPT" and f.get("kind") == "confirm", since=mark)
+        client.send_line("y")
+        client.wait_for(lambda f: f.get("type") == "PROMPT" and f.get("kind") == "password")
+        client.send_line("questionpass123")
+        client.wait_for(lambda f: f.get("type") == "PROMPT" and f.get("kind") == "command", timeout=30)
+        client.send_line("EXIT")
+        client.wait_exit()
+
+        if first is None or not first.get("text"):
+            results.fail(name, f"confirm PROMPT has no question: {first}")
+        elif not any(first["text"] == r.get("message") for r in client.results()):
+            results.fail(name, f"question is not the server's message: {first['text']!r}")
+        elif again is None or again.get("text") != first.get("text"):
+            results.fail(name, f"re-ask lost the question: {again}")
+        else:
+            results.ok(name)
+    finally:
+        client.cleanup()
+
+
+def test_batch_events(env, results):
+    name = "Batches emit per-item and summary events"
+    client = IpcClient(env, "batchevents")
+    try:
+        client.wait_for(lambda f: f.get("type") == "PROMPT")
+        tree = os.path.join(client.cwd, "evtree")
+        os.makedirs(os.path.join(tree, "sub"), exist_ok=True)
+        for rel in ["one.txt", "sub/two.txt"]:
+            with open(os.path.join(tree, rel), "w") as f:
+                f.write("x" * 100)
+
+        client.send_line(f'UPLOAD_DIR "{tree}" /ipc_evtree')
+        summary = client.event_named("batch_summary", timeout=40)
+        client.send_line("EXIT")
+        client.wait_exit()
+
+        items = [e for e in client.events() if e.get("event") == "batch_item"]
+        uploads = [e for e in items if e.get("op") == "upload"]
+        if summary is None:
+            results.fail(name, f"no batch_summary event: {client.transcript()[-600:]}")
+        elif summary.get("uploaded") != 2 or summary.get("failed") != 0:
+            results.fail(name, f"summary counts are wrong: {summary}")
+        elif not items or items[-1].get("index") != items[-1].get("total") or items[0].get("index") != 1:
+            results.fail(name, f"batch_item indices are wrong: {items}")
+        elif sorted(e.get("remote_path") for e in uploads) != ["/ipc_evtree/one.txt", "/ipc_evtree/sub/two.txt"]:
+            results.fail(name, f"upload items do not name their paths: {uploads}")
+        else:
+            results.ok(name)
+    finally:
+        client.cleanup()
+
+
+def test_state_dir(env, results):
+    name = "--state-dir moves the client's bookkeeping"
+    state = os.path.join(tempfile.mkdtemp(prefix="mdipc_state_"), "accounts", "public@here")
+    client = IpcClient(env, "statedir", extra_args=["--state-dir", state])
+    try:
+        client.wait_for(lambda f: f.get("type") == "PROMPT")
+        client.send_line("EXIT")
+        rc = client.wait_exit()
+
+        if rc != 0:
+            results.fail(name, f"client exited with {rc}")
+        elif not os.path.isfile(os.path.join(state, ".partial", "partmeta.json")):
+            results.fail(name, f"no partial-transfer database under {state}")
+        elif os.path.exists(os.path.join(client.cwd, "data", "client_cwd")):
+            results.fail(name, "the working directory still got a data/client_cwd")
+        else:
+            results.ok(name)
+    finally:
+        client.cleanup()
+        shutil.rmtree(os.path.dirname(os.path.dirname(state)), ignore_errors=True)
+
+
+def test_account_events(env, results):
+    """TIERS, VAULT_STATUS and DEVICES as events, and a sealed file listed at its plaintext size."""
+    name = "Tier, vault and device events; sealed files listed at plaintext size"
+    client = IpcClient(env, "account", endpoint=f"ipcvault@127.0.0.1:{env.port}", timeout=60)
+    try:
+        if client.login("vaultpass123", register=True) is None:
+            results.fail(name, f"login failed: {client.transcript()[-600:]}")
+            return
+
+        client.send_line("TIERS")
+        tiers = client.event_named("tiers")
+        client.send_line("VAULT_STATUS")
+        before = client.event_named("vault_status")
+        mark = client.mark()
+        client.send_line("VAULT_INIT")
+        client.wait_for(lambda f: f.get("type") == "PROMPT", timeout=30, since=mark)
+        client.send_line("VAULT_STATUS")
+        after = client.event_named("vault_status", lambda e: e.get("enabled") is True, timeout=30)
+        client.send_line("DEVICES")
+        devices = client.event_named("devices")
+
+        source = os.path.join(client.cwd, "secret.bin")
+        with open(source, "wb") as f:
+            f.write(os.urandom(600 * 1024))  # three chunks, so ciphertext is visibly larger
+        client.send_line(f'UPLOAD "{source}" /secret.bin')
+        client.result_containing("Upload successful", timeout=40)
+        client.send_line('LIST "/"')
+        listing = client.event_named("listing", lambda e: e.get("path") == "/")
+        client.send_line("EXIT")
+        client.wait_exit()
+
+        entries = {e["name"]: e for e in (listing or {}).get("entries", [])}
+        stored = os.path.join(env.server_root, "private", "ipcvault", "files", "secret.bin")
+
+        if tiers is None or not any(t.get("current") for t in tiers.get("tiers", [])):
+            results.fail(name, f"no tiers event with a current tier: {tiers}")
+        elif before is None or before.get("enabled") is not False or before.get("unlocked") is not False:
+            results.fail(name, f"vault_status before VAULT_INIT is wrong: {before}")
+        elif after is None or after.get("unlocked") is not True:
+            results.fail(name, f"vault_status after VAULT_INIT is wrong: {after}")
+        elif devices is None or devices.get("devices") != []:
+            results.fail(name, f"devices event is wrong: {devices}")
+        elif "secret.bin" not in entries:
+            results.fail(name, f"sealed file missing from the listing: {listing}")
+        elif entries["secret.bin"].get("size") != 600 * 1024:
+            results.fail(name, f"sealed file listed at {entries['secret.bin'].get('size')}, not its plaintext size")
+        elif not os.path.exists(stored) or os.path.getsize(stored) == 600 * 1024:
+            results.fail(name, "the server copy is not the (larger) ciphertext - the check proves nothing")
+        else:
+            results.ok(name)
+    finally:
+        client.cleanup()
+
+
 def main():
     check_executables()
     env = IpcEnv()
@@ -533,6 +755,11 @@ def main():
         test_download_round_trip(env, results)
         test_queued_command_does_not_preempt_transfer(env, results)
         test_batch_summary_reaches_the_host(env, results)
+        test_listing_is_structured_and_quoted_paths_work(env, results)
+        test_confirm_prompt_carries_question(env, results)
+        test_batch_events(env, results)
+        test_state_dir(env, results)
+        test_account_events(env, results)
         test_host_disconnect_exits_cleanly(env, results)
         test_oversized_frame_is_refused(env, results)
         test_missing_socket_is_a_startup_failure(env, results)

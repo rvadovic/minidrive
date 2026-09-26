@@ -110,7 +110,8 @@ public:
         send(nlohmann::json{
             {"type", "PROMPT"},
             {"kind", kind_name(kind)},
-            {"text", kind == PromptKind::Password ? password_prompt_ : std::string()}
+            {"text", kind == PromptKind::Password ? password_prompt_
+                     : kind == PromptKind::Confirm ? question_ : std::string()}
         });
     }
 
@@ -148,6 +149,10 @@ public:
 
     void end_password() override {
         password_prompt_.clear();
+    }
+
+    void set_question(const std::string& question) override {
+        question_ = question;
     }
 
     std::string describe() const override {
@@ -285,6 +290,7 @@ private:
     bool want_line_ = false;                // The client is waiting and the queue was empty
     PromptKind prompt_kind_ = PromptKind::Command;
     std::string password_prompt_;
+    std::string question_; // What the current Confirm prompt is asking
 
     // Writes are serialized the same way transport::IStream serializes them: one in flight, the
     // next started from the previous completion, with the payload owned for the whole write.

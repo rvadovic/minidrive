@@ -52,7 +52,7 @@ static bool parse_host_port(const std::string& input, UserHostPort& out) {
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " [username@]<host>:<port> [--ipc <socket>]"
-                  << " [--log <log_file>] [--log-level <level>]"
+                  << " [--state-dir <dir>] [--log <log_file>] [--log-level <level>]"
                   << " [--rung <0|3.5>] [--tls-verify <none|ca|pinned>] [--ca-file <pem>]"
                   << " [--pin <sha256:hex>] [--tls-servername <name>] [--tls-min-version <1.2|1.3>]"
                   << " [--tls-ciphers <list>] [--tls-groups <list>] [--tls-require-pq]" << std::endl;
@@ -70,6 +70,7 @@ int main(int argc, char* argv[]) {
 
     std::string log_file;
     std::string ipc_endpoint;
+    std::string state_dir = "./data/client_cwd";
     std::string log_level_str = "info";
     transport::Rung rung = transport::Rung::Plain;
     transport::TlsClientConfig tls;
@@ -89,6 +90,12 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             ipc_endpoint = argv[++i];
+        } else if (arg == "--state-dir") {
+            if (i + 1 >= argc) {
+                std::cerr << "--state-dir requires a directory\n";
+                return 1;
+            }
+            state_dir = argv[++i];
         } else if (arg == "--log-level") {
             if (i + 1 >= argc) {
                 std::cerr << "--log-level requires a value (trace|debug|info|warn|error|critical|off)\n";
@@ -242,7 +249,7 @@ int main(int argc, char* argv[]) {
     }
     spdlog::info("Console: {}", client_io->describe());
 
-    Client client(hp.username, io_context, work_guard, streams, std::move(client_io));
+    Client client(hp.username, io_context, work_guard, streams, std::move(client_io), state_dir);
     client.connect(hp.host, hp.port);
 
     // handle SIGINT, SIGTERM

@@ -45,10 +45,15 @@ roadmap — see [docs/requirements.md](docs/requirements.md) for the full featur
   ML-KEM-768, so a recorded session stays secret even against a future quantum attacker — falling
   back to a classical group, with a warning, on an OpenSSL older than 3.5. Certificates come from
   `lab/gen-certs.sh`; see [docs/tls.md](docs/tls.md).
+- **Desktop app for Linux, Windows and macOS** — a Tauri app (`gui/`) with a file manager,
+  drag-and-drop upload, folder sync, storage-tier and vault management, and a header that shows the
+  TLS posture actually negotiated. It implements no protocol and no crypto of its own. It bundles
+  the real client and drives it, so it gets TLS with pinning, resume, the sync engine and
+  end-to-end encryption for free. See [docs/gui.md](docs/gui.md).
 - **Headless mode** — `client --ipc <socket>` swaps the terminal for a Unix domain socket (named
-  pipe on Windows) carrying length-prefixed JSON: commands in, results and transfer-progress events
-  out. The state machine, wire protocol, sync/batch/resume engines and vault crypto are unchanged,
-  so a GUI can drive the real client instead of reimplementing it. See [docs/ipc.md](docs/ipc.md).
+  pipe on Windows) carrying length-prefixed JSON: commands in, results, structured listings and
+  transfer-progress events out. The state machine, wire protocol, sync/batch/resume engines and
+  vault crypto are unchanged; this is what the desktop app drives. See [docs/ipc.md](docs/ipc.md).
 - **Structured logging** — both `server` and `client` can log to a rotating file via spdlog
   (`--log-file`/`--log` respectively, plus `--log-level`). The client's log is file-only by
   design; its stdout is a stable, scriptable `OK`/`ERROR` protocol (see
@@ -60,9 +65,12 @@ roadmap — see [docs/requirements.md](docs/requirements.md) for the full featur
 
 ### Option 1: download a release
 
-The [Releases page](https://github.com/rvadovic/minidrive/releases) has separate server and client
-downloads:
+The [Releases page](https://github.com/rvadovic/minidrive/releases) has separate server, desktop
+app and client downloads:
 
+- **Desktop app**: `.msi` for Windows, `.dmg` for macOS, `.deb` or `.AppImage` for Linux. It bundles
+  the client, so it is the only download a desktop user needs (the installers are not code-signed
+  yet; see [docs/gui.md](docs/gui.md)).
 - **Server**: `minidrive-server-<version>-debian13-amd64.deb` for Debian 13, or
   `minidrive-server-<version>-src.tar.gz` to build it yourself (see `BUILD-SERVER.md` inside it;
   the dev container is included). The server uses the system OpenSSL, so Debian's security updates
@@ -98,7 +106,17 @@ The **server** targets Linux. The **client** has two consoles: the interactive t
 POSIX-only, and a headless build (`-DMINIDRIVE_INTERACTIVE_CLI=OFF`, the default on Windows) leaves
 it out entirely and is driven over a socket with `--ipc` instead — same protocol, same sync and
 resume engines, same encryption. That headless build is what makes a Windows/macOS client possible,
-and what the desktop GUI on the roadmap drives as a sidecar. See [docs/ipc.md](docs/ipc.md).
+and what the desktop app drives as a sidecar. See [docs/ipc.md](docs/ipc.md).
+
+The **desktop app** additionally needs Node 20+, Rust, and Tauri's platform prerequisites (on
+Debian/Ubuntu: `libwebkit2gtk-4.1-dev libxdo-dev libayatana-appindicator3-dev librsvg2-dev`):
+
+```sh
+cd gui
+npm ci
+npm run stage-sidecar   # bundles build/client/client into the app
+npx tauri dev           # or: npx tauri build
+```
 
 ## Running
 
@@ -187,6 +205,9 @@ python3 tests/integration/run_all_tests.py --suite auth     # one suite
 python3 tests/integration/run_all_tests.py --list           # list suite IDs
 ```
 
+The desktop app has its own layers of tests, from unit tests up to driving the built window
+through WebDriver; see [docs/gui.md](docs/gui.md#testing).
+
 CI (`.github/workflows/ci.yml`) runs the build and the suites that are expected to pass outright
 on every push; a small number of suites have known, documented test-harness gaps (not
 server/client bugs) and run separately as non-blocking — see the comments in that workflow file.
@@ -194,13 +215,16 @@ server/client bugs) and run separately as non-blocking — see the comments in t
 ## Releases
 
 Tagging a commit `vX.Y.Z` and pushing the tag triggers `.github/workflows/release.yml`, which
-builds, runs the gating test suites, packages the binaries with CPack (`.tar.gz` + `.deb`), and
-publishes a GitHub Release with those artifacts attached.
+builds, runs the gating test suites, packages the server (`.deb` + source) and the static clients
+with CPack, builds the desktop installers around those clients, and publishes a GitHub Release
+with all of them attached. The tag must match `project(... VERSION)` in `CMakeLists.txt`.
 
 ## Repository Layout
 
 - `client/`, `server/`, `shared/` – application targets (`shared/` holds the wire protocol,
   filesystem helpers, logging, and version reporting used by both)
+- `gui/` – the desktop app: React frontend (`src/`), Tauri/Rust core (`src-tauri/`), end-to-end
+  test (`tests/e2e.py`)
 - `cmake/` – dependency fetching (`Dependencies.cmake`) and release packaging (`Packaging.cmake`)
 - `.github/workflows/` – CI and release automation
 - `docs/` – architecture, protocol, flow, transport-security, and feature-specification documentation

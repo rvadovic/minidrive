@@ -80,7 +80,9 @@ namespace fsutils {
     bool is_scan_file_error(const FileMetadata& fmeta); // Check if scan_file returned error value
     bool is_scan_dir_error(const std::vector<FileMetadata>& list); // Check if scan_dir returned error value
     FileMetadata scan_file(const fs::path& path);
-    std::vector<FileMetadata> scan_directory(const fs::path& dir, bool recursive = false);
+    // with_hashes=false skips hashing file contents, for callers that only need names, sizes and
+    // times - hashing is by far the expensive part, and a directory listing has no use for it.
+    std::vector<FileMetadata> scan_directory(const fs::path& dir, bool recursive = false, bool with_hashes = true);
 
     // Chunk helper functions
     bool is_compute_chunks_error(const std::vector<protocol::ChunkInfo>& chunks); // Check if compute_chunks returned error value

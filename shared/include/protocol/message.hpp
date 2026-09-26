@@ -101,7 +101,7 @@ struct Response {
     std::string message{};
     std::string file_hash{};
     std::vector<ChunkInfo> chunks{};
-    std::vector<FileEntry> files{}; // Recursive listing, only used by SYNC responses
+    std::vector<FileEntry> files{}; // SYNC: recursive listing with hashes. LIST: one directory, no hashes
     std::vector<TierInfo> tiers{}; // Configured storage media, only used by TIERS responses
     VaultInfo vault{}; // Attached to the response that completes authentication, when a vault exists
     std::vector<DeviceInfo> devices{}; // DEVICES listing, and the enrolled devices at login

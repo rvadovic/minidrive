@@ -208,6 +208,155 @@ jobs:
           path: test_logs/
           retention-days: 7
 
+  gui:
+    # The desktop GUI (gui/), end to end: the frontend's and the Rust core's unit tests, the core
+    # driving the real client against a real server (gui/src-tauri/tests/live.rs), and then the
+    # built app itself driven through WebDriver under Xvfb (gui/tests/e2e.py) - registration,
+    # pinned TLS, browsing, drop-to-upload, the vault, tiers. On this runner's OpenSSL 3.0 the e2e
+    # expects the classical key exchange badge; the live and e2e checks assert whichever applies.
+    name: desktop GUI (linux, end to end)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        # webkit2gtk and friends are Tauri's Linux prerequisites; xvfb + webkit2gtk-driver are what
+        # tauri-driver needs to drive the app headlessly.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake python3 libssl-dev openssl ca-certificates \
+            libwebkit2gtk-4.1-dev libxdo-dev libayatana-appindicator3-dev librsvg2-dev \
+            xvfb webkit2gtk-driver
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: gui/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: gui/src-tauri
+
+      - name: Cache FetchContent dependencies
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: gui-deps-${{ hashFiles('cmake/Dependencies.cmake') }}
+          restore-keys: |
+            gui-deps-
+
+      - name: Build the client and server
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMINIDRIVE_BUILD_TESTS=OFF
+          cmake --build build --target minidrive_client minidrive_server -j"$(nproc)"
+
+      - name: Frontend (type check, unit tests, build)
+        working-directory: gui
+        run: |
+          npm ci
+          npm test
+          npm run build
+
+      - name: Stage the client as the sidecar
+        working-directory: gui
+        run: npm run stage-sidecar
+
+      - name: Rust core (clippy, unit tests, live tests against the real binaries)
+        working-directory: gui/src-tauri
+        run: |
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+
+      - name: Install tauri-driver
+        run: cargo install tauri-driver --locked
+
+      - name: Build the app (debug, frontend embedded)
+        working-directory: gui
+        run: npx tauri build --debug --no-bundle
+
+      - name: End to end through the real window
+        run: python3 gui/tests/e2e.py
+
+      - name: Upload screenshots and logs
+        # Always: the screenshots are the quickest way to see what the window looked like when a
+        # check passed or failed.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gui-e2e
+          path: test_logs/
+          retention-days: 7
+
+  gui-cross:
+    # The GUI on the platforms it exists for. The server is Linux-only, so there is nothing to run
+    # the full live suite against here; what does run needs only the client - the core starting it,
+    # the named pipe (Windows) or socket (macOS) endpoint with its peer-process check, framing, and
+    # a clean ending. Then the whole app is compiled and linked, so a platform break shows up here.
+    name: desktop GUI (${{ matrix.os }}, build + channel)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install OpenSSL (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install openssl@3
+          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+
+      - name: Cache FetchContent dependencies
+        uses: actions/cache@v4
+        with:
+          path: build-headless/_deps
+          key: headless-${{ matrix.os }}-${{ hashFiles('cmake/Dependencies.cmake') }}
+          restore-keys: |
+            headless-${{ matrix.os }}-
+
+      - name: Build the headless client
+        run: |
+          cmake -S . -B build-headless -DCMAKE_BUILD_TYPE=Release -DMINIDRIVE_INTERACTIVE_CLI=OFF -DMINIDRIVE_BUILD_TESTS=OFF -DMINIDRIVE_BUILD_SERVER=OFF
+          cmake --build build-headless --target minidrive_client --config Release -j 2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: gui/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: gui/src-tauri
+
+      - name: Frontend
+        working-directory: gui
+        run: |
+          npm ci
+          npm test
+          npm run build
+
+      - name: Stage the client, test the core, build the app
+        shell: bash
+        env:
+          MINIDRIVE_BUILD_DIR: ${{ github.workspace }}/build-headless
+        run: |
+          cd gui
+          npm run stage-sidecar
+          (cd src-tauri && cargo test)
+          npx tauri build --debug --no-bundle
+
   static-client:
     # The release's fully static Linux client (musl + the pinned OpenSSL from packaging/openssl-version.env),
     # built on every push so a break in MINIDRIVE_FULLY_STATIC shows up here rather than on a tag.

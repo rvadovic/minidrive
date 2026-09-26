@@ -66,6 +66,12 @@ public:
     virtual void begin_password(const std::string& prompt) = 0;
     virtual void end_password() = 0;
 
+    // The question a Confirm prompt is answering ("Register?", "Resume upload of x?"). A terminal
+    // has already printed it as the preceding result line; the IPC channel repeats it in the
+    // PROMPT frame so a GUI's dialog is self-contained, and keeps it across a re-ask after an
+    // invalid answer.
+    virtual void set_question(const std::string& question) = 0;
+
     // Name of this channel, for the startup log line.
     virtual std::string describe() const = 0;
 };

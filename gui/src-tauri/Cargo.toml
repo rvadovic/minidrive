@@ -1,0 +1,39 @@
+[package]
+name = "minidrive-gui"
+version = "0.7.0"
+description = "MiniDrive desktop client: a Tauri shell that drives the C++ client over --ipc"
+edition = "2021"
+rust-version = "1.80"
+publish = false
+
+[lib]
+name = "minidrive_gui_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "minidrive-gui"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "io-util", "sync", "time", "fs"] }
+thiserror = "2"
+zeroize = "1"
+getrandom = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_System_Pipes"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true

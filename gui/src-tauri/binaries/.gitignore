@@ -1,0 +1,4 @@
+# Staged by `npm run stage-sidecar` (or the release workflow) from a MiniDrive client build.
+# Tauri requires the target triple in the name: minidrive-client-<triple>[.exe]
+*
+!.gitignore

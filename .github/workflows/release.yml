@@ -5,11 +5,13 @@ name: Release
 #            minidrive-server-<ver>-debian13-amd64.deb (dynamic libssl, patched by apt)
 #   client - minidrive-client-<ver>-{linux-x86_64,macos-arm64,macos-x86_64}.tar.gz,
 #            minidrive-client-<ver>-windows-x86_64.zip (fully static, OpenSSL 3.5 embedded)
+#   gui    - minidrive-gui-<ver>-{linux-amd64.deb,linux-x86_64.AppImage,windows-x86_64.msi,
+#            macos-arm64.dmg,macos-x86_64.dmg} (the desktop app, bundling the static client above)
 #   SHA256SUMS
 #
 # gate -> package jobs (each smoke-tests its own artifact) -> server-deb-verify (clean debian:13:
-# installs the .deb and runs the gating suites against it, driven by the static Linux client) ->
-# publish. A tag push publishes; workflow_dispatch is a dry run that stops before publishing and
+# installs the .deb and runs the gating suites against it, driven by the static Linux client) and
+# gui (installers built around the released clients) -> publish. A tag push publishes; workflow_dispatch is a dry run that stops before publishing and
 # leaves the assets as workflow artifacts.
 
 on:
@@ -417,6 +419,127 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # --- desktop app ---------------------------------------------------------------------------
+
+  gui:
+    # The Tauri app, with this release's own static client bundled as its sidecar - so an installer
+    # carries OpenSSL 3.5 inside the client and needs nothing from the host but its webview. The GUI
+    # itself implements no protocol and no crypto (docs/gui.md), so there is no second TLS stack to
+    # keep patched. Installers are not code-signed; the release notes say what that means.
+    needs: [gate, client-linux, client-macos, client-windows]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04, not latest: an AppImage/deb only runs on glibc at least as new as the builder's.
+          - runner: ubuntu-22.04
+            platform: linux-x86_64
+            triple: x86_64-unknown-linux-gnu
+            client: release-client-linux-x86_64
+            bundles: deb,appimage
+          - runner: windows-latest
+            platform: windows-x86_64
+            triple: x86_64-pc-windows-msvc
+            client: release-client-windows-x86_64
+            bundles: msi
+          - runner: macos-latest
+            platform: macos-arm64
+            triple: aarch64-apple-darwin
+            client: release-client-macos-arm64
+            bundles: dmg
+          - runner: macos-15-intel
+            platform: macos-x86_64
+            triple: x86_64-apple-darwin
+            client: release-client-macos-x86_64
+            bundles: dmg
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ needs.gate.outputs.version }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Tauri's Linux prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libxdo-dev libayatana-appindicator3-dev librsvg2-dev file
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: gui/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: gui/src-tauri
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.client }}
+          path: client-dist
+
+      - name: Stage the released client as the sidecar
+        shell: bash
+        run: |
+          mkdir -p client-unpack
+          for a in client-dist/*; do
+            case "$a" in
+              *.zip) unzip -q "$a" -d client-unpack ;;
+              *.tar.gz) tar xzf "$a" -C client-unpack ;;
+            esac
+          done
+          client=$(find client-unpack -type f \( -name client -o -name client.exe \) | head -1)
+          [ -n "$client" ] || { echo "no client binary in ${{ matrix.client }}"; find client-unpack; exit 1; }
+          cd gui
+          npm ci
+          node scripts/stage-sidecar.mjs "../$client" --target ${{ matrix.triple }}
+
+      - name: Build the installers
+        shell: bash
+        working-directory: gui
+        run: |
+          # MSI versions must be purely numeric, so the bundle carries the project() version and the
+          # asset name carries the full release version (with any -rc/-dev suffix).
+          numeric="${VERSION%%-*}"
+          npx tauri build --bundles ${{ matrix.bundles }} --config "{\"version\":\"$numeric\"}"
+
+      - name: Check the sidecar is inside the bundle, and collect the installers
+        shell: bash
+        run: |
+          bundle=gui/src-tauri/target/release/bundle
+          find "$bundle" -maxdepth 2 | head -50
+          mkdir -p dist
+          case "${{ runner.os }}" in
+            Linux)
+              deb=$(ls "$bundle"/deb/*.deb)
+              # dpkg-deb -c prints "./usr/bin/..." or "usr/bin/..." depending on the builder.
+              dpkg-deb -c "$deb" | grep -qE "(^|[ /])usr/bin/minidrive-client$" \
+                || { echo "the .deb does not contain the client"; dpkg-deb -c "$deb"; exit 1; }
+              cp "$deb" "dist/minidrive-gui-${VERSION}-linux-amd64.deb"
+              cp "$bundle"/appimage/*.AppImage "dist/minidrive-gui-${VERSION}-linux-x86_64.AppImage" ;;
+            Windows)
+              test -f gui/src-tauri/target/release/minidrive-client.exe \
+                || { echo "the client was not placed beside the app"; exit 1; }
+              cp "$bundle"/msi/*.msi "dist/minidrive-gui-${VERSION}-windows-x86_64.msi" ;;
+            macOS)
+              app=$(ls -d "$bundle"/macos/*.app)
+              test -x "$app/Contents/MacOS/minidrive-client" \
+                || { echo "the .app does not contain the client"; ls -R "$app/Contents"; exit 1; }
+              cp "$bundle"/dmg/*.dmg "dist/minidrive-gui-${VERSION}-${{ matrix.platform }}.dmg" ;;
+          esac
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-gui-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+
   # --- verification of the published artifacts together --------------------------------------
 
   server-deb-verify:
@@ -478,7 +601,7 @@ jobs:
           retention-days: 7
 
   publish:
-    needs: [gate, server-src, server-deb, server-deb-verify, client-linux, client-macos, client-windows]
+    needs: [gate, server-src, server-deb, server-deb-verify, client-linux, client-macos, client-windows, gui]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
