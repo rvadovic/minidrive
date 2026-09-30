@@ -151,6 +151,12 @@ npx tauri build             # installers for this platform
 bundling, so at runtime the client sits beside the app as `minidrive-client`. Debug builds also
 accept `MINIDRIVE_CLIENT_BIN=<path>` to run a client from elsewhere.
 
+**Linux AppImage**: run `packaging/strip-appimage-wayland.sh <file>.AppImage` (needs
+`squashfs-tools`) on the built image before shipping it; the release workflow does this. Tauri
+bundles the build host's `libwayland-*`, and on a host with a newer Mesa (e.g. Fedora 43) that makes
+WebKitGTK abort with `Could not create default EGL display: EGL_BAD_PARAMETER`. The script removes
+them so the host's copies are used.
+
 ## Testing
 
 | Layer | Command | What it covers |

@@ -468,7 +468,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev libxdo-dev libayatana-appindicator3-dev librsvg2-dev file
+            libwebkit2gtk-4.1-dev libxdo-dev libayatana-appindicator3-dev librsvg2-dev file \
+            squashfs-tools
 
       - uses: actions/setup-node@v4
         with:
@@ -511,6 +512,15 @@ jobs:
           # asset name carries the full release version (with any -rc/-dev suffix).
           numeric="${VERSION%%-*}"
           npx tauri build --bundles ${{ matrix.bundles }} --config "{\"version\":\"$numeric\"}"
+
+      - name: Strip the bundled libwayland from the AppImage
+        # The Ubuntu 22.04 copies abort WebKitGTK on hosts with a newer Mesa (EGL_BAD_PARAMETER on
+        # Fedora); the host's own libwayland is always present. See the script for details.
+        if: runner.os == 'Linux'
+        run: |
+          for img in gui/src-tauri/target/release/bundle/appimage/*.AppImage; do
+            packaging/strip-appimage-wayland.sh "$img"
+          done
 
       - name: Check the sidecar is inside the bundle, and collect the installers
         shell: bash
