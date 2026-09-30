@@ -446,12 +446,16 @@ jobs:
             platform: macos-arm64
             triple: aarch64-apple-darwin
             client: release-client-macos-arm64
-            bundles: dmg
+            # "app" too: with dmg alone, Tauri deletes the intermediate .app after building the
+            # DMG, and the sidecar check below inspects the .app.
+            bundles: app,dmg
           - runner: macos-15-intel
             platform: macos-x86_64
             triple: x86_64-apple-darwin
             client: release-client-macos-x86_64
-            bundles: dmg
+            # "app" too: with dmg alone, Tauri deletes the intermediate .app after building the
+            # DMG, and the sidecar check below inspects the .app.
+            bundles: app,dmg
     runs-on: ${{ matrix.runner }}
     env:
       VERSION: ${{ needs.gate.outputs.version }}
@@ -518,8 +522,11 @@ jobs:
             Linux)
               deb=$(ls "$bundle"/deb/*.deb)
               # dpkg-deb -c prints "./usr/bin/..." or "usr/bin/..." depending on the builder.
-              dpkg-deb -c "$deb" | grep -qE "(^|[ /])usr/bin/minidrive-client$" \
-                || { echo "the .deb does not contain the client"; dpkg-deb -c "$deb"; exit 1; }
+              # Capture first: `dpkg-deb -c | grep -q` fails under pipefail, because grep exits on
+              # the first match and tar then dies writing to the closed pipe.
+              listing=$(dpkg-deb -c "$deb")
+              grep -qE "(^|[ /])usr/bin/minidrive-client$" <<< "$listing" \
+                || { echo "the .deb does not contain the client"; echo "$listing"; exit 1; }
               cp "$deb" "dist/minidrive-gui-${VERSION}-linux-amd64.deb"
               cp "$bundle"/appimage/*.AppImage "dist/minidrive-gui-${VERSION}-linux-x86_64.AppImage" ;;
             Windows)
