@@ -51,21 +51,27 @@ def generate_certificates():
     """Run lab/gen-certs.sh into a scratch directory and return the paths it produced."""
     if os.path.exists(CERT_DIR):
         shutil.rmtree(CERT_DIR)
-    subprocess.run([GEN_CERTS, CERT_DIR], check=True, capture_output=True, text=True)
+    # The CA key is always passphrase-encrypted; a throwaway one keeps the run non-interactive.
+    env = dict(os.environ, MINIDRIVE_CA_PASSPHRASE="tls-suite-throwaway")
+    subprocess.run([GEN_CERTS, "init", "--lab", CERT_DIR], check=True, capture_output=True, text=True,
+                   env=env)
 
-    def pin(name):
-        with open(os.path.join(CERT_DIR, name)) as f:
+    def path(*parts):
+        return os.path.join(CERT_DIR, *parts)
+
+    def pin(*parts):
+        with open(path(*parts)) as f:
             return f.read().strip()
 
     return {
-        "ca": os.path.join(CERT_DIR, "ca.crt"),
-        "cert": os.path.join(CERT_DIR, "server.crt"),
-        "key": os.path.join(CERT_DIR, "server.key"),
-        "pin": pin("server.pin"),
-        "rogue_ca": os.path.join(CERT_DIR, "rogue-ca.crt"),
-        "rogue_cert": os.path.join(CERT_DIR, "rogue-server.crt"),
-        "rogue_key": os.path.join(CERT_DIR, "rogue-server.key"),
-        "rogue_pin": pin("rogue-server.pin"),
+        "ca": path("client", "ca.crt"),
+        "cert": path("server", "server.crt"),
+        "key": path("server", "server.key"),
+        "pin": pin("server", "server.pin"),
+        "rogue_ca": path("adversary", "rogue-ca.crt"),
+        "rogue_cert": path("adversary", "rogue-server.crt"),
+        "rogue_key": path("adversary", "rogue-server.key"),
+        "rogue_pin": pin("adversary", "rogue-server.pin"),
     }
 
 

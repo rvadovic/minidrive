@@ -207,10 +207,11 @@ def main():
 
     try:
         certs = os.path.join(scratch, "certs")
-        subprocess.run(["bash", os.path.join(REPO, "lab", "gen-certs.sh"), certs], check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        pin = open(os.path.join(certs, "server.pin")).read().strip()
-        rogue_pin = open(os.path.join(certs, "rogue-server.pin")).read().strip()
+        subprocess.run(["bash", os.path.join(REPO, "lab", "gen-certs.sh"), "init", "--lab", certs],
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       env=dict(os.environ, MINIDRIVE_CA_PASSPHRASE="e2e-throwaway"))
+        pin = open(os.path.join(certs, "server", "server.pin")).read().strip()
+        rogue_pin = open(os.path.join(certs, "adversary", "rogue-server.pin")).read().strip()
 
         # Two tiers so the Storage view has a choice; files seeded straight onto the server's disk
         # so the file manager has something to show that the GUI did not put there itself.
@@ -226,7 +227,7 @@ def main():
         port = free_port()
         procs.append(subprocess.Popen(
             [SERVER, "--port", str(port), "--root", root, "--rung", "3.5",
-             "--tls-cert", os.path.join(certs, "server.crt"), "--tls-key", os.path.join(certs, "server.key"),
+             "--tls-cert", os.path.join(certs, "server", "server.crt"), "--tls-key", os.path.join(certs, "server", "server.key"),
              "--tier", f"hot={root}", "--tier", f"archive={archive}", "--tier-desc", "archive=Spinning disks",
              "--default-tier", "hot"],
             stdout=open(os.path.join(shots, "server.log"), "w"), stderr=subprocess.STDOUT))

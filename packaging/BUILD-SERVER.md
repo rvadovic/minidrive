@@ -51,19 +51,25 @@ and the certificate generator as `/usr/local/share/minidrive/gen-certs.sh`.
 
 ## 4. Run it
 
-To run over TLS, generate a CA and a server certificate once. Give the script an output directory,
-because the default location next to the script is not writable after a system install:
+To run over TLS you need a CA and a server certificate. Create them **on another machine** (the
+script is `lab/gen-certs.sh` in the source tree), so the CA key never sits on the server:
 
 ```text
-SERVER_SANS="DNS:nas.example.com,IP:10.0.0.5" \
-    /usr/local/share/minidrive/gen-certs.sh /etc/minidrive/certs
+SERVER_SANS="DNS:nas.example.com,IP:10.0.0.5" lab/gen-certs.sh init ~/minidrive-pki
+scp -r ~/minidrive-pki/server nas:/etc/minidrive/certs
+```
 
+Then, on the server:
+
+```text
 server --port 9000 --root /srv/minidrive --rung 3.5 \
     --tls-cert /etc/minidrive/certs/server.crt --tls-key /etc/minidrive/certs/server.key
 ```
 
-Give clients `ca.crt` (for `--ca-file`) or the `server.pin` value (for `--pin`). See
-`docs/tls.md` for the full TLS setup and `README.md` for storage tiers and the other options.
+Give clients the files in `~/minidrive-pki/client/` (`ca.crt` for `--ca-file`, `server.pin` for
+`--pin`). The certificate lasts 90 days; `gen-certs.sh renew ~/minidrive-pki` re-issues it with the
+same keys, so clients need nothing new. See `docs/tls.md` for the full TLS setup and `README.md` for
+storage tiers and the other options.
 
 ## Tests
 

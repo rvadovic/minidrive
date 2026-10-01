@@ -143,12 +143,13 @@ npx tauri dev           # or: npx tauri build
 # Client logging (file only - never mixed with the OK/ERROR stdout protocol)
 ./build/client/client alice@127.0.0.1:9000 --log client.log --log-level debug
 
-# Server and client over TLS 1.3 (rung 3.5). Generate certificates first: lab/gen-certs.sh
+# Server and client over TLS 1.3 (rung 3.5). Generate certificates first:
+#   lab/gen-certs.sh init --lab        (localhost; real deployments: see docs/tls.md)
 ./build/server/server --port 9000 --root ./data/server_root --rung 3.5 \
-  --tls-cert lab/certs/server.crt --tls-key lab/certs/server.key
+  --tls-cert lab/certs/server/server.crt --tls-key lab/certs/server/server.key
 
 ./build/client/client alice@localhost:9000 --rung 3.5 \
-  --ca-file lab/certs/ca.crt --pin "$(cat lab/certs/server.pin)"
+  --ca-file lab/certs/client/ca.crt --pin "$(cat lab/certs/client/server.pin)"
 
 # Headless: the host creates the socket first, then drives the client over it (docs/ipc.md)
 ./build/client/client alice@127.0.0.1:9000 --ipc /run/user/1000/minidrive.sock

@@ -395,15 +395,22 @@ async fn pinned_tls_reports_its_posture_and_a_wrong_pin_is_refused() {
     let Some((server_bin, client_bin)) = binaries() else { return };
     let certs = tempfile::tempdir().unwrap();
     let gen = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lab/gen-certs.sh");
-    let status = Command::new("bash").arg(&gen).arg(certs.path()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let status = Command::new("bash")
+        .arg(&gen)
+        .args(["init", "--lab"])
+        .arg(certs.path())
+        .env("MINIDRIVE_CA_PASSPHRASE", "live-test-throwaway")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
     if !matches!(status, Ok(s) if s.success()) {
         eprintln!("skipping: lab/gen-certs.sh unavailable (needs bash and openssl)");
         return;
     }
-    let cert = certs.path().join("server.crt");
-    let key = certs.path().join("server.key");
+    let cert = certs.path().join("server/server.crt");
+    let key = certs.path().join("server/server.key");
     let server = Server::start(&server_bin, &["--rung", "3.5", "--tls-cert", cert.to_str().unwrap(), "--tls-key", key.to_str().unwrap()]);
-    let pin = std::fs::read_to_string(certs.path().join("server.pin")).unwrap().trim().to_owned();
+    let pin = std::fs::read_to_string(certs.path().join("server/server.pin")).unwrap().trim().to_owned();
 
     let mut good = profile(server.port, "");
     good.security = Security { tls: true, pin: Some(pin), ..Security::default() };
@@ -418,7 +425,7 @@ async fn pinned_tls_reports_its_posture_and_a_wrong_pin_is_refused() {
     session.close().await;
 
     let mut bad = profile(server.port, "");
-    let wrong = std::fs::read_to_string(certs.path().join("rogue-server.pin")).unwrap().trim().to_owned();
+    let wrong = std::fs::read_to_string(certs.path().join("adversary/rogue-server.pin")).unwrap().trim().to_owned();
     bad.security = Security { tls: true, pin: Some(wrong), ..Security::default() };
     let state = tempfile::tempdir().unwrap();
     let (session, first) = start(&client_bin, &bad, state.path(), Arc::new(Recorder::default())).await.unwrap();
