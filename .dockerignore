@@ -1,0 +1,19 @@
+# Keep the build context small and free of host build trees: a stale CMakeCache.txt copied into
+# the image would point at this machine's paths. Only the server sources are needed (see Dockerfile).
+.git
+.github
+.vscode
+.claude
+.devcontainer
+build*
+data
+test_logs
+gui
+client
+tests
+packaging
+lab/certs
+**/__pycache__
+*.key
+*.pem
+CLAUDE.md
